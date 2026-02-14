@@ -1116,6 +1116,19 @@ fn App() -> Element {
                                                     if event.key() == Key::Enter {
                                                         if let Some(active) = editing_cell() {
                                                             let value = editing_value();
+                                                            let numeric_required = matches!(
+                                                                active.column.as_str(),
+                                                                "買進" | "市價" | "數量" | "期數"
+                                                            );
+                                                            if numeric_required
+                                                                && parse_numeric_value(&value).is_none()
+                                                            {
+                                                                *status.write() = format!(
+                                                                    "欄位 {} 必須是數字",
+                                                                    active.column
+                                                                );
+                                                                return;
+                                                            }
                                                             if active.row_idx < base_row_count {
                                                                 staged_cells.write().insert(active, value);
                                                             } else {
@@ -2522,37 +2535,7 @@ fn is_holdings_table(headers: &[String]) -> bool {
 }
 
 fn editable_columns_for_holdings() -> Vec<String> {
-    let mut editable = Vec::new();
-    for column in required_columns_for_holdings() {
-        if !editable.contains(&column) {
-            editable.push(column);
-        }
-    }
-
-    let additional = [
-        "2023年",
-        "去年度累積",
-        "1月",
-        "2月",
-        "3月",
-        "4月",
-        "5月",
-        "6月",
-        "7月",
-        "8月",
-        "9月",
-        "10月",
-        "11月",
-        "12月",
-    ];
-    for column in additional {
-        let value = column.to_string();
-        if !editable.contains(&value) {
-            editable.push(value);
-        }
-    }
-
-    editable
+    required_columns_for_holdings()
 }
 
 fn default_dataset_name_mmdd() -> String {
