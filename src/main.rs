@@ -2649,6 +2649,81 @@ fn reload_page_data(
     }
 }
 
+fn build_updated_rows(
+    columns: &[String],
+    rows: &[Vec<String>],
+    staged_cells: &HashMap<CellKey, String>,
+    deleted_rows: &BTreeSet<usize>,
+    added_rows: &[Vec<String>],
+) -> Vec<Vec<String>> {
+    let mut updated = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        if deleted_rows.contains(&row_idx) {
+            continue;
+        }
+        let mut next_row = row.clone();
+        for (col_idx, header) in columns.iter().enumerate() {
+            if let Some(value) = staged_cells.get(&CellKey {
+                row_idx,
+                col_idx,
+                column: header.clone(),
+            }) {
+                if col_idx < next_row.len() {
+                    next_row[col_idx] = value.clone();
+                }
+            }
+        }
+        updated.push(next_row);
+    }
+    for row in added_rows {
+        updated.push(row.clone());
+    }
+    updated
+}
+
+fn apply_changes_to_dataset(
+    db_path: &Path,
+    dataset_id: i64,
+    columns: &[String],
+    rows: &[Vec<String>],
+    staged_cells: &HashMap<CellKey, String>,
+    deleted_rows: &BTreeSet<usize>,
+    added_rows: &[Vec<String>],
+) -> Result<()> {
+    let updated_rows = build_updated_rows(columns, rows, staged_cells, deleted_rows, added_rows);
+    let mut conn = open_connection(db_path)?;
+    let tx = conn
+        .transaction()
+        .context("failed to start update transaction")?;
+
+    tx.execute(
+        "DELETE FROM cell WHERE dataset_id = ?1",
+        params![dataset_id],
+    )
+    .context("failed to clear existing cells")?;
+
+    let mut insert_cell = tx
+        .prepare("INSERT INTO cell(dataset_id, row_idx, col_idx, value) VALUES (?1, ?2, ?3, ?4)")
+        .context("failed to prepare cell insert")?;
+    for (row_idx, row) in updated_rows.iter().enumerate() {
+        for (col_idx, value) in row.iter().enumerate() {
+            insert_cell
+                .execute(params![dataset_id, row_idx as i64, col_idx as i64, value])
+                .context("failed to insert updated cell")?;
+        }
+    }
+    drop(insert_cell);
+
+    tx.execute(
+        "UPDATE dataset SET row_count = ?1 WHERE id = ?2",
+        params![updated_rows.len() as i64, dataset_id],
+    )
+    .context("failed to update dataset row_count")?;
+
+    tx.commit().context("failed to commit dataset update")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3238,5 +3313,64 @@ mod tests {
             "新名稱",
         );
         assert!(state.is_cell_modified("名稱", 0));
+    }
+
+    #[test]
+    fn apply_changes_to_dataset_updates_rows() {
+        let temp_dir = unique_test_dir("apply-changes");
+        fs::create_dir_all(&temp_dir).expect("should create temp dir");
+        let db_path = temp_dir.join("app.sqlite");
+        let csv_path = temp_dir.join("people.csv");
+        fs::write(&csv_path, "name,city\nAlice,Paris\nBob,Tokyo\n")
+            .expect("should write csv fixture");
+
+        let imported = import_csv_to_sqlite(&db_path, &csv_path).expect("import should succeed");
+        let (columns, rows, _total) = query_page(
+            &db_path,
+            imported.dataset_id,
+            0,
+            10,
+            &QueryOptions::default(),
+        )
+        .expect("query should succeed");
+
+        let mut staged = HashMap::new();
+        staged.insert(
+            CellKey {
+                row_idx: 0,
+                col_idx: 1,
+                column: "city".to_string(),
+            },
+            "Berlin".to_string(),
+        );
+        let mut deleted = BTreeSet::new();
+        deleted.insert(1);
+        let added = vec![vec!["Cara".to_string(), "Rome".to_string()]];
+
+        apply_changes_to_dataset(
+            &db_path,
+            imported.dataset_id,
+            &columns,
+            &rows,
+            &staged,
+            &deleted,
+            &added,
+        )
+        .expect("apply changes should succeed");
+
+        let (_columns, new_rows, total_rows) = query_page(
+            &db_path,
+            imported.dataset_id,
+            0,
+            10,
+            &QueryOptions::default(),
+        )
+        .expect("query should succeed");
+
+        assert_eq!(total_rows, 2);
+        assert_eq!(new_rows[0], vec!["Alice", "Berlin"]);
+        assert_eq!(new_rows[1], vec!["Cara", "Rome"]);
+
+        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
     }
 }
