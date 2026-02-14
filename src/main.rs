@@ -1779,6 +1779,91 @@ impl EditingState {
     }
 }
 
+struct EditTableState {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+impl EditTableState {
+    fn new_for_test() -> Self {
+        let mut headers = required_columns_for_holdings();
+        headers.push("其他".to_string());
+        let mut state = Self {
+            headers,
+            rows: Vec::new(),
+        };
+        let mut row = state.empty_row();
+        if let Some(idx) = state.header_index("所有權人") {
+            row[idx] = "王小明".to_string();
+        }
+        if let Some(idx) = state.header_index("名稱") {
+            row[idx] = "測試".to_string();
+        }
+        if let Some(idx) = state.header_index("類別") {
+            row[idx] = "ETF".to_string();
+        }
+        if let Some(idx) = state.header_index("性質") {
+            row[idx] = "股票".to_string();
+        }
+        if let Some(idx) = state.header_index("國內 /國外") {
+            row[idx] = "國內".to_string();
+        }
+        if let Some(idx) = state.header_index("代號") {
+            row[idx] = "0050".to_string();
+        }
+        if let Some(idx) = state.header_index("買進") {
+            row[idx] = "100".to_string();
+        }
+        if let Some(idx) = state.header_index("市價") {
+            row[idx] = "105".to_string();
+        }
+        if let Some(idx) = state.header_index("數量") {
+            row[idx] = "10".to_string();
+        }
+        if let Some(idx) = state.header_index("配息方式") {
+            row[idx] = "現金".to_string();
+        }
+        if let Some(idx) = state.header_index("期數") {
+            row[idx] = "4".to_string();
+        }
+        state.rows.push(row);
+        state
+    }
+
+    fn header_index(&self, name: &str) -> Option<usize> {
+        self.headers.iter().position(|h| h == name)
+    }
+
+    fn empty_row(&self) -> Vec<String> {
+        vec![String::new(); self.headers.len()]
+    }
+
+    fn add_row(&mut self, row: Vec<String>) -> Result<(), String> {
+        validate_required_holdings_row(&self.headers, &row)?;
+        self.rows.push(row);
+        Ok(())
+    }
+}
+
+fn validate_required_holdings_row(headers: &[String], row: &[String]) -> Result<(), String> {
+    for required in required_columns_for_holdings() {
+        let Some(idx) = headers.iter().position(|h| h == &required) else {
+            return Err(format!("missing header: {required}"));
+        };
+        let value = row.get(idx).map(|v| v.trim()).unwrap_or("");
+        if value.is_empty() {
+            return Err(format!("required field empty: {required}"));
+        }
+
+        let numeric_required = matches!(required.as_str(), "買進" | "市價" | "數量" | "期數");
+        if numeric_required && parse_numeric_value(value).is_none() {
+            return Err(format!("invalid number: {required}"));
+        }
+    }
+
+    Ok(())
+}
+
 fn import_xlsx_selected_sheets_to_sqlite(
     db_path: &Path,
     xlsx_path: &Path,
@@ -2746,5 +2831,16 @@ mod tests {
         assert!(state.start_edit(cell_id.clone()));
         state.apply_edit(cell_id.clone(), "王小明");
         assert_eq!(state.staged_value(cell_id), "王小明");
+    }
+
+    #[test]
+    fn add_row_requires_required_fields() {
+        let mut state = EditTableState::new_for_test();
+        let mut row = state.empty_row();
+        if let Some(idx) = state.header_index("所有權人") {
+            row[idx] = String::new();
+        }
+        let result = state.add_row(row);
+        assert!(result.is_err());
     }
 }
