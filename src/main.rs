@@ -207,9 +207,16 @@ fn App() -> Element {
     for row_idx in 0..total_row_count {
         let deleted = deleted_rows_snapshot.contains(&row_idx);
         let selected = selected_rows_snapshot.contains(&row_idx);
+        let added = row_idx >= base_row_count;
         let style = format!(
             "{}{}",
-            if selected { "background: #eef4ff;" } else { "" },
+            if selected {
+                "background: #eef4ff;"
+            } else if added {
+                "background: #d9f7d9;"
+            } else {
+                ""
+            },
             if deleted {
                 "border-top: 2px solid #d33; border-bottom: 2px solid #d33;"
             } else {
