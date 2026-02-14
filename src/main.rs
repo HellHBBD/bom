@@ -67,6 +67,10 @@ fn App() -> Element {
     let mut new_row_inputs = use_signal(HashMap::<String, String>::new);
     let mut context_menu = use_signal(|| None::<(f64, f64)>);
     let mut context_row = use_signal(|| None::<usize>);
+    let mut pending_action = use_signal(|| None::<PendingAction>);
+    let mut show_save_prompt = use_signal(|| false);
+    let mut show_save_as_prompt = use_signal(|| false);
+    let mut save_as_name = use_signal(default_dataset_name_mmdd);
 
     let db_path = Arc::new(db_path);
     let db_path_for_init = db_path.clone();
@@ -133,12 +137,15 @@ fn App() -> Element {
     let db_path_for_show_deleted = db_path.clone();
     let db_path_for_soft_delete = db_path.clone();
     let db_path_for_purge = db_path.clone();
+    let db_path_for_save = db_path.clone();
+    let db_path_for_save_as = db_path.clone();
     let grouped_datasets = build_dataset_groups(&datasets());
     let active_group =
         selected_group_key().and_then(|k| grouped_datasets.iter().find(|g| g.key == k).cloned());
     let current_columns = columns();
     let current_rows = rows();
     let added_rows_snapshot = added_rows();
+    let datasets_snapshot = datasets();
     let staged_cells_snapshot = staged_cells();
     let deleted_rows_snapshot = deleted_rows();
     let selected_rows_snapshot = selected_rows();
@@ -157,6 +164,20 @@ fn App() -> Element {
         || !deleted_rows_snapshot.is_empty()
         || !added_rows_snapshot.is_empty();
     let current_columns_for_add = current_columns.clone();
+    let current_columns_for_save = current_columns.clone();
+    let current_rows_for_save = current_rows.clone();
+    let datasets_for_save = datasets_snapshot.clone();
+    let current_columns_for_overwrite = current_columns_for_save.clone();
+    let current_rows_for_overwrite = current_rows_for_save.clone();
+    let current_columns_for_save_as = current_columns_for_save.clone();
+    let current_rows_for_save_as = current_rows_for_save.clone();
+    let db_path_for_import_prompt = db_path_for_import.clone();
+    let db_path_for_dataset_change_prompt = db_path_for_dataset_change.clone();
+    let db_path_for_tab_switch_prompt = db_path_for_tab_switch.clone();
+    let db_path_for_import_overwrite = db_path_for_import_prompt.clone();
+    let db_path_for_import_save_as = db_path_for_import_prompt.clone();
+    let db_path_for_dataset_change_overwrite = db_path_for_dataset_change_prompt.clone();
+    let db_path_for_dataset_change_save_as = db_path_for_dataset_change_prompt.clone();
     let get_raw_value = |row_idx: usize, col_idx: usize| -> String {
         if let Some(header) = current_columns.get(col_idx) {
             if let Some(value) = staged_cells_snapshot.get(&CellKey {
@@ -258,6 +279,12 @@ fn App() -> Element {
                             *status.write() = "已取消匯入".to_string();
                             return;
                         };
+
+                        if is_holdings && has_pending_changes {
+                            pending_action.set(Some(PendingAction::Import(file_path.clone())));
+                            show_save_prompt.set(true);
+                            return;
+                        }
 
                         *busy.write() = true;
                         *status.write() = format!("正在匯入 {}", file_path.display());
@@ -447,6 +474,15 @@ fn App() -> Element {
                             .and_then(|group_key| groups.iter().find(|g| &g.key == group_key))
                             .and_then(|g| g.datasets.first())
                             .map(|d| d.id);
+
+                        if is_holdings && has_pending_changes {
+                            pending_action.set(Some(PendingAction::DatasetChange {
+                                next_group: next_group.clone(),
+                                next_dataset,
+                            }));
+                            show_save_prompt.set(true);
+                            return;
+                        }
 
                         *selected_group_key.write() = next_group;
                         *selected_dataset_id.write() = next_dataset;
@@ -658,6 +694,13 @@ fn App() -> Element {
                                 onclick: {
                                     let db_path_for_tab = db_path_for_tab_switch.clone();
                                     move |_| {
+                                        if is_holdings && has_pending_changes {
+                                            pending_action.set(Some(PendingAction::TabSwitch {
+                                                dataset_id: sheet.id,
+                                            }));
+                                            show_save_prompt.set(true);
+                                            return;
+                                        }
                                         *selected_dataset_id.write() = Some(sheet.id);
                                         *page.write() = 0;
                                         staged_cells.write().clear();
@@ -1114,6 +1157,466 @@ fn App() -> Element {
                                 *status.write() = "已標記刪除（待儲存）".to_string();
                             },
                             "刪除"
+                        }
+                    }
+                }
+            }
+
+            if show_save_prompt() {
+                div {
+                    style: "position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; z-index: 1100;",
+                    div {
+                        style: "background: #fff; padding: 16px; border: 1px solid #999; min-width: 280px;",
+                        div { style: "margin-bottom: 8px; font-weight: 600;", "未儲存變更" }
+                        div { style: "margin-bottom: 12px;", "你要覆蓋目前資料集，或另存舊內容？" }
+                        div { style: "display: flex; gap: 8px;",
+                            button {
+                                onclick: move |_| {
+                                    let Some(dataset_id) = selected_dataset_id() else {
+                                        show_save_prompt.set(false);
+                                        pending_action.set(None);
+                                        return;
+                                    };
+
+                                    if let Err(err) = apply_changes_to_dataset(
+                                        &db_path_for_save,
+                                        dataset_id,
+                                        &current_columns_for_overwrite,
+                                        &current_rows_for_overwrite,
+                                        &staged_cells(),
+                                        &deleted_rows(),
+                                        &added_rows(),
+                                    ) {
+                                        *status.write() = format!("覆蓋失敗：{err}");
+                                        return;
+                                    }
+
+                                    staged_cells.write().clear();
+                                    deleted_rows.write().clear();
+                                    selected_rows.write().clear();
+                                    added_rows.write().clear();
+                                    *editing_cell.write() = None;
+                                    editing_value.set(String::new());
+                                    show_add_row.set(false);
+                                    new_row_inputs.write().clear();
+
+                                    match reload_page_data(
+                                        &db_path_for_save,
+                                        Some(dataset_id),
+                                        0,
+                                        &QueryOptions {
+                                            global_search: global_search(),
+                                            column_search_col: column_search_col(),
+                                            column_search_text: column_search_text(),
+                                            sort_col: sort_col(),
+                                            sort_desc: sort_desc(),
+                                        },
+                                    ) {
+                                        Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                            *columns.write() = loaded_columns;
+                                            *rows.write() = loaded_rows;
+                                            *total_rows.write() = loaded_total;
+                                            *page.write() = loaded_page;
+                                        }
+                                        Err(err) => {
+                                            *status.write() = format!("覆蓋後重新載入失敗：{err}");
+                                        }
+                                    }
+
+                                    show_save_prompt.set(false);
+                                    if let Some(action) = pending_action() {
+                                        pending_action.set(None);
+                                        match action {
+                                            PendingAction::Import(file_path) => {
+                                                *busy.write() = true;
+                                                *status.write() = format!("正在匯入 {}", file_path.display());
+                                                let ext = file_path
+                                                    .extension()
+                                                    .and_then(|e| e.to_str())
+                                                    .map(|s| s.to_ascii_lowercase())
+                                                    .unwrap_or_default();
+                                                let import_result = if ext == "xlsx" {
+                                                    import_xlsx_selected_sheets_to_sqlite(
+                                                        &db_path_for_import_overwrite,
+                                                        &file_path,
+                                                    )
+                                                    .map(|items| {
+                                                        (items.first().map(|it| it.dataset_id), items.len() as i64, true)
+                                                    })
+                                                } else {
+                                                    import_csv_to_sqlite(&db_path_for_import_overwrite, &file_path)
+                                                        .map(|item| (Some(item.dataset_id), item.row_count, false))
+                                                };
+                                                match import_result {
+                                                    Ok((selected_id, imported_count, is_xlsx)) => {
+                                                        match list_datasets(&db_path_for_import_overwrite, show_deleted()) {
+                                                            Ok(available) => {
+                                                                let groups = build_dataset_groups(&available);
+                                                                *datasets.write() = available;
+                                                                let next_group_key = selected_id.and_then(|id| {
+                                                                    groups
+                                                                        .iter()
+                                                                        .find(|g| g.datasets.iter().any(|d| d.id == id))
+                                                                        .map(|g| g.key.clone())
+                                                                });
+                                                                *selected_group_key.write() = next_group_key;
+                                                                *selected_dataset_id.write() = selected_id;
+                                                                *column_search_col.write() = None;
+                                                                *column_search_text.write() = String::new();
+                                                                *sort_col.write() = None;
+                                                                *sort_desc.write() = false;
+                                                                *page.write() = 0;
+                                                                match reload_page_data(
+                                                                    &db_path_for_import_overwrite,
+                                                                    selected_id,
+                                                                    0,
+                                                                    &QueryOptions::default(),
+                                                                ) {
+                                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                                                        *columns.write() = loaded_columns;
+                                                                        *rows.write() = loaded_rows;
+                                                                        *total_rows.write() = loaded_total;
+                                                                        *page.write() = loaded_page;
+                                                                        *status.write() = if is_xlsx {
+                                                                            format!("已匯入 XLSX，共 {} 個資料表", imported_count)
+                                                                        } else {
+                                                                            format!("已匯入 CSV（{} 筆）", imported_count)
+                                                                        };
+                                                                    }
+                                                                    Err(err) => {
+                                                                        *status.write() = format!("匯入成功，但載入資料失敗：{err}");
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                *status.write() = format!("匯入成功，但刷新資料集失敗：{err}");
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        *status.write() = format!("匯入失敗：{err}");
+                                                    }
+                                                }
+                                                *busy.write() = false;
+                                            }
+                                            PendingAction::DatasetChange { next_group, next_dataset } => {
+                                                *selected_group_key.write() = next_group;
+                                                *selected_dataset_id.write() = next_dataset;
+                                                *column_search_col.write() = None;
+                                                *column_search_text.write() = String::new();
+                                                *sort_col.write() = None;
+                                                *sort_desc.write() = false;
+                                                *page.write() = 0;
+                                                *busy.write() = true;
+                                                match reload_page_data(
+                                                    &db_path_for_dataset_change_overwrite,
+                                                    next_dataset,
+                                                    0,
+                                                    &QueryOptions::default(),
+                                                ) {
+                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                                        *columns.write() = loaded_columns;
+                                                        *rows.write() = loaded_rows;
+                                                        *total_rows.write() = loaded_total;
+                                                        *page.write() = loaded_page;
+                                                        *status.write() = "已切換資料集".to_string();
+                                                    }
+                                                    Err(err) => {
+                                                        *status.write() = format!("載入資料集失敗：{err}");
+                                                    }
+                                                }
+                                                *busy.write() = false;
+                                            }
+                                            PendingAction::TabSwitch { dataset_id } => {
+                                                *selected_dataset_id.write() = Some(dataset_id);
+                                                *page.write() = 0;
+                                                *busy.write() = true;
+                                                match reload_page_data(
+                                                    &db_path_for_tab_switch_prompt,
+                                                    Some(dataset_id),
+                                                    0,
+                                                    &QueryOptions::default(),
+                                                ) {
+                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                                        *columns.write() = loaded_columns;
+                                                        *rows.write() = loaded_rows;
+                                                        *total_rows.write() = loaded_total;
+                                                        *page.write() = loaded_page;
+                                                        *status.write() = "已切換工作表".to_string();
+                                                    }
+                                                    Err(err) => {
+                                                        *status.write() = format!("切換工作表失敗：{err}");
+                                                    }
+                                                }
+                                                *busy.write() = false;
+                                            }
+                                        }
+                                    }
+                                },
+                                "覆蓋"
+                            }
+                            button {
+                                onclick: move |_| {
+                                    save_as_name.set(default_dataset_name_mmdd());
+                                    show_save_prompt.set(false);
+                                    show_save_as_prompt.set(true);
+                                },
+                                "另存"
+                            }
+                            button {
+                                onclick: move |_| {
+                                    show_save_prompt.set(false);
+                                    pending_action.set(None);
+                                },
+                                "取消"
+                            }
+                        }
+                    }
+                }
+            }
+
+            if show_save_as_prompt() {
+                div {
+                    style: "position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; z-index: 1200;",
+                    div {
+                        style: "background: #fff; padding: 16px; border: 1px solid #999; min-width: 280px;",
+                        div { style: "margin-bottom: 8px; font-weight: 600;", "另存舊內容" }
+                        div { style: "margin-bottom: 8px;", "請輸入新資料集名稱（預設 MMDD）" }
+                        input {
+                            value: save_as_name(),
+                            oninput: move |event| {
+                                save_as_name.set(event.value());
+                            }
+                        }
+                        div { style: "display: flex; gap: 8px; margin-top: 12px;",
+                            button {
+                                onclick: move |_| {
+                                    let name = save_as_name().trim().to_string();
+                                    if name.is_empty() {
+                                        *status.write() = "資料集名稱不可空白".to_string();
+                                        return;
+                                    }
+                                    let Some(dataset_id) = selected_dataset_id() else {
+                                        show_save_as_prompt.set(false);
+                                        pending_action.set(None);
+                                        return;
+                                    };
+                                    if let Some(current) = datasets_for_save.iter().find(|d| d.id == dataset_id) {
+                                        if current.name == name {
+                                            *status.write() = "資料集名稱必須不同".to_string();
+                                            return;
+                                        }
+                                    }
+                                    let existing = datasets_for_save.iter().find(|d| d.name == name).cloned();
+                                    if let Some(existing) = existing {
+                                        let overwrite = MessageDialog::new()
+                                            .set_level(MessageLevel::Warning)
+                                            .set_title("名稱已存在")
+                                            .set_description("已有相同名稱，是否覆蓋？")
+                                            .set_buttons(MessageButtons::YesNo)
+                                            .show();
+                                        if overwrite != MessageDialogResult::Yes {
+                                            return;
+                                        }
+                                        if let Err(err) = purge_dataset(&db_path_for_save_as, existing.id) {
+                                            *status.write() = format!("覆蓋失敗：{err}");
+                                            return;
+                                        }
+                                    }
+
+                                    let Some(current) = datasets_for_save.iter().find(|d| d.id == dataset_id) else {
+                                        *status.write() = "找不到目前資料集".to_string();
+                                        return;
+                                    };
+                                    let prefix = current
+                                        .source_path
+                                        .split_once('#')
+                                        .map(|(p, _)| p)
+                                        .unwrap_or(&current.source_path);
+                                    let backup_source = format!("{prefix}#{name}");
+
+                                    if let Err(err) = create_dataset_from_rows(
+                                        &db_path_for_save_as,
+                                        &name,
+                                        &backup_source,
+                                        &current_columns_for_save_as,
+                                        &current_rows_for_save_as,
+                                    ) {
+                                        *status.write() = format!("另存失敗：{err}");
+                                        return;
+                                    }
+
+                                    if let Err(err) = apply_changes_to_dataset(
+                                        &db_path_for_save_as,
+                                        dataset_id,
+                                        &current_columns_for_save_as,
+                                        &current_rows_for_save_as,
+                                        &staged_cells(),
+                                        &deleted_rows(),
+                                        &added_rows(),
+                                    ) {
+                                        *status.write() = format!("覆蓋失敗：{err}");
+                                        return;
+                                    }
+
+                                    match list_datasets(&db_path_for_save_as, show_deleted()) {
+                                        Ok(available) => {
+                                            *datasets.write() = available;
+                                        }
+                                        Err(err) => {
+                                            *status.write() = format!("更新資料集清單失敗：{err}");
+                                        }
+                                    }
+
+                                    staged_cells.write().clear();
+                                    deleted_rows.write().clear();
+                                    selected_rows.write().clear();
+                                    added_rows.write().clear();
+                                    *editing_cell.write() = None;
+                                    editing_value.set(String::new());
+                                    show_add_row.set(false);
+                                    new_row_inputs.write().clear();
+
+                                    show_save_as_prompt.set(false);
+
+                                    if let Some(action) = pending_action() {
+                                        pending_action.set(None);
+                                        match action {
+                                            PendingAction::DatasetChange { next_group, next_dataset } => {
+                                                *selected_group_key.write() = next_group;
+                                                *selected_dataset_id.write() = next_dataset;
+                                                *column_search_col.write() = None;
+                                                *column_search_text.write() = String::new();
+                                                *sort_col.write() = None;
+                                                *sort_desc.write() = false;
+                                                *page.write() = 0;
+                                                *busy.write() = true;
+                                                match reload_page_data(
+                                                    &db_path_for_dataset_change_save_as,
+                                                    next_dataset,
+                                                    0,
+                                                    &QueryOptions::default(),
+                                                ) {
+                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                                        *columns.write() = loaded_columns;
+                                                        *rows.write() = loaded_rows;
+                                                        *total_rows.write() = loaded_total;
+                                                        *page.write() = loaded_page;
+                                                        *status.write() = "已切換資料集".to_string();
+                                                    }
+                                                    Err(err) => {
+                                                        *status.write() = format!("載入資料集失敗：{err}");
+                                                    }
+                                                }
+                                                *busy.write() = false;
+                                            }
+                                            PendingAction::TabSwitch { dataset_id } => {
+                                                *selected_dataset_id.write() = Some(dataset_id);
+                                                *page.write() = 0;
+                                                *busy.write() = true;
+                                                match reload_page_data(
+                                                    &db_path_for_tab_switch,
+                                                    Some(dataset_id),
+                                                    0,
+                                                    &QueryOptions::default(),
+                                                ) {
+                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                                        *columns.write() = loaded_columns;
+                                                        *rows.write() = loaded_rows;
+                                                        *total_rows.write() = loaded_total;
+                                                        *page.write() = loaded_page;
+                                                        *status.write() = "已切換工作表".to_string();
+                                                    }
+                                                    Err(err) => {
+                                                        *status.write() = format!("切換工作表失敗：{err}");
+                                                    }
+                                                }
+                                                *busy.write() = false;
+                                            }
+                                            PendingAction::Import(file_path) => {
+                                                *busy.write() = true;
+                                                *status.write() = format!("正在匯入 {}", file_path.display());
+                                                let ext = file_path
+                                                    .extension()
+                                                    .and_then(|e| e.to_str())
+                                                    .map(|s| s.to_ascii_lowercase())
+                                                    .unwrap_or_default();
+                                                let import_result = if ext == "xlsx" {
+                                                    import_xlsx_selected_sheets_to_sqlite(
+                                                        &db_path_for_import_save_as,
+                                                        &file_path,
+                                                    )
+                                                    .map(|items| {
+                                                        (items.first().map(|it| it.dataset_id), items.len() as i64, true)
+                                                    })
+                                                } else {
+                                                    import_csv_to_sqlite(&db_path_for_import_save_as, &file_path)
+                                                        .map(|item| (Some(item.dataset_id), item.row_count, false))
+                                                };
+                                                match import_result {
+                                                    Ok((selected_id, imported_count, is_xlsx)) => {
+                                                        match list_datasets(&db_path_for_import_save_as, show_deleted()) {
+                                                            Ok(available) => {
+                                                                let groups = build_dataset_groups(&available);
+                                                                *datasets.write() = available;
+                                                                let next_group_key = selected_id.and_then(|id| {
+                                                                    groups
+                                                                        .iter()
+                                                                        .find(|g| g.datasets.iter().any(|d| d.id == id))
+                                                                        .map(|g| g.key.clone())
+                                                                });
+                                                                *selected_group_key.write() = next_group_key;
+                                                                *selected_dataset_id.write() = selected_id;
+                                                                *column_search_col.write() = None;
+                                                                *column_search_text.write() = String::new();
+                                                                *sort_col.write() = None;
+                                                                *sort_desc.write() = false;
+                                                                *page.write() = 0;
+                                                                match reload_page_data(
+                                                                    &db_path_for_import_save_as,
+                                                                    selected_id,
+                                                                    0,
+                                                                    &QueryOptions::default(),
+                                                                ) {
+                                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                                                        *columns.write() = loaded_columns;
+                                                                        *rows.write() = loaded_rows;
+                                                                        *total_rows.write() = loaded_total;
+                                                                        *page.write() = loaded_page;
+                                                                        *status.write() = if is_xlsx {
+                                                                            format!("已匯入 XLSX，共 {} 個資料表", imported_count)
+                                                                        } else {
+                                                                            format!("已匯入 CSV（{} 筆）", imported_count)
+                                                                        };
+                                                                    }
+                                                                    Err(err) => {
+                                                                        *status.write() = format!("匯入成功，但載入資料失敗：{err}");
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                *status.write() = format!("匯入成功，但刷新資料集失敗：{err}");
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(err) => {
+                                                        *status.write() = format!("匯入失敗：{err}");
+                                                    }
+                                                }
+                                                *busy.write() = false;
+                                            }
+                                        }
+                                    }
+                                },
+                                "確認"
+                            }
+                            button {
+                                onclick: move |_| {
+                                    show_save_as_prompt.set(false);
+                                    pending_action.set(None);
+                                },
+                                "取消"
+                            }
                         }
                     }
                 }
@@ -2045,6 +2548,11 @@ fn editable_columns_for_holdings() -> Vec<String> {
     editable
 }
 
+fn default_dataset_name_mmdd() -> String {
+    let now = chrono::Local::now();
+    now.format("%m%d").to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CellKey {
     row_idx: usize,
@@ -2070,6 +2578,18 @@ struct RowRender {
     is_deleted: bool,
     style: String,
     cells: Vec<CellRender>,
+}
+
+#[derive(Clone)]
+enum PendingAction {
+    Import(PathBuf),
+    DatasetChange {
+        next_group: Option<String>,
+        next_dataset: Option<i64>,
+    },
+    TabSwitch {
+        dataset_id: i64,
+    },
 }
 
 struct EditingState {
@@ -2724,6 +3244,50 @@ fn apply_changes_to_dataset(
     Ok(())
 }
 
+fn create_dataset_from_rows(
+    db_path: &Path,
+    name: &str,
+    source_path: &str,
+    columns: &[String],
+    rows: &[Vec<String>],
+) -> Result<i64> {
+    init_db(db_path)?;
+    let mut conn = open_connection(db_path)?;
+    let tx = conn
+        .transaction()
+        .context("failed to start dataset create transaction")?;
+
+    tx.execute(
+        "INSERT INTO dataset(name, source_path, row_count) VALUES (?1, ?2, 0)",
+        params![name, source_path],
+    )
+    .context("failed to insert dataset")?;
+    let dataset_id = tx.last_insert_rowid();
+
+    insert_header_names(&tx, dataset_id, columns)?;
+
+    let mut insert_cell = tx
+        .prepare("INSERT INTO cell(dataset_id, row_idx, col_idx, value) VALUES (?1, ?2, ?3, ?4)")
+        .context("failed to prepare cell insert")?;
+    for (row_idx, row) in rows.iter().enumerate() {
+        for (col_idx, value) in row.iter().enumerate() {
+            insert_cell
+                .execute(params![dataset_id, row_idx as i64, col_idx as i64, value])
+                .context("failed to insert dataset cell")?;
+        }
+    }
+    drop(insert_cell);
+
+    tx.execute(
+        "UPDATE dataset SET row_count = ?1 WHERE id = ?2",
+        params![rows.len() as i64, dataset_id],
+    )
+    .context("failed to update dataset row_count")?;
+
+    tx.commit().context("failed to commit dataset create")?;
+    Ok(dataset_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3370,6 +3934,50 @@ mod tests {
         assert_eq!(total_rows, 2);
         assert_eq!(new_rows[0], vec!["Alice", "Berlin"]);
         assert_eq!(new_rows[1], vec!["Cara", "Rome"]);
+
+        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+    }
+
+    #[test]
+    fn create_dataset_from_rows_inserts_dataset() {
+        let temp_dir = unique_test_dir("create-dataset");
+        fs::create_dir_all(&temp_dir).expect("should create temp dir");
+        let db_path = temp_dir.join("app.sqlite");
+        init_db(&db_path).expect("init_db should succeed");
+
+        let columns = vec!["col1".to_string(), "col2".to_string()];
+        let rows = vec![vec!["a".to_string(), "b".to_string()]];
+        let dataset_id =
+            create_dataset_from_rows(&db_path, "backup", "test#backup", &columns, &rows)
+                .expect("create dataset should succeed");
+
+        let conn = Connection::open(&db_path).expect("should open sqlite db");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dataset WHERE id = ?1 AND name = ?2",
+                params![dataset_id, "backup"],
+                |row| row.get(0),
+            )
+            .expect("dataset count query should succeed");
+        assert_eq!(count, 1);
+
+        let column_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM column_name WHERE dataset_id = ?1",
+                params![dataset_id],
+                |row| row.get(0),
+            )
+            .expect("column count query should succeed");
+        assert_eq!(column_count, 2);
+
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT row_count FROM dataset WHERE id = ?1",
+                params![dataset_id],
+                |row| row.get(0),
+            )
+            .expect("row count query should succeed");
+        assert_eq!(row_count, 1);
 
         fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
     }
