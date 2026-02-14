@@ -28,17 +28,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/dioxus_csv_sqlite_table.exe dist/dioxus_csv_sqlite_table-windows-x86_64.exe
+          cp target/release/dioxus_csv_sqlite_table.exe dist/BOM-windows-x86_64.exe
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dioxus_csv_sqlite_table-windows-${{ github.run_number }}
-          path: dist/dioxus_csv_sqlite_table-windows-x86_64.exe
+          name: BOM-windows-${{ github.run_number }}
+          path: dist/BOM-windows-x86_64.exe
 
       - name: Upload to GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.ref_name }}
-          files: dist/dioxus_csv_sqlite_table-windows-x86_64.exe
+          files: dist/BOM-windows-x86_64.exe
           overwrite_files: true

@@ -17,7 +17,16 @@ type QueryPageResult = (Vec<String>, Vec<Vec<String>>, i64);
 type ReloadPageResult = (Vec<String>, Vec<Vec<String>>, i64, i64);
 
 fn main() {
-    dioxus::launch(App);
+    let webview_data_dir =
+        default_webview_data_dir().expect("should resolve and create WebView2 data directory");
+
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(
+            dioxus::desktop::Config::new()
+                .with_window(dioxus::desktop::WindowBuilder::new().with_title("BOM"))
+                .with_data_directory(webview_data_dir),
+        )
+        .launch(App);
 }
 
 #[component]
@@ -873,9 +882,26 @@ fn open_connection(db_path: &Path) -> Result<Connection> {
 
 #[allow(dead_code)]
 fn default_db_path() -> Result<PathBuf> {
-    let project_dirs = ProjectDirs::from("com", "hellhbbd", "dioxus")
+    let project_dirs = ProjectDirs::from("com", "hellhbbd", "bom")
         .ok_or_else(|| anyhow!("unable to resolve data directory"))?;
     Ok(project_dirs.data_local_dir().join("datasets.sqlite"))
+}
+
+fn ensure_webview_data_dir(base_data_dir: &Path) -> Result<PathBuf> {
+    let webview_data_dir = base_data_dir.join("webview2");
+    std::fs::create_dir_all(&webview_data_dir).with_context(|| {
+        format!(
+            "failed to create webview dir: {}",
+            webview_data_dir.display()
+        )
+    })?;
+    Ok(webview_data_dir)
+}
+
+fn default_webview_data_dir() -> Result<PathBuf> {
+    let project_dirs = ProjectDirs::from("com", "hellhbbd", "bom")
+        .ok_or_else(|| anyhow!("unable to resolve data directory"))?;
+    ensure_webview_data_dir(project_dirs.data_local_dir())
 }
 
 #[allow(dead_code)]
@@ -2241,6 +2267,36 @@ mod tests {
             err.to_string().contains("sort_col out of range"),
             "unexpected error: {err:#}"
         );
+
+        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+    }
+
+    #[test]
+    fn default_db_path_uses_bom_app_directory() {
+        let db_path = default_db_path().expect("default db path should resolve");
+        let app_dir = db_path
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .expect("db path should include app directory");
+
+        assert_eq!(
+            db_path.file_name().and_then(|name| name.to_str()),
+            Some("datasets.sqlite")
+        );
+        assert_eq!(app_dir, "bom", "app data directory should be BOM");
+    }
+
+    #[test]
+    fn ensure_webview_data_dir_creates_webview2_subdir() {
+        let temp_dir = unique_test_dir("webview-data-dir");
+        fs::create_dir_all(&temp_dir).expect("should create temp dir");
+
+        let webview_dir =
+            ensure_webview_data_dir(&temp_dir).expect("webview data dir should be created");
+
+        assert_eq!(webview_dir, temp_dir.join("webview2"));
+        assert!(webview_dir.is_dir(), "webview2 directory should exist");
 
         fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
     }
