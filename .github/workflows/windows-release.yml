@@ -1,0 +1,44 @@
+name: Windows Release Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/dioxus_csv_sqlite_table.exe dist/dioxus_csv_sqlite_table-windows-x86_64.exe
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dioxus_csv_sqlite_table-windows-${{ github.run_number }}
+          path: dist/dioxus_csv_sqlite_table-windows-x86_64.exe
+
+      - name: Upload to GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          files: dist/dioxus_csv_sqlite_table-windows-x86_64.exe
+          overwrite_files: true
