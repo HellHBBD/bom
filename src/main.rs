@@ -1730,6 +1730,55 @@ fn editable_columns_for_holdings() -> Vec<String> {
     editable
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CellKey {
+    row_idx: usize,
+    column: String,
+}
+
+struct EditingState {
+    editable_columns: Vec<String>,
+    staged: HashMap<CellKey, String>,
+    active: Option<CellKey>,
+}
+
+impl EditingState {
+    fn new_for_test() -> Self {
+        Self {
+            editable_columns: editable_columns_for_holdings(),
+            staged: HashMap::new(),
+            active: None,
+        }
+    }
+
+    fn cell_id(&self, column: &str, row_idx: usize) -> CellKey {
+        CellKey {
+            row_idx,
+            column: column.to_string(),
+        }
+    }
+
+    fn start_edit(&mut self, cell: CellKey) -> bool {
+        if self.editable_columns.contains(&cell.column) {
+            self.active = Some(cell);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_edit(&mut self, cell: CellKey, value: &str) {
+        if self.editable_columns.contains(&cell.column) {
+            self.staged.insert(cell, value.to_string());
+            self.active = None;
+        }
+    }
+
+    fn staged_value(&self, cell: CellKey) -> String {
+        self.staged.get(&cell).cloned().unwrap_or_default()
+    }
+}
+
 fn import_xlsx_selected_sheets_to_sqlite(
     db_path: &Path,
     xlsx_path: &Path,
@@ -2688,5 +2737,14 @@ mod tests {
         assert!(required.contains(&"所有權人".to_string()));
         assert!(required.contains(&"配息方式".to_string()));
         assert!(!editable.contains(&"總成本".to_string()));
+    }
+
+    #[test]
+    fn apply_edit_updates_staged_value_only_for_editable_columns() {
+        let mut state = EditingState::new_for_test();
+        let cell_id = state.cell_id("所有權人", 0);
+        assert!(state.start_edit(cell_id.clone()));
+        state.apply_edit(cell_id.clone(), "王小明");
+        assert_eq!(state.staged_value(cell_id), "王小明");
     }
 }
