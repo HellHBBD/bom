@@ -7,7 +7,7 @@ use csv::StringRecord;
 use directories::ProjectDirs;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use rusqlite::{params, types::Value, Connection};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 const PAGE_SIZE: i64 = i64::MAX;
@@ -57,6 +57,16 @@ fn App() -> Element {
     let mut show_deleted = use_signal(|| false);
     let mut busy = use_signal(|| false);
     let mut status = use_signal(|| "就緒".to_string());
+    let mut staged_cells = use_signal(HashMap::<CellKey, String>::new);
+    let mut deleted_rows = use_signal(BTreeSet::<usize>::new);
+    let mut selected_rows = use_signal(BTreeSet::<usize>::new);
+    let mut editing_cell = use_signal(|| None::<CellKey>);
+    let mut editing_value = use_signal(String::new);
+    let mut added_rows = use_signal(Vec::<Vec<String>>::new);
+    let mut show_add_row = use_signal(|| false);
+    let mut new_row_inputs = use_signal(HashMap::<String, String>::new);
+    let mut context_menu = use_signal(|| None::<(f64, f64)>);
+    let mut context_row = use_signal(|| None::<usize>);
 
     let db_path = Arc::new(db_path);
     let db_path_for_init = db_path.clone();
@@ -128,14 +138,111 @@ fn App() -> Element {
         selected_group_key().and_then(|k| grouped_datasets.iter().find(|g| g.key == k).cloned());
     let current_columns = columns();
     let current_rows = rows();
+    let added_rows_snapshot = added_rows();
+    let staged_cells_snapshot = staged_cells();
+    let deleted_rows_snapshot = deleted_rows();
+    let selected_rows_snapshot = selected_rows();
+    let editing_cell_snapshot = editing_cell();
     let column_alignments: Vec<&'static str> = current_columns
         .iter()
         .enumerate()
         .map(|(idx, header)| column_alignment(header, &current_rows, idx))
         .collect();
+    let is_holdings = is_holdings_table(&current_columns);
+    let editable_columns = editable_columns_for_holdings();
+    let required_columns = required_columns_for_holdings();
+    let base_row_count = current_rows.len();
+    let total_row_count = base_row_count + added_rows_snapshot.len();
+    let has_pending_changes = !staged_cells_snapshot.is_empty()
+        || !deleted_rows_snapshot.is_empty()
+        || !added_rows_snapshot.is_empty();
+    let current_columns_for_add = current_columns.clone();
+    let get_raw_value = |row_idx: usize, col_idx: usize| -> String {
+        if let Some(header) = current_columns.get(col_idx) {
+            if let Some(value) = staged_cells_snapshot.get(&CellKey {
+                row_idx,
+                col_idx,
+                column: header.clone(),
+            }) {
+                return value.clone();
+            }
+        }
+        if row_idx < base_row_count {
+            current_rows
+                .get(row_idx)
+                .and_then(|row| row.get(col_idx))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            let new_idx = row_idx - base_row_count;
+            added_rows_snapshot
+                .get(new_idx)
+                .and_then(|row| row.get(col_idx))
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    let mut row_render_models = Vec::with_capacity(total_row_count);
+    for row_idx in 0..total_row_count {
+        let deleted = deleted_rows_snapshot.contains(&row_idx);
+        let selected = selected_rows_snapshot.contains(&row_idx);
+        let style = format!(
+            "{}{}",
+            if selected { "background: #eef4ff;" } else { "" },
+            if deleted {
+                "border-top: 2px solid #d33; border-bottom: 2px solid #d33;"
+            } else {
+                ""
+            }
+        );
+        let mut cells = Vec::with_capacity(current_columns.len());
+        for (col_idx, header) in current_columns.iter().enumerate() {
+            let raw_value = get_raw_value(row_idx, col_idx);
+            let formatted = format_cell_value(header, &raw_value);
+            let is_editing = editing_cell_snapshot
+                .as_ref()
+                .map(|cell| cell.row_idx == row_idx && cell.column == *header)
+                .unwrap_or(false);
+            let is_modified = staged_cells_snapshot.contains_key(&CellKey {
+                row_idx,
+                col_idx,
+                column: header.clone(),
+            });
+            let is_editable = editable_columns.iter().any(|c| c == header);
+            let cell_style = format!(
+                "border: 1px solid #bbb; padding: 6px; text-align: {};{}",
+                column_alignments.get(col_idx).copied().unwrap_or("left"),
+                if is_modified {
+                    " background: #d9f7d9;"
+                } else {
+                    ""
+                }
+            );
+            cells.push(CellRender {
+                row_idx,
+                col_idx,
+                header: header.clone(),
+                raw: raw_value,
+                formatted,
+                is_editing,
+                is_editable,
+                style: cell_style,
+            });
+        }
+        row_render_models.push(RowRender {
+            row_idx,
+            is_deleted: deleted,
+            style,
+            cells,
+        });
+    }
 
     rsx! {
         div {
+            onclick: move |_| {
+                context_menu.set(None);
+                context_row.set(None);
+            },
             nav {
                 style: "display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 8px 0;",
                 button {
@@ -187,6 +294,16 @@ fn App() -> Element {
                                     *sort_col.write() = None;
                                     *sort_desc.write() = false;
                                     *page.write() = 0;
+                                    staged_cells.write().clear();
+                                    deleted_rows.write().clear();
+                                    selected_rows.write().clear();
+                                    *editing_cell.write() = None;
+                                    editing_value.set(String::new());
+                                    added_rows.write().clear();
+                                    show_add_row.set(false);
+                                    new_row_inputs.write().clear();
+                                    context_menu.set(None);
+                                    context_row.set(None);
 
                                     let options = QueryOptions {
                                         global_search: global_search(),
@@ -256,6 +373,16 @@ fn App() -> Element {
 
                                     *selected_group_key.write() = next_group;
                                     *selected_dataset_id.write() = next_dataset;
+                                    staged_cells.write().clear();
+                                    deleted_rows.write().clear();
+                                    selected_rows.write().clear();
+                                    *editing_cell.write() = None;
+                                    editing_value.set(String::new());
+                                    added_rows.write().clear();
+                                    show_add_row.set(false);
+                                    new_row_inputs.write().clear();
+                                    context_menu.set(None);
+                                    context_row.set(None);
 
                                     let options = QueryOptions {
                                         global_search: global_search(),
@@ -328,6 +455,16 @@ fn App() -> Element {
                         *sort_col.write() = None;
                         *sort_desc.write() = false;
                         *page.write() = 0;
+                        staged_cells.write().clear();
+                        deleted_rows.write().clear();
+                        selected_rows.write().clear();
+                        *editing_cell.write() = None;
+                        editing_value.set(String::new());
+                        added_rows.write().clear();
+                        show_add_row.set(false);
+                        new_row_inputs.write().clear();
+                        context_menu.set(None);
+                        context_row.set(None);
                         *busy.write() = true;
 
                         let options = QueryOptions {
@@ -523,6 +660,16 @@ fn App() -> Element {
                                     move |_| {
                                         *selected_dataset_id.write() = Some(sheet.id);
                                         *page.write() = 0;
+                                        staged_cells.write().clear();
+                                        deleted_rows.write().clear();
+                                        selected_rows.write().clear();
+                                        *editing_cell.write() = None;
+                                        editing_value.set(String::new());
+                                        added_rows.write().clear();
+                                        show_add_row.set(false);
+                                        new_row_inputs.write().clear();
+                                        context_menu.set(None);
+                                        context_row.set(None);
                                         *busy.write() = true;
 
                                         let options = QueryOptions {
@@ -775,6 +922,81 @@ fn App() -> Element {
                 span { "共 {current_total_rows} 筆" }
             }
 
+            if is_holdings {
+                div { style: "display: flex; gap: 8px; align-items: center; margin: 8px 0;",
+                    button {
+                        disabled: busy(),
+                        onclick: move |_| {
+                            if busy() {
+                                return;
+                            }
+                            let mut inputs = new_row_inputs.write();
+                            inputs.clear();
+                            for col in &required_columns {
+                                inputs.insert(col.clone(), String::new());
+                            }
+                            show_add_row.set(true);
+                        },
+                        "新增列"
+                    }
+                    if has_pending_changes {
+                        span { style: "color: #0f5132;", "尚未儲存變更" }
+                    }
+                }
+                if show_add_row() {
+                    div { style: "border: 1px solid #c7c7c7; padding: 8px; margin-bottom: 8px;",
+                        div { style: "margin-bottom: 6px;", "新增列（必填欄位）" }
+                        for col in required_columns.iter() {
+                            div { style: "display: flex; gap: 8px; align-items: center; margin-bottom: 6px;",
+                                label { style: "min-width: 90px;", "{col}" }
+                                input {
+                                    value: new_row_inputs().get(col).cloned().unwrap_or_default(),
+                                    oninput: {
+                                        let col = col.clone();
+                                        move |event| {
+                                            new_row_inputs
+                                                .write()
+                                                .insert(col.clone(), event.value());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { style: "display: flex; gap: 8px;",
+                            button {
+                                onclick: move |_| {
+                                    let mut row = vec![String::new(); current_columns_for_add.len()];
+                                    for (idx, header) in current_columns_for_add.iter().enumerate() {
+                                        if let Some(value) = new_row_inputs().get(header).cloned() {
+                                            row[idx] = value;
+                                        }
+                                    }
+                                    match validate_required_holdings_row(&current_columns_for_add, &row) {
+                                        Ok(_) => {
+                                            added_rows.write().push(row);
+                                            show_add_row.set(false);
+                                            new_row_inputs.write().clear();
+                                            *status.write() = "已新增列（待儲存）".to_string();
+                                        }
+                                        Err(err) => {
+                                            *status.write() = format!("新增列失敗：{err}");
+                                        }
+                                    }
+                                },
+                                "新增"
+                            }
+                            button {
+                                onclick: move |_| {
+                                    show_add_row.set(false);
+                                    new_row_inputs.write().clear();
+                                },
+                                "取消"
+                            }
+                        }
+                    }
+                }
+            }
+
             table { style: "border-collapse: collapse; width: 100%; border: 1px solid #bbb;",
                 thead {
                     tr {
@@ -787,7 +1009,7 @@ fn App() -> Element {
                     }
                 }
                 tbody {
-                    if current_rows.is_empty() {
+                    if total_row_count == 0 {
                         tr {
                             td { style: "border: 1px solid #bbb; padding: 6px;",
                                 colspan: current_columns.len().max(1),
@@ -795,15 +1017,103 @@ fn App() -> Element {
                             }
                         }
                     } else {
-                        for row in current_rows.iter() {
+                        for row in row_render_models.clone() {
                             tr {
-                                for (idx, cell) in row.iter().enumerate() {
+                                style: "{row.style}",
+                                onclick: move |_| {
+                                    if !is_holdings {
+                                        return;
+                                    }
+                                    let mut selected = selected_rows.write();
+                                    if selected.contains(&row.row_idx) {
+                                        selected.remove(&row.row_idx);
+                                    } else {
+                                        selected.insert(row.row_idx);
+                                    }
+                                },
+                                oncontextmenu: move |event| {
+                                    if !is_holdings {
+                                        return;
+                                    }
+                                    let coords = event.client_coordinates();
+                                    context_menu.set(Some((coords.x, coords.y)));
+                                    context_row.set(Some(row.row_idx));
+                                },
+                                for cell in row.cells.clone() {
                                     td {
-                                        style: "border: 1px solid #bbb; padding: 6px; text-align: {column_alignments.get(idx).copied().unwrap_or(\"left\")};",
-                                        "{format_cell_value(current_columns.get(idx).map(String::as_str).unwrap_or(\"\"), cell)}"
+                                        style: "{cell.style}",
+                                        ondoubleclick: move |_| {
+                                            if !is_holdings || row.is_deleted {
+                                                return;
+                                            }
+                                            if !cell.is_editable {
+                                                return;
+                                            }
+                                            *editing_cell.write() = Some(CellKey {
+                                                row_idx: cell.row_idx,
+                                                col_idx: cell.col_idx,
+                                                column: cell.header.clone(),
+                                            });
+                                            editing_value.set(cell.raw.clone());
+                                        },
+                                        if cell.is_editing {
+                                            input {
+                                                value: "{editing_value()}",
+                                                oninput: move |event| {
+                                                    editing_value.set(event.value());
+                                                },
+                                                onkeydown: move |event| {
+                                                    if event.key() == Key::Enter {
+                                                        if let Some(active) = editing_cell() {
+                                                            let value = editing_value();
+                                                            if active.row_idx < base_row_count {
+                                                                staged_cells.write().insert(active, value);
+                                                            } else {
+                                                                let new_idx = active.row_idx - base_row_count;
+                                                                if let Some(row) = added_rows.write().get_mut(new_idx) {
+                                                                    if active.col_idx < row.len() {
+                                                                        row[active.col_idx] = value;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        *editing_cell.write() = None;
+                                                    } else if event.key() == Key::Escape {
+                                                        *editing_cell.write() = None;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            "{cell.formatted}"
+                                        }
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            if is_holdings {
+                if let Some((x, y)) = context_menu() {
+                    div {
+                        style: "position: fixed; left: {x}px; top: {y}px; background: #fff; border: 1px solid #999; padding: 6px; z-index: 1000;",
+                        button {
+                            onclick: move |_| {
+                                let mut targets = selected_rows();
+                                if targets.is_empty() {
+                                    if let Some(row) = context_row() {
+                                        targets.insert(row);
+                                    }
+                                }
+                                for row in targets {
+                                    deleted_rows.write().insert(row);
+                                }
+                                context_menu.set(None);
+                                context_row.set(None);
+                                *status.write() = "已標記刪除（待儲存）".to_string();
+                            },
+                            "刪除"
                         }
                     }
                 }
@@ -1696,6 +2006,11 @@ fn required_columns_for_holdings() -> Vec<String> {
     ]
 }
 
+fn is_holdings_table(headers: &[String]) -> bool {
+    let required = required_columns_for_holdings();
+    required.iter().all(|col| headers.iter().any(|h| h == col))
+}
+
 fn editable_columns_for_holdings() -> Vec<String> {
     let mut editable = Vec::new();
     for column in required_columns_for_holdings() {
@@ -1733,7 +2048,28 @@ fn editable_columns_for_holdings() -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CellKey {
     row_idx: usize,
+    col_idx: usize,
     column: String,
+}
+
+#[derive(Clone)]
+struct CellRender {
+    row_idx: usize,
+    col_idx: usize,
+    header: String,
+    raw: String,
+    formatted: String,
+    is_editing: bool,
+    is_editable: bool,
+    style: String,
+}
+
+#[derive(Clone)]
+struct RowRender {
+    row_idx: usize,
+    is_deleted: bool,
+    style: String,
+    cells: Vec<CellRender>,
 }
 
 struct EditingState {
@@ -1751,9 +2087,10 @@ impl EditingState {
         }
     }
 
-    fn cell_id(&self, column: &str, row_idx: usize) -> CellKey {
+    fn cell_id(&self, column: &str, row_idx: usize, col_idx: usize) -> CellKey {
         CellKey {
             row_idx,
+            col_idx,
             column: column.to_string(),
         }
     }
@@ -1869,8 +2206,12 @@ impl EditTableState {
     }
 
     fn is_cell_modified(&self, column: &str, row_idx: usize) -> bool {
+        let Some(col_idx) = self.header_index(column) else {
+            return false;
+        };
         self.staged_cells.contains_key(&CellKey {
             row_idx,
+            col_idx,
             column: column.to_string(),
         })
     }
@@ -2858,7 +3199,7 @@ mod tests {
     #[test]
     fn apply_edit_updates_staged_value_only_for_editable_columns() {
         let mut state = EditingState::new_for_test();
-        let cell_id = state.cell_id("所有權人", 0);
+        let cell_id = state.cell_id("所有權人", 0, 0);
         assert!(state.start_edit(cell_id.clone()));
         state.apply_edit(cell_id.clone(), "王小明");
         assert_eq!(state.staged_value(cell_id), "王小明");
@@ -2887,9 +3228,11 @@ mod tests {
     #[test]
     fn change_marking_applies_cell_and_row_styles() {
         let mut state = EditTableState::new_for_test();
+        let col_idx = state.header_index("名稱").unwrap_or(0);
         state.apply_edit(
             CellKey {
                 row_idx: 0,
+                col_idx,
                 column: "名稱".to_string(),
             },
             "新名稱",
