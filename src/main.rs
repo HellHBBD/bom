@@ -126,6 +126,13 @@ fn App() -> Element {
     let grouped_datasets = build_dataset_groups(&datasets());
     let active_group =
         selected_group_key().and_then(|k| grouped_datasets.iter().find(|g| g.key == k).cloned());
+    let current_columns = columns();
+    let current_rows = rows();
+    let column_alignments: Vec<&'static str> = current_columns
+        .iter()
+        .enumerate()
+        .map(|(idx, header)| column_alignment(header, &current_rows, idx))
+        .collect();
 
     rsx! {
         div {
@@ -771,24 +778,30 @@ fn App() -> Element {
             table { style: "border-collapse: collapse; width: 100%; border: 1px solid #bbb;",
                 thead {
                     tr {
-                        for header in columns() {
-                            th { style: "border: 1px solid #bbb; padding: 6px; background: #f2f2f2;", "{header}" }
+                        for (idx, header) in current_columns.iter().enumerate() {
+                            th {
+                                style: "border: 1px solid #bbb; padding: 6px; background: #f2f2f2; text-align: {column_alignments[idx]};",
+                                "{header}"
+                            }
                         }
                     }
                 }
                 tbody {
-                    if rows().is_empty() {
+                    if current_rows.is_empty() {
                         tr {
                             td { style: "border: 1px solid #bbb; padding: 6px;",
-                                colspan: columns().len().max(1),
+                                colspan: current_columns.len().max(1),
                                 "無資料"
                             }
                         }
                     } else {
-                        for row in rows() {
+                        for row in current_rows.iter() {
                             tr {
-                                for cell in row {
-                                    td { style: "border: 1px solid #bbb; padding: 6px;", "{cell}" }
+                                for (idx, cell) in row.iter().enumerate() {
+                                    td {
+                                        style: "border: 1px solid #bbb; padding: 6px; text-align: {column_alignments.get(idx).copied().unwrap_or(\"left\")};",
+                                        "{format_cell_value(current_columns.get(idx).map(String::as_str).unwrap_or(\"\"), cell)}"
+                                    }
                                 }
                             }
                         }
@@ -1067,11 +1080,129 @@ fn format_f64(value: f64) -> String {
     }
 }
 
+fn format_number_with_commas(value: f64, decimals: usize) -> String {
+    if !value.is_finite() {
+        return String::new();
+    }
+
+    let sign = if value < 0.0 { "-" } else { "" };
+    let abs = value.abs();
+    let raw = format!("{:.*}", decimals, abs);
+    let (int_part, frac_part) = raw.split_once('.').unwrap_or((&raw, ""));
+    let mut int_with_commas = String::new();
+    for (idx, ch) in int_part.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            int_with_commas.push(',');
+        }
+        int_with_commas.push(ch);
+    }
+    let int_with_commas: String = int_with_commas.chars().rev().collect();
+    if decimals == 0 {
+        format!("{sign}{int_with_commas}")
+    } else {
+        format!("{sign}{int_with_commas}.{frac_part}")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NumericFormat {
+    Integer,
+    TwoDecimals,
+    Percent,
+}
+
+fn is_text_header(header: &str) -> bool {
+    matches!(
+        header,
+        "名稱"
+            | "類別"
+            | "性質"
+            | "國內 /國外"
+            | "代號"
+            | "資產形式"
+            | "所有權人"
+            | "往來機構"
+            | "帳號"
+            | "幣別"
+            | "配息方式"
+    )
+}
+
+fn numeric_format_for_header(header: &str) -> NumericFormat {
+    if matches!(header, "買進" | "市價" | "買入價") {
+        NumericFormat::TwoDecimals
+    } else if matches!(
+        header,
+        "損益率" | "報酬率" | "估計殖利率" | "最新殖利率" | "差異" | "殖利率" | "累計殖利率"
+    ) {
+        NumericFormat::Percent
+    } else {
+        NumericFormat::Integer
+    }
+}
+
+fn parse_numeric_value(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (number_text, is_percent) = if trimmed.ends_with('%') {
+        (trimmed.trim_end_matches('%'), true)
+    } else {
+        (trimmed, false)
+    };
+    let cleaned = number_text.replace(',', "");
+    let parsed = cleaned.parse::<f64>().ok()?;
+    if is_percent {
+        Some(parsed / 100.0)
+    } else {
+        Some(parsed)
+    }
+}
+
+fn format_cell_value(header: &str, raw: &str) -> String {
+    if is_text_header(header) {
+        return raw.to_string();
+    }
+    let Some(value) = parse_numeric_value(raw) else {
+        return raw.to_string();
+    };
+    match numeric_format_for_header(header) {
+        NumericFormat::Percent => format!("{}%", format_number_with_commas(value * 100.0, 2)),
+        NumericFormat::TwoDecimals => format_number_with_commas(value, 2),
+        NumericFormat::Integer => format_number_with_commas(value, 0),
+    }
+}
+
+fn column_alignment(header: &str, rows: &[Vec<String>], column_idx: usize) -> &'static str {
+    if is_text_header(header) {
+        return "left";
+    }
+    let is_numeric = rows.iter().any(|row| {
+        row.get(column_idx)
+            .and_then(|value| parse_numeric_value(value))
+            .is_some()
+    });
+    if is_numeric {
+        "right"
+    } else {
+        "left"
+    }
+}
+
 fn safe_div(numerator: f64, denominator: f64) -> f64 {
     if denominator.abs() < f64::EPSILON {
         0.0
     } else {
         numerator / denominator
+    }
+}
+
+fn format_ratio_or_na(numerator: f64, denominator: f64) -> String {
+    if denominator.abs() < f64::EPSILON {
+        "N/A".to_string()
+    } else {
+        format_f64(numerator / denominator)
     }
 }
 
@@ -1177,11 +1308,9 @@ fn transform_holdings_sheet(
 
         let total_cost = buy * qty;
         let capital_gain = (price - buy) * qty;
-        let gain_rate = safe_div(capital_gain, total_cost);
         let net_value = total_cost + capital_gain;
         let received_dividend = 0.0;
         let total_gain = capital_gain + received_dividend;
-        let roi = safe_div(total_gain, total_cost);
         let estimated_dividend = annual_dividend * qty;
         let estimated_yield = safe_div(estimated_dividend, total_cost);
         let latest_yield = safe_div(latest_dividend * freq, price);
@@ -1218,14 +1347,14 @@ fn transform_holdings_sheet(
             format_f64(latest_dividend),
             format_f64(total_cost),
             format_f64(capital_gain),
-            format_f64(gain_rate),
+            format_ratio_or_na(capital_gain, total_cost),
             format_f64(net_value),
             format_f64(received_dividend),
             format_f64(total_gain),
-            format_f64(roi),
+            format_ratio_or_na(total_gain, total_cost),
             format_f64(estimated_dividend),
-            format_f64(estimated_yield),
-            format_f64(latest_yield),
+            format_ratio_or_na(estimated_dividend, total_cost),
+            format_ratio_or_na(latest_dividend * freq, price),
             format_f64(latest_income),
             format_f64(diff),
             format_f64(if is_stock { total_cost } else { 0.0 }),
@@ -1251,36 +1380,45 @@ fn transform_assets_sheet(
         "往來機構".to_string(),
         "帳號".to_string(),
         "幣別".to_string(),
-        "投入金額".to_string(),
-        "匯率".to_string(),
-        "目前淨值".to_string(),
-        "損益率".to_string(),
-        "損益".to_string(),
+        "餘額".to_string(),
+        "交割款".to_string(),
     ];
 
     let mut output = Vec::new();
     for row in rows {
         let asset_form = row_value(row, 0);
-        if asset_form.trim().is_empty() || is_summary_label(&asset_form) {
+        if asset_form.trim().is_empty()
+            || is_summary_label(&asset_form)
+            || asset_form.trim() == "交割款"
+        {
             continue;
         }
         let owner = row_value(row, 1);
         let institution = row_value(row, 2);
         let account = row_value(row, 3);
         let currency = row_value(row, 4);
-        let mut cost = parse_f64(&row_value(row, 5));
-        let fx = parse_f64(&row_value(row, 14));
+        if owner.trim().is_empty()
+            || institution.trim().is_empty()
+            || account.trim().is_empty()
+            || currency.trim().is_empty()
+        {
+            continue;
+        }
+        let balance_raw = row_value(row, 5);
+        let Some(balance_value) = parse_numeric_value(&balance_raw) else {
+            continue;
+        };
+        let mut cost = balance_value;
         let is_investment = asset_form.contains("投資") || asset_form.contains("股票");
         if is_investment {
             cost = holdings_total_cost;
         }
-        let net = if is_investment {
+        let balance = if is_investment {
             holdings_total_net
         } else {
             cost
         };
-        let profit = net - cost;
-        let rate = safe_div(profit, cost);
+        let settlement = String::new();
 
         output.push(vec![
             asset_form,
@@ -1288,11 +1426,8 @@ fn transform_assets_sheet(
             institution,
             account,
             currency,
-            format_f64(cost),
-            format_f64(fx),
-            format_f64(net),
-            format_f64(rate),
-            format_f64(profit),
+            format_f64(balance),
+            settlement,
         ]);
     }
 
@@ -1373,12 +1508,10 @@ fn transform_dividend_sheet(
             0.0
         };
         let estimated = hold.estimated_dividend;
-        let yield_rate = safe_div(estimated, principal);
         let y2024 = prev_total - y2023;
         let total = prev_total + current_total;
         let expected = estimated;
         let variance = current_total - expected;
-        let cumulative_yield = safe_div(total, principal);
 
         let mut result = vec![
             name,
@@ -1401,13 +1534,13 @@ fn transform_dividend_sheet(
             format_f64(debt),
             format_f64(stock),
             format_f64(estimated),
-            format_f64(yield_rate),
+            format_ratio_or_na(estimated, principal),
             format_f64(y2024),
             format_f64(current_total),
             format_f64(total),
             format_f64(expected),
             format_f64(variance),
-            format_f64(cumulative_yield),
+            format_ratio_or_na(total, principal),
         ]);
 
         output.push(result);
@@ -1493,7 +1626,108 @@ fn merge_holdings_and_dividends(
         merged_rows.push(row);
     }
 
-    (merged_headers, merged_rows)
+    let preferred_order = [
+        "所有權人",
+        "名稱",
+        "類別",
+        "性質",
+        "國內 /國外",
+        "代號",
+        "買進",
+        "市價",
+        "數量",
+        "配息方式",
+        "期數",
+    ];
+    reorder_headers_and_rows(&merged_headers, &merged_rows, &preferred_order)
+}
+
+fn reorder_headers_and_rows(
+    headers: &[String],
+    rows: &[Vec<String>],
+    preferred_order: &[&str],
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut indices = Vec::new();
+    let mut used = vec![false; headers.len()];
+
+    for &name in preferred_order {
+        if let Some((idx, _)) = headers
+            .iter()
+            .enumerate()
+            .find(|(_, header)| header.as_str() == name)
+        {
+            indices.push(idx);
+            used[idx] = true;
+        }
+    }
+
+    for (idx, _) in headers.iter().enumerate() {
+        if !used[idx] {
+            indices.push(idx);
+        }
+    }
+
+    let new_headers = indices.iter().map(|&idx| headers[idx].clone()).collect();
+    let mut new_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut reordered = Vec::with_capacity(indices.len());
+        for &idx in &indices {
+            reordered.push(row.get(idx).cloned().unwrap_or_default());
+        }
+        new_rows.push(reordered);
+    }
+
+    (new_headers, new_rows)
+}
+
+fn required_columns_for_holdings() -> Vec<String> {
+    vec![
+        "所有權人".to_string(),
+        "名稱".to_string(),
+        "類別".to_string(),
+        "性質".to_string(),
+        "國內 /國外".to_string(),
+        "代號".to_string(),
+        "買進".to_string(),
+        "市價".to_string(),
+        "數量".to_string(),
+        "配息方式".to_string(),
+        "期數".to_string(),
+    ]
+}
+
+fn editable_columns_for_holdings() -> Vec<String> {
+    let mut editable = Vec::new();
+    for column in required_columns_for_holdings() {
+        if !editable.contains(&column) {
+            editable.push(column);
+        }
+    }
+
+    let additional = [
+        "2023年",
+        "去年度累積",
+        "1月",
+        "2月",
+        "3月",
+        "4月",
+        "5月",
+        "6月",
+        "7月",
+        "8月",
+        "9月",
+        "10月",
+        "11月",
+        "12月",
+    ];
+    for column in additional {
+        let value = column.to_string();
+        if !editable.contains(&value) {
+            editable.push(value);
+        }
+    }
+
+    editable
 }
 
 fn import_xlsx_selected_sheets_to_sqlite(
@@ -2299,5 +2533,160 @@ mod tests {
         assert!(webview_dir.is_dir(), "webview2 directory should exist");
 
         fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+    }
+
+    #[test]
+    fn format_number_with_commas_handles_decimals() {
+        assert_eq!(format_number_with_commas(12345.678, 0), "12,346");
+        assert_eq!(format_number_with_commas(12345.678, 2), "12,345.68");
+        assert_eq!(format_number_with_commas(-1234.5, 2), "-1,234.50");
+    }
+
+    #[test]
+    fn format_cell_value_applies_header_rules() {
+        assert_eq!(format_cell_value("買進", "1234.5"), "1,234.50");
+        assert_eq!(format_cell_value("損益率", "0.1234"), "12.34%");
+        assert_eq!(format_cell_value("代號", "0050"), "0050");
+    }
+
+    #[test]
+    fn column_alignment_prefers_text_headers() {
+        let rows = vec![vec!["0050".to_string()], vec!["006208".to_string()]];
+        assert_eq!(column_alignment("代號", &rows, 0), "left");
+    }
+
+    #[test]
+    fn format_ratio_or_na_handles_zero_denominator() {
+        assert_eq!(format_ratio_or_na(10.0, 0.0), "N/A");
+        assert_eq!(format_ratio_or_na(25.0, 200.0), "0.125");
+    }
+
+    #[test]
+    fn transform_assets_sheet_keeps_required_columns_and_adds_settlement_column() {
+        let rows = vec![
+            vec![
+                "證券戶".to_string(),
+                "王小明".to_string(),
+                "元大證券".to_string(),
+                "A12345".to_string(),
+                "TWD".to_string(),
+                "100000".to_string(),
+            ],
+            vec![
+                "銀行活存".to_string(),
+                "王小明".to_string(),
+                "台灣銀行".to_string(),
+                "B67890".to_string(),
+                "TWD".to_string(),
+                "50000".to_string(),
+            ],
+            vec![
+                "銀行活存".to_string(),
+                "".to_string(),
+                "台灣銀行".to_string(),
+                "C00001".to_string(),
+                "TWD".to_string(),
+                "40000".to_string(),
+            ],
+            vec![
+                "銀行活存".to_string(),
+                "王小明".to_string(),
+                "台灣銀行".to_string(),
+                "C00002".to_string(),
+                "TWD".to_string(),
+                "N/A".to_string(),
+            ],
+            vec![
+                "交割款".to_string(),
+                "王小明".to_string(),
+                "元大證券".to_string(),
+                "A12345".to_string(),
+                "TWD".to_string(),
+                "777".to_string(),
+            ],
+        ];
+
+        let (headers, data) = transform_assets_sheet(&rows, 0.0, 0.0);
+
+        assert_eq!(
+            headers,
+            vec![
+                "資產形式",
+                "所有權人",
+                "往來機構",
+                "帳號",
+                "幣別",
+                "餘額",
+                "交割款"
+            ]
+        );
+        assert_eq!(data.len(), 2, "格式不正確與交割款列應移除");
+        assert_eq!(data[0][0], "證券戶");
+        assert_eq!(data[0][6], "", "交割款預設應為空白");
+        assert_eq!(data[1][0], "銀行活存");
+        assert_eq!(data[1][6], "");
+    }
+
+    #[test]
+    fn reorder_headers_and_rows_applies_preferred_order() {
+        let headers = vec![
+            "名稱".to_string(),
+            "類別".to_string(),
+            "性質".to_string(),
+            "國內 /國外".to_string(),
+            "代號".to_string(),
+            "買進".to_string(),
+            "市價".to_string(),
+            "數量".to_string(),
+            "所有權人".to_string(),
+            "配息方式".to_string(),
+            "期數".to_string(),
+            "其他".to_string(),
+        ];
+        let rows = vec![headers.iter().map(|h| h.clone()).collect::<Vec<_>>()];
+        let preferred = [
+            "所有權人",
+            "名稱",
+            "類別",
+            "性質",
+            "國內 /國外",
+            "代號",
+            "買進",
+            "市價",
+            "數量",
+            "配息方式",
+            "期數",
+        ];
+
+        let (new_headers, new_rows) = reorder_headers_and_rows(&headers, &rows, &preferred);
+
+        assert_eq!(
+            new_headers,
+            vec![
+                "所有權人",
+                "名稱",
+                "類別",
+                "性質",
+                "國內 /國外",
+                "代號",
+                "買進",
+                "市價",
+                "數量",
+                "配息方式",
+                "期數",
+                "其他"
+            ]
+        );
+        assert_eq!(new_rows[0], new_headers);
+    }
+
+    #[test]
+    fn holdings_editable_and_required_columns_match_spec() {
+        let required = required_columns_for_holdings();
+        let editable = editable_columns_for_holdings();
+        assert!(required.iter().all(|c| editable.contains(c)));
+        assert!(required.contains(&"所有權人".to_string()));
+        assert!(required.contains(&"配息方式".to_string()));
+        assert!(!editable.contains(&"總成本".to_string()));
     }
 }
