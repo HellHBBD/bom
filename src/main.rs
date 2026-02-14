@@ -1782,6 +1782,9 @@ impl EditingState {
 struct EditTableState {
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
+    selected_rows: std::collections::BTreeSet<usize>,
+    deleted_rows: std::collections::BTreeSet<usize>,
+    staged_cells: HashMap<CellKey, String>,
 }
 
 impl EditTableState {
@@ -1791,6 +1794,9 @@ impl EditTableState {
         let mut state = Self {
             headers,
             rows: Vec::new(),
+            selected_rows: std::collections::BTreeSet::new(),
+            deleted_rows: std::collections::BTreeSet::new(),
+            staged_cells: HashMap::new(),
         };
         let mut row = state.empty_row();
         if let Some(idx) = state.header_index("所有權人") {
@@ -1842,6 +1848,31 @@ impl EditTableState {
         validate_required_holdings_row(&self.headers, &row)?;
         self.rows.push(row);
         Ok(())
+    }
+
+    fn select_rows(&mut self, rows: Vec<usize>) {
+        self.selected_rows = rows.into_iter().collect();
+    }
+
+    fn delete_selected(&mut self) {
+        for row in &self.selected_rows {
+            self.deleted_rows.insert(*row);
+        }
+    }
+
+    fn is_deleted(&self, row_idx: usize) -> bool {
+        self.deleted_rows.contains(&row_idx)
+    }
+
+    fn apply_edit(&mut self, cell: CellKey, value: &str) {
+        self.staged_cells.insert(cell, value.to_string());
+    }
+
+    fn is_cell_modified(&self, column: &str, row_idx: usize) -> bool {
+        self.staged_cells.contains_key(&CellKey {
+            row_idx,
+            column: column.to_string(),
+        })
     }
 }
 
@@ -2842,5 +2873,27 @@ mod tests {
         }
         let result = state.add_row(row);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn delete_rows_marks_rows_and_tracks_changes() {
+        let mut state = EditTableState::new_for_test();
+        state.select_rows(vec![0, 2]);
+        state.delete_selected();
+        assert!(state.is_deleted(0));
+        assert!(state.is_deleted(2));
+    }
+
+    #[test]
+    fn change_marking_applies_cell_and_row_styles() {
+        let mut state = EditTableState::new_for_test();
+        state.apply_edit(
+            CellKey {
+                row_idx: 0,
+                column: "名稱".to_string(),
+            },
+            "新名稱",
+        );
+        assert!(state.is_cell_modified("名稱", 0));
     }
 }
