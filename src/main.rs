@@ -2077,15 +2077,7 @@ fn row_value(row: &[String], idx: usize) -> String {
     row.get(idx).cloned().unwrap_or_default()
 }
 
-fn transform_holdings_sheet(
-    rows: &[Vec<String>],
-) -> (
-    Vec<String>,
-    Vec<Vec<String>>,
-    HashMap<String, HoldingDerived>,
-    f64,
-    f64,
-) {
+fn transform_holdings_sheet(rows: &[Vec<String>]) -> HoldingsTransform {
     let headers = vec![
         "名稱".to_string(),
         "類別".to_string(),
@@ -2199,7 +2191,13 @@ fn transform_holdings_sheet(
         ]);
     }
 
-    (headers, output, by_code, total_cost_sum, total_net_sum)
+    HoldingsTransform {
+        headers,
+        rows: output,
+        by_code,
+        total_cost: total_cost_sum,
+        total_net: total_net_sum,
+    }
 }
 
 fn transform_assets_sheet(
@@ -2582,149 +2580,12 @@ enum PendingAction {
     },
 }
 
-struct EditingState {
-    editable_columns: Vec<String>,
-    staged: HashMap<CellKey, String>,
-    active: Option<CellKey>,
-}
-
-impl EditingState {
-    fn new_for_test() -> Self {
-        Self {
-            editable_columns: editable_columns_for_holdings(),
-            staged: HashMap::new(),
-            active: None,
-        }
-    }
-
-    fn cell_id(&self, column: &str, row_idx: usize, col_idx: usize) -> CellKey {
-        CellKey {
-            row_idx,
-            col_idx,
-            column: column.to_string(),
-        }
-    }
-
-    fn start_edit(&mut self, cell: CellKey) -> bool {
-        if self.editable_columns.contains(&cell.column) {
-            self.active = Some(cell);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn apply_edit(&mut self, cell: CellKey, value: &str) {
-        if self.editable_columns.contains(&cell.column) {
-            self.staged.insert(cell, value.to_string());
-            self.active = None;
-        }
-    }
-
-    fn staged_value(&self, cell: CellKey) -> String {
-        self.staged.get(&cell).cloned().unwrap_or_default()
-    }
-}
-
-struct EditTableState {
+struct HoldingsTransform {
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
-    selected_rows: std::collections::BTreeSet<usize>,
-    deleted_rows: std::collections::BTreeSet<usize>,
-    staged_cells: HashMap<CellKey, String>,
-}
-
-impl EditTableState {
-    fn new_for_test() -> Self {
-        let mut headers = required_columns_for_holdings();
-        headers.push("其他".to_string());
-        let mut state = Self {
-            headers,
-            rows: Vec::new(),
-            selected_rows: std::collections::BTreeSet::new(),
-            deleted_rows: std::collections::BTreeSet::new(),
-            staged_cells: HashMap::new(),
-        };
-        let mut row = state.empty_row();
-        if let Some(idx) = state.header_index("所有權人") {
-            row[idx] = "王小明".to_string();
-        }
-        if let Some(idx) = state.header_index("名稱") {
-            row[idx] = "測試".to_string();
-        }
-        if let Some(idx) = state.header_index("類別") {
-            row[idx] = "ETF".to_string();
-        }
-        if let Some(idx) = state.header_index("性質") {
-            row[idx] = "股票".to_string();
-        }
-        if let Some(idx) = state.header_index("國內 /國外") {
-            row[idx] = "國內".to_string();
-        }
-        if let Some(idx) = state.header_index("代號") {
-            row[idx] = "0050".to_string();
-        }
-        if let Some(idx) = state.header_index("買進") {
-            row[idx] = "100".to_string();
-        }
-        if let Some(idx) = state.header_index("市價") {
-            row[idx] = "105".to_string();
-        }
-        if let Some(idx) = state.header_index("數量") {
-            row[idx] = "10".to_string();
-        }
-        if let Some(idx) = state.header_index("配息方式") {
-            row[idx] = "現金".to_string();
-        }
-        if let Some(idx) = state.header_index("期數") {
-            row[idx] = "4".to_string();
-        }
-        state.rows.push(row);
-        state
-    }
-
-    fn header_index(&self, name: &str) -> Option<usize> {
-        self.headers.iter().position(|h| h == name)
-    }
-
-    fn empty_row(&self) -> Vec<String> {
-        vec![String::new(); self.headers.len()]
-    }
-
-    fn add_row(&mut self, row: Vec<String>) -> Result<(), String> {
-        validate_required_holdings_row(&self.headers, &row)?;
-        self.rows.push(row);
-        Ok(())
-    }
-
-    fn select_rows(&mut self, rows: Vec<usize>) {
-        self.selected_rows = rows.into_iter().collect();
-    }
-
-    fn delete_selected(&mut self) {
-        for row in &self.selected_rows {
-            self.deleted_rows.insert(*row);
-        }
-    }
-
-    fn is_deleted(&self, row_idx: usize) -> bool {
-        self.deleted_rows.contains(&row_idx)
-    }
-
-    fn apply_edit(&mut self, cell: CellKey, value: &str) {
-        self.staged_cells.insert(cell, value.to_string());
-    }
-
-    fn is_cell_modified(&self, column: &str, row_idx: usize) -> bool {
-        let Some(col_idx) = self.header_index(column) else {
-            return false;
-        };
-        self.staged_cells.contains_key(&CellKey {
-            row_idx,
-            col_idx,
-            column: column.to_string(),
-        })
-    }
+    by_code: HashMap<String, HoldingDerived>,
+    total_cost: f64,
+    total_net: f64,
 }
 
 fn validate_required_holdings_row(headers: &[String], row: &[String]) -> Result<(), String> {
@@ -2787,12 +2648,13 @@ fn import_xlsx_selected_sheets_to_sqlite(
         .map(|r| r.iter().map(cell_to_string).collect())
         .collect();
 
-    let (holdings_headers, holdings_data, by_code, total_cost, total_net) =
-        transform_holdings_sheet(&holdings_rows);
-    let (assets_headers, assets_data) = transform_assets_sheet(&assets_rows, total_cost, total_net);
-    let (_dividend_headers, dividend_data) = transform_dividend_sheet(&dividends_rows, &by_code);
+    let holdings = transform_holdings_sheet(&holdings_rows);
+    let (assets_headers, assets_data) =
+        transform_assets_sheet(&assets_rows, holdings.total_cost, holdings.total_net);
+    let (_dividend_headers, dividend_data) =
+        transform_dividend_sheet(&dividends_rows, &holdings.by_code);
     let (merged_headers, merged_data) =
-        merge_holdings_and_dividends(holdings_headers, holdings_data, &dividend_data);
+        merge_holdings_and_dividends(holdings.headers, holdings.rows, &dividend_data);
 
     let transformed = vec![
         ("資產總表", assets_headers, assets_data),
@@ -3826,47 +3688,73 @@ mod tests {
     }
 
     #[test]
-    fn apply_edit_updates_staged_value_only_for_editable_columns() {
-        let mut state = EditingState::new_for_test();
-        let cell_id = state.cell_id("所有權人", 0, 0);
-        assert!(state.start_edit(cell_id.clone()));
-        state.apply_edit(cell_id.clone(), "王小明");
-        assert_eq!(state.staged_value(cell_id), "王小明");
+    fn build_updated_rows_applies_staged_values() {
+        let columns = vec!["所有權人".to_string(), "名稱".to_string()];
+        let rows = vec![vec!["王小明".to_string(), "舊名稱".to_string()]];
+        let mut staged = HashMap::new();
+        staged.insert(
+            CellKey {
+                row_idx: 0,
+                col_idx: 1,
+                column: "名稱".to_string(),
+            },
+            "新名稱".to_string(),
+        );
+        let deleted = BTreeSet::new();
+        let added = Vec::new();
+
+        let updated = build_updated_rows(&columns, &rows, &staged, &deleted, &added);
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0][1], "新名稱");
     }
 
     #[test]
-    fn add_row_requires_required_fields() {
-        let mut state = EditTableState::new_for_test();
-        let mut row = state.empty_row();
-        if let Some(idx) = state.header_index("所有權人") {
-            row[idx] = String::new();
-        }
-        let result = state.add_row(row);
+    fn validate_required_holdings_row_rejects_empty_required_field() {
+        let headers = required_columns_for_holdings();
+        let mut row = vec!["X".to_string(); headers.len()];
+        let owner_idx = headers
+            .iter()
+            .position(|h| h == "所有權人")
+            .expect("should have required header");
+        row[owner_idx] = String::new();
+
+        let result = validate_required_holdings_row(&headers, &row);
+
         assert!(result.is_err());
     }
 
     #[test]
-    fn delete_rows_marks_rows_and_tracks_changes() {
-        let mut state = EditTableState::new_for_test();
-        state.select_rows(vec![0, 2]);
-        state.delete_selected();
-        assert!(state.is_deleted(0));
-        assert!(state.is_deleted(2));
+    fn build_updated_rows_skips_deleted_rows() {
+        let columns = vec!["所有權人".to_string()];
+        let rows = vec![
+            vec!["A".to_string()],
+            vec!["B".to_string()],
+            vec!["C".to_string()],
+        ];
+        let staged = HashMap::new();
+        let mut deleted = BTreeSet::new();
+        deleted.insert(0);
+        deleted.insert(2);
+        let added = Vec::new();
+
+        let updated = build_updated_rows(&columns, &rows, &staged, &deleted, &added);
+
+        assert_eq!(updated, vec![vec!["B".to_string()]]);
     }
 
     #[test]
-    fn change_marking_applies_cell_and_row_styles() {
-        let mut state = EditTableState::new_for_test();
-        let col_idx = state.header_index("名稱").unwrap_or(0);
-        state.apply_edit(
-            CellKey {
-                row_idx: 0,
-                col_idx,
-                column: "名稱".to_string(),
-            },
-            "新名稱",
-        );
-        assert!(state.is_cell_modified("名稱", 0));
+    fn build_updated_rows_appends_added_rows() {
+        let columns = vec!["所有權人".to_string(), "名稱".to_string()];
+        let rows = vec![vec!["A".to_string(), "X".to_string()]];
+        let staged = HashMap::new();
+        let deleted = BTreeSet::new();
+        let added = vec![vec!["B".to_string(), "Y".to_string()]];
+
+        let updated = build_updated_rows(&columns, &rows, &staged, &deleted, &added);
+
+        assert_eq!(updated.len(), 2);
+        assert_eq!(updated[1], vec!["B".to_string(), "Y".to_string()]);
     }
 
     #[test]

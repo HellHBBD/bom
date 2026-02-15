@@ -1,5 +1,5 @@
 [package]
-name = "dioxus_csv_sqlite_table"
+name = "BOM"
 version = "0.1.0"
 authors = ["Hell HBBD <paulyu602@gmail.com>"]
 edition = "2021"

@@ -3,6 +3,20 @@
 version = 4
 
 [[package]]
+name = "BOM"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calamine",
+ "chrono",
+ "csv",
+ "dioxus",
+ "directories",
+ "rfd 0.14.1",
+ "rusqlite",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1704,20 +1718,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
-]
-
-[[package]]
-name = "dioxus_csv_sqlite_table"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calamine",
- "chrono",
- "csv",
- "dioxus",
- "directories",
- "rfd 0.14.1",
- "rusqlite",
 ]
 
 [[package]]

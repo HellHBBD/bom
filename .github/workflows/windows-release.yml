@@ -1,19 +1,20 @@
-name: Windows Release Build
+name: Windows Build (push) + Desktop Bundle (tag)
 
 on:
   push:
-    branches:
-      - "main"
-    tags:
-      - "v*"
+    branches: ["main"]
+    tags: ["v*"]
   release:
     types: [published]
 
 permissions:
   contents: write
 
+env:
+  BIN_NAME: BOM
+
 jobs:
-  build-windows:
+  windows:
     runs-on: windows-latest
 
     steps:
@@ -23,25 +24,108 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
-      - name: Prepare artifact
+      # -----------------------------
+      # PUSH main: cargo build (debug)
+      # -----------------------------
+      - name: Cargo build (debug)
+        if: github.ref_type == 'branch'
+        run: cargo build --locked
+
+      - name: Prepare debug exe artifact
+        if: github.ref_type == 'branch'
         shell: bash
         run: |
+          set -euxo pipefail
           mkdir -p dist
-          cp target/release/dioxus_csv_sqlite_table.exe dist/BOM-windows-x86_64.exe
+          cp "target/debug/${BIN_NAME}.exe" "dist/${BIN_NAME}-windows-debug.exe"
 
-      - name: Upload workflow artifact
+      - name: Upload debug exe artifact
+        if: github.ref_type == 'branch'
         uses: actions/upload-artifact@v4
         with:
-          name: BOM-windows-${{ github.run_number }}
-          path: dist/BOM-windows-x86_64.exe
+          name: ${{ env.BIN_NAME }}-windows-debug-${{ github.run_number }}
+          path: dist/${{ env.BIN_NAME }}-windows-debug.exe
+
+      # ------------------------------------
+      # TAG / RELEASE: dx bundle (desktop)
+      # ------------------------------------
+      - name: Install dx (prebuilt, A方案)
+        if: github.ref_type == 'tag' || github.event_name == 'release'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -sSL https://dioxus.dev/install.sh | bash
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          dx --version
+
+      - name: dx bundle (windows desktop)
+        if: github.ref_type == 'tag' || github.event_name == 'release'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          dx bundle --platform desktop
+
+      # 從 bundle 產物中「抽出 app exe」到 dist/，不自己 zip
+      - name: Extract bundled exe (no zip)
+        if: github.ref_type == 'tag' || github.event_name == 'release'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # 常見 bundle 輸出路徑（不同 dx 版本可能略不同）
+          $candidates = @(
+            "target\dx\bundle",
+            "target\dioxus\bundle"
+          )
+
+          $bundleRoot = $null
+          foreach ($p in $candidates) {
+            if (Test-Path $p) { $bundleRoot = $p; break }
+          }
+
+          if (-not $bundleRoot) {
+            Write-Host "Bundle directory not found. Listing target:"
+            Get-ChildItem -Recurse -Depth 4 target | Select-Object FullName | Out-Host
+            throw "Cannot find dx bundle output directory."
+          }
+
+          Write-Host "Bundle root: $bundleRoot"
+
+          # 找你的 exe（排除常見非你 app 的 exe，例如 dx.exe）
+          $binName = "${env:BIN_NAME}.exe"
+
+          $exe = Get-ChildItem -Path $bundleRoot -Recurse -Filter $binName -File |
+            Where-Object { $_.Name -ieq $binName } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Host "Could not find $binName under $bundleRoot"
+            Write-Host "All exe files under bundle root:"
+            Get-ChildItem -Path $bundleRoot -Recurse -Filter *.exe -File | Select-Object FullName | Out-Host
+            throw "Bundled exe not found."
+          }
+
+          Copy-Item $exe.FullName "dist\${env:BIN_NAME}-windows-bundled.exe" -Force
+          Write-Host "Bundled exe copied: dist\${env:BIN_NAME}-windows-bundled.exe"
+
+      - name: Upload bundled exe artifact
+        if: github.ref_type == 'tag' || github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-windows-bundled-${{ github.ref_name }}
+          path: dist/${{ env.BIN_NAME }}-windows-bundled.exe
 
       - name: Upload to GitHub Release assets
         if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.ref_name }}
-          files: dist/BOM-windows-x86_64.exe
+          files: dist/${{ env.BIN_NAME }}-windows-bundled.exe
           overwrite_files: true
