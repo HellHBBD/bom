@@ -1076,8 +1076,9 @@ fn App() -> Element {
                                     }
                                     let mut selected = selected_rows.write();
                                     if selected.contains(&row.row_idx) {
-                                        selected.remove(&row.row_idx);
+                                        selected.clear();
                                     } else {
+                                        selected.clear();
                                         selected.insert(row.row_idx);
                                     }
                                 },
