@@ -1,20 +1,74 @@
+mod app;
+mod domain;
+mod infra;
+mod platform;
+mod ui;
+mod usecase;
+
 use dioxus::prelude::*;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use calamine::{open_workbook_auto, Data, Reader};
-use csv::StringRecord;
 use directories::ProjectDirs;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use rusqlite::{params, types::Value, Connection};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-const PAGE_SIZE: i64 = i64::MAX;
+use crate::domain::entities::dataset::{
+    ColumnFilter, DatasetId, PageQuery, SortDirection, SortSpec,
+};
+use crate::domain::entities::edit::{CellKey, StagedEdits};
+use crate::infra::sqlite::repo::SqliteRepo;
+use crate::usecase::ports::repo::{DatasetMeta, DatasetRepository, NewDatasetMeta, TabularData};
+use crate::usecase::services::edit_service::EditService;
+use crate::usecase::services::import_service::ImportService;
+use crate::usecase::services::query_service::QueryService;
+
+pub const PAGE_SIZE: i64 = i64::MAX;
 const NONE_OPTION_VALUE: &str = "__none__";
 
-type QueryPageResult = (Vec<String>, Vec<Vec<String>>, i64);
 type ReloadPageResult = (Vec<String>, Vec<Vec<String>>, i64, i64);
+
+fn build_page_query(dataset_id: i64, page: i64, options: &QueryOptions) -> PageQuery {
+    let column_filter = options.column_search_col.map(|col| ColumnFilter {
+        column_idx: col,
+        term: options.column_search_text.clone(),
+    });
+    let sort = options.sort_col.map(|col| SortSpec {
+        column_idx: col,
+        direction: if options.sort_desc {
+            SortDirection::Desc
+        } else {
+            SortDirection::Asc
+        },
+    });
+    PageQuery {
+        dataset_id: dataset_id.into(),
+        page,
+        page_size: PAGE_SIZE,
+        global_search: options.global_search.clone(),
+        column_filter,
+        sort,
+    }
+}
+
+fn reload_page_data_usecase(
+    service: &QueryService,
+    dataset_id: Option<i64>,
+    target_page: i64,
+    options: &QueryOptions,
+) -> Result<ReloadPageResult> {
+    let page = target_page.max(0);
+    if let Some(dataset_id) = dataset_id {
+        let query = build_page_query(dataset_id, page, options);
+        let result = service
+            .query_page(query)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        Ok((result.columns, result.rows, result.total_rows, page))
+    } else {
+        Ok((Vec::new(), Vec::new(), 0, 0))
+    }
+}
 
 fn main() {
     let webview_data_dir =
@@ -26,9 +80,10 @@ fn main() {
                 .with_window(dioxus::desktop::WindowBuilder::new().with_title("BOM"))
                 .with_data_directory(webview_data_dir),
         )
-        .launch(App);
+        .launch(app::App);
 }
 
+#[allow(dead_code)]
 #[component]
 fn App() -> Element {
     let db_path = match default_db_path() {
@@ -42,7 +97,7 @@ fn App() -> Element {
         }
     };
 
-    let mut datasets = use_signal(Vec::<DatasetSummary>::new);
+    let mut datasets = use_signal(Vec::<DatasetMeta>::new);
     let mut selected_group_key = use_signal(|| None::<String>);
     let mut selected_dataset_id = use_signal(|| None::<i64>);
     let mut columns = use_signal(Vec::<String>::new);
@@ -73,23 +128,38 @@ fn App() -> Element {
     let mut save_as_name = use_signal(default_dataset_name_mmdd);
 
     let db_path = Arc::new(db_path);
-    let db_path_for_init = db_path.clone();
+    let repo = Arc::new(SqliteRepo {
+        db_path: (*db_path).clone(),
+    });
+    let query_service = Arc::new(QueryService::new(repo.clone()));
+    let edit_service = Arc::new(EditService::new(repo.clone()));
+    let import_service = Arc::new(ImportService::new((*db_path).clone()));
+    let repo_for_init = repo.clone();
+    let query_service_for_init = query_service.clone();
     use_effect(move || {
         *busy.write() = true;
-        match init_db(&db_path_for_init).and_then(|_| list_datasets(&db_path_for_init, false)) {
+        let init_result = repo_for_init
+            .init()
+            .map_err(|err| anyhow!(err.to_string()))
+            .and_then(|_| {
+                query_service_for_init
+                    .list_datasets(false)
+                    .map_err(|err| anyhow!(err.to_string()))
+            });
+        match init_result {
             Ok(available) => {
                 let groups = build_dataset_groups(&available);
                 let first_dataset = groups
                     .first()
                     .and_then(|g| g.datasets.first())
-                    .map(|dataset| dataset.id);
+                    .map(|dataset| dataset.id.0);
                 *datasets.write() = available;
                 *selected_group_key.write() = groups.first().map(|g| g.key.clone());
                 *selected_dataset_id.write() = first_dataset;
                 *page.write() = 0;
 
-                match reload_page_data(
-                    &db_path_for_init,
+                match reload_page_data_usecase(
+                    &query_service_for_init,
                     first_dataset,
                     0,
                     &QueryOptions::default(),
@@ -126,19 +196,28 @@ fn App() -> Element {
 
     let current_total_rows = total_rows();
 
-    let db_path_for_import = db_path.clone();
-    let db_path_for_dataset_change = db_path.clone();
-    let db_path_for_global_search = db_path.clone();
-    let db_path_for_column_select = db_path.clone();
-    let db_path_for_column_search = db_path.clone();
-    let db_path_for_sort_select = db_path.clone();
-    let db_path_for_sort_toggle = db_path.clone();
-    let db_path_for_tab_switch = db_path.clone();
-    let db_path_for_show_deleted = db_path.clone();
-    let db_path_for_soft_delete = db_path.clone();
-    let db_path_for_purge = db_path.clone();
-    let db_path_for_save = db_path.clone();
-    let db_path_for_save_as = db_path.clone();
+    let query_service_for_import = query_service.clone();
+    let import_service_for_import = import_service.clone();
+    let query_service_for_dataset_change = query_service.clone();
+    let query_service_for_global_search = query_service.clone();
+    let query_service_for_column_select = query_service.clone();
+    let query_service_for_column_search = query_service.clone();
+    let query_service_for_sort_select = query_service.clone();
+    let query_service_for_sort_toggle = query_service.clone();
+    let query_service_for_tab_switch = query_service.clone();
+    let query_service_for_show_deleted = query_service.clone();
+    let query_service_for_soft_delete = query_service.clone();
+    let query_service_for_purge = query_service.clone();
+    let query_service_for_save = query_service.clone();
+    let query_service_for_save_as = query_service.clone();
+    let query_service_for_import_overwrite = query_service.clone();
+    let query_service_for_import_save_as = query_service.clone();
+    let edit_service_for_save = edit_service.clone();
+    let edit_service_for_save_as = edit_service.clone();
+    let edit_service_for_soft_delete = edit_service.clone();
+    let edit_service_for_purge = edit_service.clone();
+    let import_service_for_import_overwrite = import_service.clone();
+    let import_service_for_import_save_as = import_service.clone();
     let grouped_datasets = build_dataset_groups(&datasets());
     let active_group =
         selected_group_key().and_then(|k| grouped_datasets.iter().find(|g| g.key == k).cloned());
@@ -167,17 +246,8 @@ fn App() -> Element {
     let current_columns_for_save = current_columns.clone();
     let current_rows_for_save = current_rows.clone();
     let datasets_for_save = datasets_snapshot.clone();
-    let current_columns_for_overwrite = current_columns_for_save.clone();
-    let current_rows_for_overwrite = current_rows_for_save.clone();
     let current_columns_for_save_as = current_columns_for_save.clone();
     let current_rows_for_save_as = current_rows_for_save.clone();
-    let db_path_for_import_prompt = db_path_for_import.clone();
-    let db_path_for_dataset_change_prompt = db_path_for_dataset_change.clone();
-    let db_path_for_tab_switch_prompt = db_path_for_tab_switch.clone();
-    let db_path_for_import_overwrite = db_path_for_import_prompt.clone();
-    let db_path_for_import_save_as = db_path_for_import_prompt.clone();
-    let db_path_for_dataset_change_overwrite = db_path_for_dataset_change_prompt.clone();
-    let db_path_for_dataset_change_save_as = db_path_for_dataset_change_prompt.clone();
     let get_raw_value = |row_idx: usize, col_idx: usize| -> String {
         if let Some(header) = current_columns.get(col_idx) {
             if let Some(value) = staged_cells_snapshot.get(&CellKey {
@@ -303,22 +373,24 @@ fn App() -> Element {
                             .unwrap_or_default();
 
                         let import_result = if ext == "xlsx" {
-                            import_xlsx_selected_sheets_to_sqlite(&db_path_for_import, &file_path)
+                            import_service_for_import
+                                .import_xlsx(&file_path)
                                 .map(|items| (items.first().map(|it| it.dataset_id), items.len() as i64, true))
                         } else {
-                            import_csv_to_sqlite(&db_path_for_import, &file_path)
+                            import_service_for_import
+                                .import_csv(&file_path)
                                 .map(|item| (Some(item.dataset_id), item.row_count, false))
                         };
 
                         match import_result {
-                            Ok((selected_id, imported_count, is_xlsx)) => match list_datasets(&db_path_for_import, show_deleted()) {
+                            Ok((selected_id, imported_count, is_xlsx)) => match query_service_for_import.list_datasets(show_deleted()) {
                                 Ok(available) => {
                                     let groups = build_dataset_groups(&available);
                                     *datasets.write() = available;
                                     let next_group_key = selected_id.and_then(|id| {
                                         groups
                                             .iter()
-                                            .find(|g| g.datasets.iter().any(|d| d.id == id))
+                                            .find(|g| g.datasets.iter().any(|d| d.id.0 == id))
                                             .map(|g| g.key.clone())
                                     });
                                     *selected_group_key.write() = next_group_key;
@@ -347,7 +419,12 @@ fn App() -> Element {
                                         sort_desc: sort_desc(),
                                     };
 
-                                    match reload_page_data(&db_path_for_import, selected_id, 0, &options) {
+                                    match reload_page_data_usecase(
+                                        &query_service_for_import,
+                                        selected_id,
+                                        0,
+                                        &options,
+                                    ) {
                                         Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                             *columns.write() = loaded_columns;
                                             *rows.write() = loaded_rows;
@@ -391,7 +468,7 @@ fn App() -> Element {
                             *busy.write() = true;
                             *show_deleted.write() = checked;
 
-                            match list_datasets(&db_path_for_show_deleted, checked) {
+                            match query_service_for_show_deleted.list_datasets(checked) {
                                 Ok(available) => {
                                     let groups = build_dataset_groups(&available);
                                     *datasets.write() = available;
@@ -403,7 +480,7 @@ fn App() -> Element {
                                         .as_ref()
                                         .and_then(|k| groups.iter().find(|g| &g.key == k))
                                         .and_then(|g| g.datasets.first())
-                                        .map(|d| d.id);
+                                        .map(|d| d.id.0);
 
                                     *selected_group_key.write() = next_group;
                                     *selected_dataset_id.write() = next_dataset;
@@ -426,7 +503,12 @@ fn App() -> Element {
                                         sort_desc: sort_desc(),
                                     };
 
-                                    match reload_page_data(&db_path_for_show_deleted, next_dataset, 0, &options) {
+                                    match reload_page_data_usecase(
+                                        &query_service_for_show_deleted,
+                                        next_dataset,
+                                        0,
+                                        &options,
+                                    ) {
                                         Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                             *columns.write() = loaded_columns;
                                             *rows.write() = loaded_rows;
@@ -468,7 +550,10 @@ fn App() -> Element {
                     value: selected_group_key()
                         .map(|key| key.to_string())
                         .unwrap_or_else(|| NONE_OPTION_VALUE.to_string()),
-                    onchange: move |event| {
+                    onchange: {
+                        let query_service_for_dataset_change =
+                            query_service_for_dataset_change.clone();
+                        move |event| {
                         let value = event.value();
                         let groups = build_dataset_groups(&datasets());
                         let next_group = if value == NONE_OPTION_VALUE {
@@ -480,7 +565,7 @@ fn App() -> Element {
                             .as_ref()
                             .and_then(|group_key| groups.iter().find(|g| &g.key == group_key))
                             .and_then(|g| g.datasets.first())
-                            .map(|d| d.id);
+                            .map(|d| d.id.0);
 
                         if is_holdings && has_pending_changes {
                             pending_action.set(Some(PendingAction::DatasetChange {
@@ -518,7 +603,12 @@ fn App() -> Element {
                             sort_desc: sort_desc(),
                         };
 
-                        match reload_page_data(&db_path_for_dataset_change, next_dataset, 0, &options) {
+                        match reload_page_data_usecase(
+                            &query_service_for_dataset_change,
+                            next_dataset,
+                            0,
+                            &options,
+                        ) {
                             Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                 *columns.write() = loaded_columns;
                                 *rows.write() = loaded_rows;
@@ -536,6 +626,7 @@ fn App() -> Element {
                         }
 
                         *busy.write() = false;
+                        }
                     },
                     option { value: "{NONE_OPTION_VALUE}", "請選擇資料集" }
                     for group in grouped_datasets.clone() {
@@ -564,9 +655,14 @@ fn App() -> Element {
                         }
 
                         *busy.write() = true;
-                        match soft_delete_dataset(&db_path_for_soft_delete, dataset_id)
-                            .and_then(|_| list_datasets(&db_path_for_soft_delete, show_deleted()))
-                        {
+                        match edit_service_for_soft_delete
+                            .soft_delete_dataset(DatasetId(dataset_id))
+                            .map_err(|err| anyhow!(err.to_string()))
+                            .and_then(|_| {
+                                query_service_for_soft_delete
+                                    .list_datasets(show_deleted())
+                                    .map_err(|err| anyhow!(err.to_string()))
+                            }) {
                             Ok(available) => {
                                 let groups = build_dataset_groups(&available);
                                 *datasets.write() = available;
@@ -578,7 +674,7 @@ fn App() -> Element {
                                     .as_ref()
                                     .and_then(|k| groups.iter().find(|g| &g.key == k))
                                     .and_then(|g| g.datasets.first())
-                                    .map(|d| d.id);
+                                    .map(|d| d.id.0);
 
                                 *selected_group_key.write() = next_group;
                                 *selected_dataset_id.write() = next_dataset;
@@ -591,7 +687,12 @@ fn App() -> Element {
                                     sort_desc: sort_desc(),
                                 };
 
-                                match reload_page_data(&db_path_for_soft_delete, next_dataset, 0, &options) {
+                                match reload_page_data_usecase(
+                                    &query_service_for_soft_delete,
+                                    next_dataset,
+                                    0,
+                                    &options,
+                                ) {
                                     Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                         *columns.write() = loaded_columns;
                                         *rows.write() = loaded_rows;
@@ -636,9 +737,14 @@ fn App() -> Element {
                         }
 
                         *busy.write() = true;
-                        match purge_dataset(&db_path_for_purge, dataset_id)
-                            .and_then(|_| list_datasets(&db_path_for_purge, show_deleted()))
-                        {
+                        match edit_service_for_purge
+                            .purge_dataset(DatasetId(dataset_id))
+                            .map_err(|err| anyhow!(err.to_string()))
+                            .and_then(|_| {
+                                query_service_for_purge
+                                    .list_datasets(show_deleted())
+                                    .map_err(|err| anyhow!(err.to_string()))
+                            }) {
                             Ok(available) => {
                                 let groups = build_dataset_groups(&available);
                                 *datasets.write() = available;
@@ -650,7 +756,7 @@ fn App() -> Element {
                                     .as_ref()
                                     .and_then(|k| groups.iter().find(|g| &g.key == k))
                                     .and_then(|g| g.datasets.first())
-                                    .map(|d| d.id);
+                                    .map(|d| d.id.0);
 
                                 *selected_group_key.write() = next_group;
                                 *selected_dataset_id.write() = next_dataset;
@@ -663,7 +769,12 @@ fn App() -> Element {
                                     sort_desc: sort_desc(),
                                 };
 
-                                match reload_page_data(&db_path_for_purge, next_dataset, 0, &options) {
+                                match reload_page_data_usecase(
+                                    &query_service_for_purge,
+                                    next_dataset,
+                                    0,
+                                    &options,
+                                ) {
                                     Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                         *columns.write() = loaded_columns;
                                         *rows.write() = loaded_rows;
@@ -699,16 +810,17 @@ fn App() -> Element {
                             button {
                                 disabled: busy(),
                                 onclick: {
-                                    let db_path_for_tab = db_path_for_tab_switch.clone();
+                                    let query_service_for_tab_switch =
+                                        query_service_for_tab_switch.clone();
                                     move |_| {
                                         if is_holdings && has_pending_changes {
                                             pending_action.set(Some(PendingAction::TabSwitch {
-                                                dataset_id: sheet.id,
+                                                dataset_id: sheet.id.0,
                                             }));
                                             show_save_prompt.set(true);
                                             return;
                                         }
-                                        *selected_dataset_id.write() = Some(sheet.id);
+                                        *selected_dataset_id.write() = Some(sheet.id.0);
                                         *page.write() = 0;
                                         staged_cells.write().clear();
                                         deleted_rows.write().clear();
@@ -730,7 +842,12 @@ fn App() -> Element {
                                             sort_desc: sort_desc(),
                                         };
 
-                                        match reload_page_data(&db_path_for_tab, Some(sheet.id), 0, &options) {
+                                        match reload_page_data_usecase(
+                                            &query_service_for_tab_switch,
+                                            Some(sheet.id.0),
+                                            0,
+                                            &options,
+                                        ) {
                                             Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                                 *columns.write() = loaded_columns;
                                                 *rows.write() = loaded_rows;
@@ -746,7 +863,7 @@ fn App() -> Element {
                                         *busy.write() = false;
                                     }
                                 },
-                                if Some(sheet.id) == selected_dataset_id() {
+                                if Some(sheet.id.0) == selected_dataset_id() {
                                     "[{sheet.name}]"
                                 } else {
                                     "{sheet.name}"
@@ -777,7 +894,12 @@ fn App() -> Element {
                             sort_desc: sort_desc(),
                         };
 
-                        match reload_page_data(&db_path_for_global_search, selected_dataset_id(), 0, &options) {
+                        match reload_page_data_usecase(
+                            &query_service_for_global_search,
+                            selected_dataset_id(),
+                            0,
+                            &options,
+                        ) {
                             Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                 *columns.write() = loaded_columns;
                                 *rows.write() = loaded_rows;
@@ -822,7 +944,12 @@ fn App() -> Element {
                             sort_desc: sort_desc(),
                         };
 
-                        match reload_page_data(&db_path_for_column_select, selected_dataset_id(), 0, &options) {
+                        match reload_page_data_usecase(
+                            &query_service_for_column_select,
+                            selected_dataset_id(),
+                            0,
+                            &options,
+                        ) {
                             Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                 *columns.write() = loaded_columns;
                                 *rows.write() = loaded_rows;
@@ -864,7 +991,12 @@ fn App() -> Element {
                             sort_desc: sort_desc(),
                         };
 
-                        match reload_page_data(&db_path_for_column_search, selected_dataset_id(), 0, &options) {
+                        match reload_page_data_usecase(
+                            &query_service_for_column_search,
+                            selected_dataset_id(),
+                            0,
+                            &options,
+                        ) {
                             Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                 *columns.write() = loaded_columns;
                                 *rows.write() = loaded_rows;
@@ -909,7 +1041,12 @@ fn App() -> Element {
                             sort_desc: sort_desc(),
                         };
 
-                        match reload_page_data(&db_path_for_sort_select, selected_dataset_id(), 0, &options) {
+                        match reload_page_data_usecase(
+                            &query_service_for_sort_select,
+                            selected_dataset_id(),
+                            0,
+                            &options,
+                        ) {
                             Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                 *columns.write() = loaded_columns;
                                 *rows.write() = loaded_rows;
@@ -949,7 +1086,12 @@ fn App() -> Element {
                             sort_desc: next_desc,
                         };
 
-                        match reload_page_data(&db_path_for_sort_toggle, selected_dataset_id(), 0, &options) {
+                        match reload_page_data_usecase(
+                            &query_service_for_sort_toggle,
+                            selected_dataset_id(),
+                            0,
+                            &options,
+                        ) {
                             Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
                                 *columns.write() = loaded_columns;
                                 *rows.write() = loaded_rows;
@@ -1192,189 +1334,235 @@ fn App() -> Element {
                         div { style: "margin-bottom: 12px;", "你要覆蓋目前資料集，或另存舊內容？" }
                         div { style: "display: flex; gap: 8px;",
                             button {
-                                onclick: move |_| {
-                                    let Some(dataset_id) = selected_dataset_id() else {
+                                onclick: {
+                                    let query_service_for_dataset_change =
+                                        query_service_for_dataset_change.clone();
+                                    let query_service_for_tab_switch =
+                                        query_service_for_tab_switch.clone();
+                                    move |_| {
+                                        let Some(dataset_id) = selected_dataset_id() else {
+                                            show_save_prompt.set(false);
+                                            pending_action.set(None);
+                                            return;
+                                        };
+
+                                        let edits = StagedEdits {
+                                            staged_cells: staged_cells(),
+                                            deleted_rows: deleted_rows(),
+                                            added_rows: added_rows(),
+                                        };
+                                        if let Err(err) = edit_service_for_save
+                                            .apply_edits(DatasetId(dataset_id), edits)
+                                            .map_err(|err| anyhow!(err.to_string()))
+                                        {
+                                            *status.write() = format!("覆蓋失敗：{err}");
+                                            return;
+                                        }
+
+                                        staged_cells.write().clear();
+                                        deleted_rows.write().clear();
+                                        selected_rows.write().clear();
+                                        added_rows.write().clear();
+                                        *editing_cell.write() = None;
+                                        editing_value.set(String::new());
+                                        show_add_row.set(false);
+                                        new_row_inputs.write().clear();
+
+                                        match reload_page_data_usecase(
+                                            &query_service_for_save,
+                                            Some(dataset_id),
+                                            0,
+                                            &QueryOptions {
+                                                global_search: global_search(),
+                                                column_search_col: column_search_col(),
+                                                column_search_text: column_search_text(),
+                                                sort_col: sort_col(),
+                                                sort_desc: sort_desc(),
+                                            },
+                                        ) {
+                                            Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                                *columns.write() = loaded_columns;
+                                                *rows.write() = loaded_rows;
+                                                *total_rows.write() = loaded_total;
+                                                *page.write() = loaded_page;
+                                            }
+                                            Err(err) => {
+                                                *status.write() = format!("覆蓋後重新載入失敗：{err}");
+                                            }
+                                        }
+
                                         show_save_prompt.set(false);
-                                        pending_action.set(None);
-                                        return;
-                                    };
-
-                                    if let Err(err) = apply_changes_to_dataset(
-                                        &db_path_for_save,
-                                        dataset_id,
-                                        &current_columns_for_overwrite,
-                                        &current_rows_for_overwrite,
-                                        &staged_cells(),
-                                        &deleted_rows(),
-                                        &added_rows(),
-                                    ) {
-                                        *status.write() = format!("覆蓋失敗：{err}");
-                                        return;
-                                    }
-
-                                    staged_cells.write().clear();
-                                    deleted_rows.write().clear();
-                                    selected_rows.write().clear();
-                                    added_rows.write().clear();
-                                    *editing_cell.write() = None;
-                                    editing_value.set(String::new());
-                                    show_add_row.set(false);
-                                    new_row_inputs.write().clear();
-
-                                    match reload_page_data(
-                                        &db_path_for_save,
-                                        Some(dataset_id),
-                                        0,
-                                        &QueryOptions {
-                                            global_search: global_search(),
-                                            column_search_col: column_search_col(),
-                                            column_search_text: column_search_text(),
-                                            sort_col: sort_col(),
-                                            sort_desc: sort_desc(),
-                                        },
-                                    ) {
-                                        Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                            *columns.write() = loaded_columns;
-                                            *rows.write() = loaded_rows;
-                                            *total_rows.write() = loaded_total;
-                                            *page.write() = loaded_page;
-                                        }
-                                        Err(err) => {
-                                            *status.write() = format!("覆蓋後重新載入失敗：{err}");
-                                        }
-                                    }
-
-                                    show_save_prompt.set(false);
-                                    if let Some(action) = pending_action() {
-                                        pending_action.set(None);
-                                        match action {
-                                            PendingAction::Import(file_path) => {
-                                                *busy.write() = true;
-                                                *status.write() = format!("正在匯入 {}", file_path.display());
-                                                let ext = file_path
-                                                    .extension()
-                                                    .and_then(|e| e.to_str())
-                                                    .map(|s| s.to_ascii_lowercase())
-                                                    .unwrap_or_default();
-                                                let import_result = if ext == "xlsx" {
-                                                    import_xlsx_selected_sheets_to_sqlite(
-                                                        &db_path_for_import_overwrite,
-                                                        &file_path,
-                                                    )
-                                                    .map(|items| {
-                                                        (items.first().map(|it| it.dataset_id), items.len() as i64, true)
-                                                    })
-                                                } else {
-                                                    import_csv_to_sqlite(&db_path_for_import_overwrite, &file_path)
-                                                        .map(|item| (Some(item.dataset_id), item.row_count, false))
-                                                };
-                                                match import_result {
-                                                    Ok((selected_id, imported_count, is_xlsx)) => {
-                                                        match list_datasets(&db_path_for_import_overwrite, show_deleted()) {
-                                                            Ok(available) => {
-                                                                let groups = build_dataset_groups(&available);
-                                                                *datasets.write() = available;
-                                                                let next_group_key = selected_id.and_then(|id| {
-                                                                    groups
-                                                                        .iter()
-                                                                        .find(|g| g.datasets.iter().any(|d| d.id == id))
-                                                                        .map(|g| g.key.clone())
-                                                                });
-                                                                *selected_group_key.write() = next_group_key;
-                                                                *selected_dataset_id.write() = selected_id;
-                                                                *column_search_col.write() = None;
-                                                                *column_search_text.write() = String::new();
-                                                                *sort_col.write() = None;
-                                                                *sort_desc.write() = false;
-                                                                *page.write() = 0;
-                                                                match reload_page_data(
-                                                                    &db_path_for_import_overwrite,
-                                                                    selected_id,
-                                                                    0,
-                                                                    &QueryOptions::default(),
-                                                                ) {
-                                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                                                        *columns.write() = loaded_columns;
-                                                                        *rows.write() = loaded_rows;
-                                                                        *total_rows.write() = loaded_total;
-                                                                        *page.write() = loaded_page;
-                                                                        *status.write() = if is_xlsx {
-                                                                            format!("已匯入 XLSX，共 {} 個資料表", imported_count)
-                                                                        } else {
-                                                                            format!("已匯入 CSV（{} 筆）", imported_count)
-                                                                        };
-                                                                    }
-                                                                    Err(err) => {
-                                                                        *status.write() = format!("匯入成功，但載入資料失敗：{err}");
+                                        if let Some(action) = pending_action() {
+                                            pending_action.set(None);
+                                            match action {
+                                                PendingAction::Import(file_path) => {
+                                                    *busy.write() = true;
+                                                    *status.write() =
+                                                        format!("正在匯入 {}", file_path.display());
+                                                    let ext = file_path
+                                                        .extension()
+                                                        .and_then(|e| e.to_str())
+                                                        .map(|s| s.to_ascii_lowercase())
+                                                        .unwrap_or_default();
+                                                    let import_result = if ext == "xlsx" {
+                                                        import_service_for_import_overwrite
+                                                            .import_xlsx(&file_path)
+                                                            .map(|items| {
+                                                                (
+                                                                    items.first().map(|it| it.dataset_id),
+                                                                    items.len() as i64,
+                                                                    true,
+                                                                )
+                                                            })
+                                                    } else {
+                                                        import_service_for_import_overwrite
+                                                            .import_csv(&file_path)
+                                                            .map(|item| {
+                                                                (Some(item.dataset_id), item.row_count, false)
+                                                            })
+                                                    };
+                                                    match import_result {
+                                                        Ok((selected_id, imported_count, is_xlsx)) => {
+                                                            match query_service_for_import_overwrite
+                                                                .list_datasets(show_deleted())
+                                                            {
+                                                                Ok(available) => {
+                                                                    let groups =
+                                                                        build_dataset_groups(&available);
+                                                                    *datasets.write() = available;
+                                                                    let next_group_key =
+                                                                        selected_id.and_then(|id| {
+                                                                            groups
+                                                                                .iter()
+                                                                                .find(|g| {
+                                                                                    g.datasets
+                                                                                        .iter()
+                                                                                        .any(|d| d.id.0 == id)
+                                                                                })
+                                                                                .map(|g| g.key.clone())
+                                                                        });
+                                                                    *selected_group_key.write() = next_group_key;
+                                                                    *selected_dataset_id.write() = selected_id;
+                                                                    *column_search_col.write() = None;
+                                                                    *column_search_text.write() = String::new();
+                                                                    *sort_col.write() = None;
+                                                                    *sort_desc.write() = false;
+                                                                    *page.write() = 0;
+                                                                    match reload_page_data_usecase(
+                                                                        &query_service_for_import_overwrite,
+                                                                        selected_id,
+                                                                        0,
+                                                                        &QueryOptions::default(),
+                                                                    ) {
+                                                                        Ok((
+                                                                            loaded_columns,
+                                                                            loaded_rows,
+                                                                            loaded_total,
+                                                                            loaded_page,
+                                                                        )) => {
+                                                                            *columns.write() = loaded_columns;
+                                                                            *rows.write() = loaded_rows;
+                                                                            *total_rows.write() = loaded_total;
+                                                                            *page.write() = loaded_page;
+                                                                            *status.write() = if is_xlsx {
+                                                                                format!(
+                                                                                    "已匯入 XLSX，共 {} 個資料表",
+                                                                                    imported_count
+                                                                                )
+                                                                            } else {
+                                                                                format!(
+                                                                                    "已匯入 CSV（{} 筆）",
+                                                                                    imported_count
+                                                                                )
+                                                                            };
+                                                                        }
+                                                                        Err(err) => {
+                                                                            *status.write() =
+                                                                                format!("匯入成功，但載入資料失敗：{err}");
+                                                                        }
                                                                     }
                                                                 }
-                                                            }
-                                                            Err(err) => {
-                                                                *status.write() = format!("匯入成功，但刷新資料集失敗：{err}");
+                                                                Err(err) => {
+                                                                    *status.write() = format!(
+                                                                        "匯入成功，但刷新資料集失敗：{err}"
+                                                                    );
+                                                                }
                                                             }
                                                         }
+                                                        Err(err) => {
+                                                            *status.write() = format!("匯入失敗：{err}");
+                                                        }
                                                     }
-                                                    Err(err) => {
-                                                        *status.write() = format!("匯入失敗：{err}");
-                                                    }
+                                                    *busy.write() = false;
                                                 }
-                                                *busy.write() = false;
-                                            }
-                                            PendingAction::DatasetChange { next_group, next_dataset } => {
-                                                *selected_group_key.write() = next_group;
-                                                *selected_dataset_id.write() = next_dataset;
-                                                *column_search_col.write() = None;
-                                                *column_search_text.write() = String::new();
-                                                *sort_col.write() = None;
-                                                *sort_desc.write() = false;
-                                                *page.write() = 0;
-                                                *busy.write() = true;
-                                                match reload_page_data(
-                                                    &db_path_for_dataset_change_overwrite,
-                                                    next_dataset,
-                                                    0,
-                                                    &QueryOptions::default(),
-                                                ) {
-                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                                        *columns.write() = loaded_columns;
-                                                        *rows.write() = loaded_rows;
-                                                        *total_rows.write() = loaded_total;
-                                                        *page.write() = loaded_page;
-                                                        *status.write() = "已切換資料集".to_string();
+                                                PendingAction::DatasetChange { next_group, next_dataset } => {
+                                                    *selected_group_key.write() = next_group;
+                                                    *selected_dataset_id.write() = next_dataset;
+                                                    *column_search_col.write() = None;
+                                                    *column_search_text.write() = String::new();
+                                                    *sort_col.write() = None;
+                                                    *sort_desc.write() = false;
+                                                    *page.write() = 0;
+                                                    *busy.write() = true;
+                                                    match reload_page_data_usecase(
+                                                        &query_service_for_dataset_change,
+                                                        next_dataset,
+                                                        0,
+                                                        &QueryOptions::default(),
+                                                    ) {
+                                                        Ok((
+                                                            loaded_columns,
+                                                            loaded_rows,
+                                                            loaded_total,
+                                                            loaded_page,
+                                                        )) => {
+                                                            *columns.write() = loaded_columns;
+                                                            *rows.write() = loaded_rows;
+                                                            *total_rows.write() = loaded_total;
+                                                            *page.write() = loaded_page;
+                                                            *status.write() = "已切換資料集".to_string();
+                                                        }
+                                                        Err(err) => {
+                                                            *status.write() =
+                                                                format!("載入資料集失敗：{err}");
+                                                        }
                                                     }
-                                                    Err(err) => {
-                                                        *status.write() = format!("載入資料集失敗：{err}");
-                                                    }
+                                                    *busy.write() = false;
                                                 }
-                                                *busy.write() = false;
-                                            }
-                                            PendingAction::TabSwitch { dataset_id } => {
-                                                *selected_dataset_id.write() = Some(dataset_id);
-                                                *page.write() = 0;
-                                                *busy.write() = true;
-                                                match reload_page_data(
-                                                    &db_path_for_tab_switch_prompt,
-                                                    Some(dataset_id),
-                                                    0,
-                                                    &QueryOptions::default(),
-                                                ) {
-                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                                        *columns.write() = loaded_columns;
-                                                        *rows.write() = loaded_rows;
-                                                        *total_rows.write() = loaded_total;
-                                                        *page.write() = loaded_page;
-                                                        *status.write() = "已切換工作表".to_string();
+                                                PendingAction::TabSwitch { dataset_id } => {
+                                                    *selected_dataset_id.write() = Some(dataset_id);
+                                                    *page.write() = 0;
+                                                    *busy.write() = true;
+                                                    match reload_page_data_usecase(
+                                                        &query_service_for_tab_switch,
+                                                        Some(dataset_id),
+                                                        0,
+                                                        &QueryOptions::default(),
+                                                    ) {
+                                                        Ok((
+                                                            loaded_columns,
+                                                            loaded_rows,
+                                                            loaded_total,
+                                                            loaded_page,
+                                                        )) => {
+                                                            *columns.write() = loaded_columns;
+                                                            *rows.write() = loaded_rows;
+                                                            *total_rows.write() = loaded_total;
+                                                            *page.write() = loaded_page;
+                                                            *status.write() = "已切換工作表".to_string();
+                                                        }
+                                                        Err(err) => {
+                                                            *status.write() =
+                                                                format!("切換工作表失敗：{err}");
+                                                        }
                                                     }
-                                                    Err(err) => {
-                                                        *status.write() = format!("切換工作表失敗：{err}");
-                                                    }
+                                                    *busy.write() = false;
                                                 }
-                                                *busy.write() = false;
                                             }
                                         }
                                     }
                                 },
-                                "覆蓋"
+                            "覆蓋"
                             }
                             button {
                                 onclick: move |_| {
@@ -1411,220 +1599,288 @@ fn App() -> Element {
                         }
                         div { style: "display: flex; gap: 8px; margin-top: 12px;",
                             button {
-                                onclick: move |_| {
-                                    let name = save_as_name().trim().to_string();
-                                    if name.is_empty() {
-                                        *status.write() = "資料集名稱不可空白".to_string();
-                                        return;
-                                    }
-                                    let Some(dataset_id) = selected_dataset_id() else {
-                                        show_save_as_prompt.set(false);
-                                        pending_action.set(None);
-                                        return;
-                                    };
-                                    if let Some(current) = datasets_for_save.iter().find(|d| d.id == dataset_id) {
-                                        if current.name == name {
-                                            *status.write() = "資料集名稱必須不同".to_string();
+                                onclick: {
+                                    let query_service_for_dataset_change =
+                                        query_service_for_dataset_change.clone();
+                                    let query_service_for_tab_switch =
+                                        query_service_for_tab_switch.clone();
+                                    let query_service_for_import_save_as =
+                                        query_service_for_import_save_as.clone();
+                                    let import_service_for_import_save_as =
+                                        import_service_for_import_save_as.clone();
+                                    move |_| {
+                                        let name = save_as_name().trim().to_string();
+                                        if name.is_empty() {
+                                            *status.write() = "資料集名稱不可空白".to_string();
                                             return;
                                         }
-                                    }
-                                    let existing = datasets_for_save.iter().find(|d| d.name == name).cloned();
-                                    if let Some(existing) = existing {
-                                        let overwrite = MessageDialog::new()
-                                            .set_level(MessageLevel::Warning)
-                                            .set_title("名稱已存在")
-                                            .set_description("已有相同名稱，是否覆蓋？")
-                                            .set_buttons(MessageButtons::YesNo)
-                                            .show();
-                                        if overwrite != MessageDialogResult::Yes {
+                                        let Some(dataset_id) = selected_dataset_id() else {
+                                            show_save_as_prompt.set(false);
+                                            pending_action.set(None);
+                                            return;
+                                        };
+                                        if let Some(current) =
+                                            datasets_for_save.iter().find(|d| d.id.0 == dataset_id)
+                                        {
+                                            if current.name == name {
+                                                *status.write() = "資料集名稱必須不同".to_string();
+                                                return;
+                                            }
+                                        }
+                                        let existing =
+                                            datasets_for_save.iter().find(|d| d.name == name).cloned();
+                                        if let Some(existing) = existing {
+                                            let overwrite = MessageDialog::new()
+                                                .set_level(MessageLevel::Warning)
+                                                .set_title("名稱已存在")
+                                                .set_description("已有相同名稱，是否覆蓋？")
+                                                .set_buttons(MessageButtons::YesNo)
+                                                .show();
+                                            if overwrite != MessageDialogResult::Yes {
+                                                return;
+                                            }
+                                            if let Err(err) = edit_service_for_save_as
+                                                .purge_dataset(existing.id)
+                                                .map_err(|err| anyhow!(err.to_string()))
+                                            {
+                                                *status.write() = format!("覆蓋失敗：{err}");
+                                                return;
+                                            }
+                                        }
+
+                                        let Some(current) =
+                                            datasets_for_save.iter().find(|d| d.id.0 == dataset_id)
+                                        else {
+                                            *status.write() = "找不到目前資料集".to_string();
+                                            return;
+                                        };
+                                        let prefix = current
+                                            .source_path
+                                            .split_once('#')
+                                            .map(|(p, _)| p)
+                                            .unwrap_or(&current.source_path);
+                                        let backup_source = format!("{prefix}#{name}");
+
+                                        if let Err(err) = edit_service_for_save_as
+                                            .create_dataset(
+                                                NewDatasetMeta {
+                                                    name: name.clone(),
+                                                    source_path: backup_source,
+                                                },
+                                                TabularData {
+                                                    columns: current_columns_for_save_as.clone(),
+                                                    rows: current_rows_for_save_as.clone(),
+                                                },
+                                            )
+                                            .map_err(|err| anyhow!(err.to_string()))
+                                        {
+                                            *status.write() = format!("另存失敗：{err}");
                                             return;
                                         }
-                                        if let Err(err) = purge_dataset(&db_path_for_save_as, existing.id) {
+
+                                        let edits = StagedEdits {
+                                            staged_cells: staged_cells(),
+                                            deleted_rows: deleted_rows(),
+                                            added_rows: added_rows(),
+                                        };
+                                        if let Err(err) = edit_service_for_save_as
+                                            .apply_edits(DatasetId(dataset_id), edits)
+                                            .map_err(|err| anyhow!(err.to_string()))
+                                        {
                                             *status.write() = format!("覆蓋失敗：{err}");
                                             return;
                                         }
-                                    }
 
-                                    let Some(current) = datasets_for_save.iter().find(|d| d.id == dataset_id) else {
-                                        *status.write() = "找不到目前資料集".to_string();
-                                        return;
-                                    };
-                                    let prefix = current
-                                        .source_path
-                                        .split_once('#')
-                                        .map(|(p, _)| p)
-                                        .unwrap_or(&current.source_path);
-                                    let backup_source = format!("{prefix}#{name}");
-
-                                    if let Err(err) = create_dataset_from_rows(
-                                        &db_path_for_save_as,
-                                        &name,
-                                        &backup_source,
-                                        &current_columns_for_save_as,
-                                        &current_rows_for_save_as,
-                                    ) {
-                                        *status.write() = format!("另存失敗：{err}");
-                                        return;
-                                    }
-
-                                    if let Err(err) = apply_changes_to_dataset(
-                                        &db_path_for_save_as,
-                                        dataset_id,
-                                        &current_columns_for_save_as,
-                                        &current_rows_for_save_as,
-                                        &staged_cells(),
-                                        &deleted_rows(),
-                                        &added_rows(),
-                                    ) {
-                                        *status.write() = format!("覆蓋失敗：{err}");
-                                        return;
-                                    }
-
-                                    match list_datasets(&db_path_for_save_as, show_deleted()) {
-                                        Ok(available) => {
-                                            *datasets.write() = available;
-                                        }
-                                        Err(err) => {
-                                            *status.write() = format!("更新資料集清單失敗：{err}");
-                                        }
-                                    }
-
-                                    staged_cells.write().clear();
-                                    deleted_rows.write().clear();
-                                    selected_rows.write().clear();
-                                    added_rows.write().clear();
-                                    *editing_cell.write() = None;
-                                    editing_value.set(String::new());
-                                    show_add_row.set(false);
-                                    new_row_inputs.write().clear();
-
-                                    show_save_as_prompt.set(false);
-
-                                    if let Some(action) = pending_action() {
-                                        pending_action.set(None);
-                                        match action {
-                                            PendingAction::DatasetChange { next_group, next_dataset } => {
-                                                *selected_group_key.write() = next_group;
-                                                *selected_dataset_id.write() = next_dataset;
-                                                *column_search_col.write() = None;
-                                                *column_search_text.write() = String::new();
-                                                *sort_col.write() = None;
-                                                *sort_desc.write() = false;
-                                                *page.write() = 0;
-                                                *busy.write() = true;
-                                                match reload_page_data(
-                                                    &db_path_for_dataset_change_save_as,
-                                                    next_dataset,
-                                                    0,
-                                                    &QueryOptions::default(),
-                                                ) {
-                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                                        *columns.write() = loaded_columns;
-                                                        *rows.write() = loaded_rows;
-                                                        *total_rows.write() = loaded_total;
-                                                        *page.write() = loaded_page;
-                                                        *status.write() = "已切換資料集".to_string();
-                                                    }
-                                                    Err(err) => {
-                                                        *status.write() = format!("載入資料集失敗：{err}");
-                                                    }
-                                                }
-                                                *busy.write() = false;
+                                        match query_service_for_save_as.list_datasets(show_deleted()) {
+                                            Ok(available) => {
+                                                *datasets.write() = available;
                                             }
-                                            PendingAction::TabSwitch { dataset_id } => {
-                                                *selected_dataset_id.write() = Some(dataset_id);
-                                                *page.write() = 0;
-                                                *busy.write() = true;
-                                                match reload_page_data(
-                                                    &db_path_for_tab_switch,
-                                                    Some(dataset_id),
-                                                    0,
-                                                    &QueryOptions::default(),
-                                                ) {
-                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                                        *columns.write() = loaded_columns;
-                                                        *rows.write() = loaded_rows;
-                                                        *total_rows.write() = loaded_total;
-                                                        *page.write() = loaded_page;
-                                                        *status.write() = "已切換工作表".to_string();
-                                                    }
-                                                    Err(err) => {
-                                                        *status.write() = format!("切換工作表失敗：{err}");
-                                                    }
-                                                }
-                                                *busy.write() = false;
+                                            Err(err) => {
+                                                *status.write() =
+                                                    format!("更新資料集清單失敗：{err}");
                                             }
-                                            PendingAction::Import(file_path) => {
-                                                *busy.write() = true;
-                                                *status.write() = format!("正在匯入 {}", file_path.display());
-                                                let ext = file_path
-                                                    .extension()
-                                                    .and_then(|e| e.to_str())
-                                                    .map(|s| s.to_ascii_lowercase())
-                                                    .unwrap_or_default();
-                                                let import_result = if ext == "xlsx" {
-                                                    import_xlsx_selected_sheets_to_sqlite(
-                                                        &db_path_for_import_save_as,
-                                                        &file_path,
-                                                    )
-                                                    .map(|items| {
-                                                        (items.first().map(|it| it.dataset_id), items.len() as i64, true)
-                                                    })
-                                                } else {
-                                                    import_csv_to_sqlite(&db_path_for_import_save_as, &file_path)
-                                                        .map(|item| (Some(item.dataset_id), item.row_count, false))
-                                                };
-                                                match import_result {
-                                                    Ok((selected_id, imported_count, is_xlsx)) => {
-                                                        match list_datasets(&db_path_for_import_save_as, show_deleted()) {
-                                                            Ok(available) => {
-                                                                let groups = build_dataset_groups(&available);
-                                                                *datasets.write() = available;
-                                                                let next_group_key = selected_id.and_then(|id| {
-                                                                    groups
-                                                                        .iter()
-                                                                        .find(|g| g.datasets.iter().any(|d| d.id == id))
-                                                                        .map(|g| g.key.clone())
-                                                                });
-                                                                *selected_group_key.write() = next_group_key;
-                                                                *selected_dataset_id.write() = selected_id;
-                                                                *column_search_col.write() = None;
-                                                                *column_search_text.write() = String::new();
-                                                                *sort_col.write() = None;
-                                                                *sort_desc.write() = false;
-                                                                *page.write() = 0;
-                                                                match reload_page_data(
-                                                                    &db_path_for_import_save_as,
-                                                                    selected_id,
-                                                                    0,
-                                                                    &QueryOptions::default(),
-                                                                ) {
-                                                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                                                        *columns.write() = loaded_columns;
-                                                                        *rows.write() = loaded_rows;
-                                                                        *total_rows.write() = loaded_total;
-                                                                        *page.write() = loaded_page;
-                                                                        *status.write() = if is_xlsx {
-                                                                            format!("已匯入 XLSX，共 {} 個資料表", imported_count)
-                                                                        } else {
-                                                                            format!("已匯入 CSV（{} 筆）", imported_count)
-                                                                        };
-                                                                    }
-                                                                    Err(err) => {
-                                                                        *status.write() = format!("匯入成功，但載入資料失敗：{err}");
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(err) => {
-                                                                *status.write() = format!("匯入成功，但刷新資料集失敗：{err}");
-                                                            }
+                                        }
+
+                                        staged_cells.write().clear();
+                                        deleted_rows.write().clear();
+                                        selected_rows.write().clear();
+                                        added_rows.write().clear();
+                                        *editing_cell.write() = None;
+                                        editing_value.set(String::new());
+                                        show_add_row.set(false);
+                                        new_row_inputs.write().clear();
+
+                                        show_save_as_prompt.set(false);
+
+                                        if let Some(action) = pending_action() {
+                                            pending_action.set(None);
+                                            match action {
+                                                PendingAction::DatasetChange { next_group, next_dataset } => {
+                                                    *selected_group_key.write() = next_group;
+                                                    *selected_dataset_id.write() = next_dataset;
+                                                    *column_search_col.write() = None;
+                                                    *column_search_text.write() = String::new();
+                                                    *sort_col.write() = None;
+                                                    *sort_desc.write() = false;
+                                                    *page.write() = 0;
+                                                    *busy.write() = true;
+                                                    match reload_page_data_usecase(
+                                                        &query_service_for_dataset_change,
+                                                        next_dataset,
+                                                        0,
+                                                        &QueryOptions::default(),
+                                                    ) {
+                                                        Ok((
+                                                            loaded_columns,
+                                                            loaded_rows,
+                                                            loaded_total,
+                                                            loaded_page,
+                                                        )) => {
+                                                            *columns.write() = loaded_columns;
+                                                            *rows.write() = loaded_rows;
+                                                            *total_rows.write() = loaded_total;
+                                                            *page.write() = loaded_page;
+                                                            *status.write() =
+                                                                "已切換資料集".to_string();
+                                                        }
+                                                        Err(err) => {
+                                                            *status.write() =
+                                                                format!("載入資料集失敗：{err}");
                                                         }
                                                     }
-                                                    Err(err) => {
-                                                        *status.write() = format!("匯入失敗：{err}");
-                                                    }
+                                                    *busy.write() = false;
                                                 }
-                                                *busy.write() = false;
+                                                PendingAction::TabSwitch { dataset_id } => {
+                                                    *selected_dataset_id.write() = Some(dataset_id);
+                                                    *page.write() = 0;
+                                                    *busy.write() = true;
+                                                    match reload_page_data_usecase(
+                                                        &query_service_for_tab_switch,
+                                                        Some(dataset_id),
+                                                        0,
+                                                        &QueryOptions::default(),
+                                                    ) {
+                                                        Ok((
+                                                            loaded_columns,
+                                                            loaded_rows,
+                                                            loaded_total,
+                                                            loaded_page,
+                                                        )) => {
+                                                            *columns.write() = loaded_columns;
+                                                            *rows.write() = loaded_rows;
+                                                            *total_rows.write() = loaded_total;
+                                                            *page.write() = loaded_page;
+                                                            *status.write() =
+                                                                "已切換工作表".to_string();
+                                                        }
+                                                        Err(err) => {
+                                                            *status.write() =
+                                                                format!("切換工作表失敗：{err}");
+                                                        }
+                                                    }
+                                                    *busy.write() = false;
+                                                }
+                                                PendingAction::Import(file_path) => {
+                                                    *busy.write() = true;
+                                                    *status.write() =
+                                                        format!("正在匯入 {}", file_path.display());
+                                                    let ext = file_path
+                                                        .extension()
+                                                        .and_then(|e| e.to_str())
+                                                        .map(|s| s.to_ascii_lowercase())
+                                                        .unwrap_or_default();
+                                                    let import_result = if ext == "xlsx" {
+                                                        import_service_for_import_save_as
+                                                            .import_xlsx(&file_path)
+                                                            .map(|items| {
+                                                                (
+                                                                    items.first().map(|it| it.dataset_id),
+                                                                    items.len() as i64,
+                                                                    true,
+                                                                )
+                                                            })
+                                                    } else {
+                                                        import_service_for_import_save_as
+                                                            .import_csv(&file_path)
+                                                            .map(|item| {
+                                                                (Some(item.dataset_id), item.row_count, false)
+                                                            })
+                                                    };
+                                                    match import_result {
+                                                        Ok((selected_id, imported_count, is_xlsx)) => {
+                                                            match query_service_for_import_save_as
+                                                                .list_datasets(show_deleted())
+                                                            {
+                                                                Ok(available) => {
+                                                                    let groups =
+                                                                        build_dataset_groups(&available);
+                                                                    *datasets.write() = available;
+                                                                    let next_group_key =
+                                                                        selected_id.and_then(|id| {
+                                                                            groups
+                                                                                .iter()
+                                                                                .find(|g| {
+                                                                                    g.datasets
+                                                                                        .iter()
+                                                                                        .any(|d| d.id.0 == id)
+                                                                                })
+                                                                                .map(|g| g.key.clone())
+                                                                        });
+                                                                    *selected_group_key.write() = next_group_key;
+                                                                    *selected_dataset_id.write() = selected_id;
+                                                                    *column_search_col.write() = None;
+                                                                    *column_search_text.write() = String::new();
+                                                                    *sort_col.write() = None;
+                                                                    *sort_desc.write() = false;
+                                                                    *page.write() = 0;
+                                                                    match reload_page_data_usecase(
+                                                                        &query_service_for_import_save_as,
+                                                                        selected_id,
+                                                                        0,
+                                                                        &QueryOptions::default(),
+                                                                    ) {
+                                                                        Ok((
+                                                                            loaded_columns,
+                                                                            loaded_rows,
+                                                                            loaded_total,
+                                                                            loaded_page,
+                                                                        )) => {
+                                                                            *columns.write() = loaded_columns;
+                                                                            *rows.write() = loaded_rows;
+                                                                            *total_rows.write() = loaded_total;
+                                                                            *page.write() = loaded_page;
+                                                                            *status.write() = if is_xlsx {
+                                                                                format!(
+                                                                                    "已匯入 XLSX，共 {} 個資料表",
+                                                                                    imported_count
+                                                                                )
+                                                                            } else {
+                                                                                format!(
+                                                                                    "已匯入 CSV（{} 筆）",
+                                                                                    imported_count
+                                                                                )
+                                                                            };
+                                                                        }
+                                                                        Err(err) => {
+                                                                            *status.write() = format!(
+                                                                                "匯入成功，但載入資料失敗：{err}"
+                                                                            );
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(err) => {
+                                                                    *status.write() = format!(
+                                                                        "匯入成功，但刷新資料集失敗：{err}"
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(err) => {
+                                                            *status.write() = format!("匯入失敗：{err}");
+                                                        }
+                                                    }
+                                                    *busy.write() = false;
+                                                }
                                             }
                                         }
                                     }
@@ -1647,19 +1903,10 @@ fn App() -> Element {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DatasetSummary {
-    id: i64,
-    name: String,
-    row_count: i64,
-    source_path: String,
-    deleted_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct DatasetGroup {
     key: String,
     label: String,
-    datasets: Vec<DatasetSummary>,
+    datasets: Vec<DatasetMeta>,
 }
 
 fn dataset_group_key(source_path: &str, id: i64) -> String {
@@ -1681,11 +1928,12 @@ fn dataset_group_label(source_path: &str, fallback_name: &str, id: i64) -> Strin
     format!("{fallback_name}（#{id}）")
 }
 
-fn build_dataset_groups(list: &[DatasetSummary]) -> Vec<DatasetGroup> {
+fn build_dataset_groups(list: &[DatasetMeta]) -> Vec<DatasetGroup> {
     let mut grouped: BTreeMap<String, DatasetGroup> = BTreeMap::new();
     for item in list {
-        let key = dataset_group_key(&item.source_path, item.id);
-        let label = dataset_group_label(&item.source_path, &item.name, item.id);
+        let id: i64 = item.id.into();
+        let key = dataset_group_key(&item.source_path, id);
+        let label = dataset_group_label(&item.source_path, &item.name, id);
         let entry = grouped.entry(key.clone()).or_insert_with(|| DatasetGroup {
             key,
             label,
@@ -1696,7 +1944,7 @@ fn build_dataset_groups(list: &[DatasetSummary]) -> Vec<DatasetGroup> {
 
     let mut groups: Vec<DatasetGroup> = grouped.into_values().collect();
     for group in &mut groups {
-        group.datasets.sort_by_key(|d| d.id);
+        group.datasets.sort_by_key(|d| d.id.0);
     }
     groups
 }
@@ -1716,15 +1964,6 @@ struct QueryOptions {
     column_search_text: String,
     sort_col: Option<i64>,
     sort_desc: bool,
-}
-
-#[allow(dead_code)]
-fn open_connection(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("failed to open db: {}", db_path.display()))?;
-    conn.execute("PRAGMA foreign_keys = ON", [])
-        .context("failed to enable foreign key enforcement")?;
-    Ok(conn)
 }
 
 #[allow(dead_code)]
@@ -1751,138 +1990,9 @@ fn default_webview_data_dir() -> Result<PathBuf> {
     ensure_webview_data_dir(project_dirs.data_local_dir())
 }
 
-#[allow(dead_code)]
-fn init_db(db_path: &Path) -> Result<()> {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create parent dir: {}", parent.display()))?;
-    }
+// moved to infra::sqlite::schema
 
-    let conn = open_connection(db_path)?;
-
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS dataset (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            source_path TEXT NOT NULL,
-            row_count   INTEGER NOT NULL,
-            deleted_at  TEXT,
-            imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS column_name (
-            dataset_id  INTEGER NOT NULL,
-            col_idx     INTEGER NOT NULL,
-            name        TEXT NOT NULL,
-            PRIMARY KEY (dataset_id, col_idx),
-            FOREIGN KEY (dataset_id) REFERENCES dataset(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS cell (
-            dataset_id  INTEGER NOT NULL,
-            row_idx     INTEGER NOT NULL,
-            col_idx     INTEGER NOT NULL,
-            value       TEXT NOT NULL,
-            PRIMARY KEY (dataset_id, row_idx, col_idx),
-            FOREIGN KEY (dataset_id) REFERENCES dataset(id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_cell_dataset_row
-            ON cell(dataset_id, row_idx);
-
-        CREATE INDEX IF NOT EXISTS idx_cell_dataset_col_value
-            ON cell(dataset_id, col_idx, value);
-        ",
-    )
-    .context("failed to initialize schema")?;
-
-    conn.execute("ALTER TABLE dataset ADD COLUMN deleted_at TEXT", [])
-        .ok();
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn import_csv_to_sqlite(db_path: &Path, csv_path: &Path) -> Result<ImportResult> {
-    init_db(db_path)?;
-
-    let mut reader = csv::Reader::from_path(csv_path)
-        .with_context(|| format!("failed to open csv: {}", csv_path.display()))?;
-    let headers = reader
-        .headers()
-        .with_context(|| format!("failed to read headers from csv: {}", csv_path.display()))?
-        .clone();
-
-    if headers.is_empty() {
-        anyhow::bail!("csv header is required")
-    }
-
-    let source_path = csv_path.to_string_lossy().into_owned();
-    let dataset_name = csv_path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("dataset")
-        .to_string();
-
-    let mut conn = open_connection(db_path)?;
-    let tx = conn.transaction().context("failed to start transaction")?;
-
-    tx.execute(
-        "INSERT INTO dataset(name, source_path, row_count) VALUES (?1, ?2, 0)",
-        params![dataset_name, source_path],
-    )
-    .context("failed to insert dataset")?;
-    let dataset_id = tx.last_insert_rowid();
-
-    insert_headers(&tx, dataset_id, &headers)?;
-
-    let mut insert_cell = tx
-        .prepare("INSERT INTO cell(dataset_id, row_idx, col_idx, value) VALUES (?1, ?2, ?3, ?4)")
-        .context("failed to prepare cell insert")?;
-
-    let mut row_count = 0_i64;
-    let header_len = headers.len();
-    for (row_idx, record) in reader.records().enumerate() {
-        let record = record.context("failed to parse csv record")?;
-        for col_idx in 0..header_len {
-            let value = record.get(col_idx).unwrap_or("");
-            insert_cell
-                .execute(params![dataset_id, row_idx as i64, col_idx as i64, value])
-                .context("failed to insert cell")?;
-        }
-        row_count += 1;
-    }
-    drop(insert_cell);
-
-    tx.execute(
-        "UPDATE dataset SET row_count = ?1 WHERE id = ?2",
-        params![row_count, dataset_id],
-    )
-    .context("failed to update dataset row_count")?;
-
-    tx.commit().context("failed to commit import transaction")?;
-
-    Ok(ImportResult {
-        dataset_id,
-        row_count,
-    })
-}
-
-fn cell_to_string(cell: &Data) -> String {
-    match cell {
-        Data::String(v) => v.to_string(),
-        Data::Float(v) => v.to_string(),
-        Data::Int(v) => v.to_string(),
-        Data::Bool(v) => v.to_string(),
-        Data::DateTime(v) => v.to_string(),
-        Data::DateTimeIso(v) => v.to_string(),
-        Data::DurationIso(v) => v.to_string(),
-        Data::Error(v) => format!("{v:?}"),
-        Data::Empty => String::new(),
-    }
-}
+// moved to infra::import
 
 #[derive(Clone, Debug, Default)]
 struct HoldingDerived {
@@ -2542,12 +2652,7 @@ fn default_dataset_name_mmdd() -> String {
     now.format("%m%d").to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CellKey {
-    row_idx: usize,
-    col_idx: usize,
-    column: String,
-}
+// moved to domain::entities::edit::CellKey
 
 #[derive(Clone)]
 struct CellRender {
@@ -2608,1256 +2713,15 @@ fn validate_required_holdings_row(headers: &[String], row: &[String]) -> Result<
     Ok(())
 }
 
-fn import_xlsx_selected_sheets_to_sqlite(
-    db_path: &Path,
-    xlsx_path: &Path,
-) -> Result<Vec<ImportResult>> {
-    init_db(db_path)?;
+// moved to infra::import
 
-    let mut workbook = open_workbook_auto(xlsx_path)
-        .with_context(|| format!("failed to open xlsx: {}", xlsx_path.display()))?;
-    let source_path = xlsx_path.to_string_lossy().into_owned();
+// moved to infra::sqlite::queries
 
-    let mut conn = open_connection(db_path)?;
-    let tx = conn
-        .transaction()
-        .context("failed to start xlsx import transaction")?;
+// moved to infra::sqlite::queries
 
-    let assets_range = workbook
-        .worksheet_range("資產總表")
-        .context("failed to read sheet: 資產總表")?;
-    let holdings_range = workbook
-        .worksheet_range("持股明細")
-        .context("failed to read sheet: 持股明細")?;
-    let dividends_range = workbook
-        .worksheet_range("股息收入明細表")
-        .context("failed to read sheet: 股息收入明細表")?;
+// moved to infra::sqlite::queries
 
-    let assets_rows: Vec<Vec<String>> = assets_range
-        .rows()
-        .skip(3)
-        .map(|r| r.iter().map(cell_to_string).collect())
-        .collect();
-    let holdings_rows: Vec<Vec<String>> = holdings_range
-        .rows()
-        .skip(2)
-        .map(|r| r.iter().map(cell_to_string).collect())
-        .collect();
-    let dividends_rows: Vec<Vec<String>> = dividends_range
-        .rows()
-        .skip(1)
-        .map(|r| r.iter().map(cell_to_string).collect())
-        .collect();
-
-    let holdings = transform_holdings_sheet(&holdings_rows);
-    let (assets_headers, assets_data) =
-        transform_assets_sheet(&assets_rows, holdings.total_cost, holdings.total_net);
-    let (_dividend_headers, dividend_data) =
-        transform_dividend_sheet(&dividends_rows, &holdings.by_code);
-    let (merged_headers, merged_data) =
-        merge_holdings_and_dividends(holdings.headers, holdings.rows, &dividend_data);
-
-    let transformed = vec![
-        ("資產總表", assets_headers, assets_data),
-        ("持股股息合併表", merged_headers, merged_data),
-    ];
-
-    let mut imported = Vec::new();
-    for (sheet_name, headers, rows) in transformed {
-        tx.execute(
-            "INSERT INTO dataset(name, source_path, row_count) VALUES (?1, ?2, 0)",
-            params![sheet_name, format!("{source_path}#{sheet_name}")],
-        )
-        .with_context(|| format!("failed to insert dataset for sheet: {sheet_name}"))?;
-        let dataset_id = tx.last_insert_rowid();
-
-        insert_header_names(&tx, dataset_id, &headers)?;
-
-        let mut insert_cell = tx
-            .prepare(
-                "INSERT INTO cell(dataset_id, row_idx, col_idx, value) VALUES (?1, ?2, ?3, ?4)",
-            )
-            .context("failed to prepare xlsx cell insert")?;
-
-        for (row_idx, row) in rows.iter().enumerate() {
-            for (col_idx, value) in row.iter().enumerate() {
-                insert_cell
-                    .execute(params![dataset_id, row_idx as i64, col_idx as i64, value])
-                    .context("failed to insert transformed xlsx cell")?;
-            }
-        }
-        drop(insert_cell);
-
-        let row_count = rows.len() as i64;
-        tx.execute(
-            "UPDATE dataset SET row_count = ?1 WHERE id = ?2",
-            params![row_count, dataset_id],
-        )
-        .context("failed to update xlsx dataset row_count")?;
-
-        imported.push(ImportResult {
-            dataset_id,
-            row_count,
-        });
-    }
-
-    tx.commit()
-        .context("failed to commit xlsx import transaction")?;
-
-    Ok(imported)
-}
-
-#[allow(dead_code)]
-fn insert_headers(
-    tx: &rusqlite::Transaction<'_>,
-    dataset_id: i64,
-    headers: &StringRecord,
-) -> Result<()> {
-    let mut insert_header = tx
-        .prepare("INSERT INTO column_name(dataset_id, col_idx, name) VALUES (?1, ?2, ?3)")
-        .context("failed to prepare header insert")?;
-
-    for (col_idx, name) in headers.iter().enumerate() {
-        insert_header
-            .execute(params![dataset_id, col_idx as i64, name])
-            .context("failed to insert header")?;
-    }
-
-    Ok(())
-}
-
-fn insert_header_names(
-    tx: &rusqlite::Transaction<'_>,
-    dataset_id: i64,
-    headers: &[String],
-) -> Result<()> {
-    let mut insert_header = tx
-        .prepare("INSERT INTO column_name(dataset_id, col_idx, name) VALUES (?1, ?2, ?3)")
-        .context("failed to prepare header insert")?;
-
-    for (col_idx, name) in headers.iter().enumerate() {
-        insert_header
-            .execute(params![dataset_id, col_idx as i64, name])
-            .context("failed to insert header")?;
-    }
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn query_page(
-    db_path: &Path,
-    dataset_id: i64,
-    target_page: i64,
-    page_size: i64,
-    options: &QueryOptions,
-) -> Result<QueryPageResult> {
-    if page_size <= 0 {
-        anyhow::bail!("page_size must be greater than zero")
-    }
-
-    let conn = open_connection(db_path)?;
-
-    let mut columns_stmt = conn
-        .prepare(
-            "SELECT name
-             FROM column_name
-             WHERE dataset_id = ?1
-             ORDER BY col_idx ASC",
-        )
-        .context("failed to prepare columns query")?;
-    let columns = columns_stmt
-        .query_map([dataset_id], |row| row.get::<_, String>(0))
-        .context("failed to query columns")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to collect columns")?;
-    drop(columns_stmt);
-
-    if columns.is_empty() {
-        return Ok((columns, Vec::new(), 0));
-    }
-
-    if let Some(column_search_col) = options.column_search_col {
-        if column_search_col < 0 || column_search_col as usize >= columns.len() {
-            anyhow::bail!(
-                "column_search_col out of range: {column_search_col} (columns: {})",
-                columns.len()
-            );
-        }
-    }
-
-    if let Some(sort_col) = options.sort_col {
-        if sort_col < 0 || sort_col as usize >= columns.len() {
-            anyhow::bail!(
-                "sort_col out of range: {sort_col} (columns: {})",
-                columns.len()
-            );
-        }
-    }
-
-    let mut filter_clauses = vec!["base.dataset_id = ?".to_string()];
-    let mut filter_params = vec![Value::Integer(dataset_id)];
-
-    let global_search = options.global_search.trim();
-    if !global_search.is_empty() {
-        filter_clauses.push(
-            "EXISTS (
-                SELECT 1 FROM cell gs
-                WHERE gs.dataset_id = ?
-                  AND gs.row_idx = base.row_idx
-                  AND gs.value LIKE ?
-            )"
-            .to_string(),
-        );
-        filter_params.push(Value::Integer(dataset_id));
-        filter_params.push(Value::Text(format!("%{global_search}%")));
-    }
-
-    let column_search_text = options.column_search_text.trim();
-    if !column_search_text.is_empty() {
-        if let Some(column_search_col) = options.column_search_col {
-            filter_clauses.push(
-                "EXISTS (
-                    SELECT 1 FROM cell cs
-                    WHERE cs.dataset_id = ?
-                      AND cs.row_idx = base.row_idx
-                      AND cs.col_idx = ?
-                      AND cs.value LIKE ?
-                )"
-                .to_string(),
-            );
-            filter_params.push(Value::Integer(dataset_id));
-            filter_params.push(Value::Integer(column_search_col));
-            filter_params.push(Value::Text(format!("%{column_search_text}%")));
-        }
-    }
-
-    let where_sql = filter_clauses.join(" AND ");
-
-    let count_sql = format!(
-        "SELECT COUNT(*)
-         FROM (
-             SELECT base.row_idx
-             FROM cell base
-             WHERE {where_sql}
-             GROUP BY base.row_idx
-         ) filtered"
-    );
-    let total_rows: i64 = conn
-        .query_row(
-            &count_sql,
-            rusqlite::params_from_iter(filter_params.iter().cloned()),
-            |row| row.get(0),
-        )
-        .context("failed to query filtered row count")?;
-
-    let offset = target_page.max(0) * page_size;
-    let sort_direction = if options.sort_desc { "DESC" } else { "ASC" };
-
-    let mut row_params = Vec::<Value>::new();
-    let mut row_sql = String::from("SELECT base.row_idx FROM cell base ");
-    if let Some(sort_col) = options.sort_col {
-        row_sql.push_str(
-            "LEFT JOIN cell sort_cell
-             ON sort_cell.dataset_id = base.dataset_id
-            AND sort_cell.row_idx = base.row_idx
-            AND sort_cell.col_idx = ? ",
-        );
-        row_params.push(Value::Integer(sort_col));
-    }
-
-    row_sql.push_str(&format!(
-        "WHERE {where_sql} GROUP BY base.row_idx ORDER BY "
-    ));
-    if options.sort_col.is_some() {
-        row_sql.push_str(&format!("COALESCE(sort_cell.value, '') {sort_direction}, "));
-    }
-    row_sql.push_str("base.row_idx ASC LIMIT ? OFFSET ?");
-
-    row_params.extend(filter_params.iter().cloned());
-    row_params.push(Value::Integer(page_size));
-    row_params.push(Value::Integer(offset));
-
-    let mut row_stmt = conn
-        .prepare(&row_sql)
-        .context("failed to prepare page row_idx query")?;
-    let row_indices = row_stmt
-        .query_map(rusqlite::params_from_iter(row_params), |row| {
-            row.get::<_, i64>(0)
-        })
-        .context("failed to query page row_idx")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to collect page row_idx")?;
-    drop(row_stmt);
-
-    if row_indices.is_empty() {
-        return Ok((columns, Vec::new(), total_rows));
-    }
-
-    let placeholders = std::iter::repeat_n("?", row_indices.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let hydrate_sql = format!(
-        "SELECT row_idx, col_idx, value
-         FROM cell
-         WHERE dataset_id = ? AND row_idx IN ({placeholders})
-         ORDER BY row_idx ASC, col_idx ASC"
-    );
-    let mut hydrate_params = vec![Value::Integer(dataset_id)];
-    hydrate_params.extend(row_indices.iter().copied().map(Value::Integer));
-
-    let mut rows = vec![vec![String::new(); columns.len()]; row_indices.len()];
-    let row_pos: HashMap<i64, usize> = row_indices
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(idx, row_idx)| (row_idx, idx))
-        .collect();
-
-    let mut hydrate_stmt = conn
-        .prepare(&hydrate_sql)
-        .context("failed to prepare row hydration query")?;
-    let mut hydrate_rows = hydrate_stmt
-        .query(rusqlite::params_from_iter(hydrate_params))
-        .context("failed to run row hydration query")?;
-
-    while let Some(row) = hydrate_rows.next().context("failed to read hydrated row")? {
-        let row_idx: i64 = row.get(0).context("failed to read row_idx")?;
-        let col_idx: i64 = row.get(1).context("failed to read col_idx")?;
-        let value: String = row.get(2).context("failed to read value")?;
-
-        if let Some(&dest_row_idx) = row_pos.get(&row_idx) {
-            if let Some(dest_cell) = rows
-                .get_mut(dest_row_idx)
-                .and_then(|dest_row| dest_row.get_mut(col_idx as usize))
-            {
-                *dest_cell = value;
-            }
-        }
-    }
-
-    Ok((columns, rows, total_rows))
-}
-
-fn list_datasets(db_path: &Path, include_deleted: bool) -> Result<Vec<DatasetSummary>> {
-    init_db(db_path)?;
-    let conn = open_connection(db_path)?;
-    let filter = if include_deleted {
-        ""
-    } else {
-        "WHERE deleted_at IS NULL"
-    };
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT id, name, row_count, source_path, deleted_at
-             FROM dataset
-             {filter}
-             ORDER BY id DESC"
-        ))
-        .context("failed to prepare datasets query")?;
-
-    let datasets = stmt
-        .query_map([], |row| {
-            Ok(DatasetSummary {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                row_count: row.get(2)?,
-                source_path: row.get(3)?,
-                deleted_at: row.get(4)?,
-            })
-        })
-        .context("failed to query datasets")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to collect datasets")?;
-
-    Ok(datasets)
-}
-
-fn soft_delete_dataset(db_path: &Path, dataset_id: i64) -> Result<()> {
-    init_db(db_path)?;
-    let conn = open_connection(db_path)?;
-    conn.execute(
-        "UPDATE dataset SET deleted_at = datetime('now') WHERE id = ?1",
-        params![dataset_id],
-    )
-    .with_context(|| format!("failed to soft-delete dataset #{dataset_id}"))?;
-    Ok(())
-}
-
-fn purge_dataset(db_path: &Path, dataset_id: i64) -> Result<()> {
-    init_db(db_path)?;
-    let mut conn = open_connection(db_path)?;
-    let tx = conn
-        .transaction()
-        .context("failed to start purge transaction")?;
-    tx.execute(
-        "DELETE FROM cell WHERE dataset_id = ?1",
-        params![dataset_id],
-    )
-    .with_context(|| format!("failed to delete cells for dataset #{dataset_id}"))?;
-    tx.execute(
-        "DELETE FROM column_name WHERE dataset_id = ?1",
-        params![dataset_id],
-    )
-    .with_context(|| format!("failed to delete columns for dataset #{dataset_id}"))?;
-    tx.execute("DELETE FROM dataset WHERE id = ?1", params![dataset_id])
-        .with_context(|| format!("failed to delete dataset #{dataset_id}"))?;
-    tx.commit().context("failed to commit purge transaction")?;
-    Ok(())
-}
-
-fn reload_page_data(
-    db_path: &Path,
-    dataset_id: Option<i64>,
-    target_page: i64,
-    options: &QueryOptions,
-) -> Result<ReloadPageResult> {
-    let page = target_page.max(0);
-    if let Some(dataset_id) = dataset_id {
-        let (columns, rows, total_rows) =
-            query_page(db_path, dataset_id, page, PAGE_SIZE, options)?;
-        Ok((columns, rows, total_rows, page))
-    } else {
-        Ok((Vec::new(), Vec::new(), 0, 0))
-    }
-}
-
-fn build_updated_rows(
-    columns: &[String],
-    rows: &[Vec<String>],
-    staged_cells: &HashMap<CellKey, String>,
-    deleted_rows: &BTreeSet<usize>,
-    added_rows: &[Vec<String>],
-) -> Vec<Vec<String>> {
-    let mut updated = Vec::new();
-    for (row_idx, row) in rows.iter().enumerate() {
-        if deleted_rows.contains(&row_idx) {
-            continue;
-        }
-        let mut next_row = row.clone();
-        for (col_idx, header) in columns.iter().enumerate() {
-            if let Some(value) = staged_cells.get(&CellKey {
-                row_idx,
-                col_idx,
-                column: header.clone(),
-            }) {
-                if col_idx < next_row.len() {
-                    next_row[col_idx] = value.clone();
-                }
-            }
-        }
-        updated.push(next_row);
-    }
-    for row in added_rows {
-        updated.push(row.clone());
-    }
-    updated
-}
-
-fn apply_changes_to_dataset(
-    db_path: &Path,
-    dataset_id: i64,
-    columns: &[String],
-    rows: &[Vec<String>],
-    staged_cells: &HashMap<CellKey, String>,
-    deleted_rows: &BTreeSet<usize>,
-    added_rows: &[Vec<String>],
-) -> Result<()> {
-    let updated_rows = build_updated_rows(columns, rows, staged_cells, deleted_rows, added_rows);
-    let mut conn = open_connection(db_path)?;
-    let tx = conn
-        .transaction()
-        .context("failed to start update transaction")?;
-
-    tx.execute(
-        "DELETE FROM cell WHERE dataset_id = ?1",
-        params![dataset_id],
-    )
-    .context("failed to clear existing cells")?;
-
-    let mut insert_cell = tx
-        .prepare("INSERT INTO cell(dataset_id, row_idx, col_idx, value) VALUES (?1, ?2, ?3, ?4)")
-        .context("failed to prepare cell insert")?;
-    for (row_idx, row) in updated_rows.iter().enumerate() {
-        for (col_idx, value) in row.iter().enumerate() {
-            insert_cell
-                .execute(params![dataset_id, row_idx as i64, col_idx as i64, value])
-                .context("failed to insert updated cell")?;
-        }
-    }
-    drop(insert_cell);
-
-    tx.execute(
-        "UPDATE dataset SET row_count = ?1 WHERE id = ?2",
-        params![updated_rows.len() as i64, dataset_id],
-    )
-    .context("failed to update dataset row_count")?;
-
-    tx.commit().context("failed to commit dataset update")?;
-    Ok(())
-}
-
-fn create_dataset_from_rows(
-    db_path: &Path,
-    name: &str,
-    source_path: &str,
-    columns: &[String],
-    rows: &[Vec<String>],
-) -> Result<i64> {
-    init_db(db_path)?;
-    let mut conn = open_connection(db_path)?;
-    let tx = conn
-        .transaction()
-        .context("failed to start dataset create transaction")?;
-
-    tx.execute(
-        "INSERT INTO dataset(name, source_path, row_count) VALUES (?1, ?2, 0)",
-        params![name, source_path],
-    )
-    .context("failed to insert dataset")?;
-    let dataset_id = tx.last_insert_rowid();
-
-    insert_header_names(&tx, dataset_id, columns)?;
-
-    let mut insert_cell = tx
-        .prepare("INSERT INTO cell(dataset_id, row_idx, col_idx, value) VALUES (?1, ?2, ?3, ?4)")
-        .context("failed to prepare cell insert")?;
-    for (row_idx, row) in rows.iter().enumerate() {
-        for (col_idx, value) in row.iter().enumerate() {
-            insert_cell
-                .execute(params![dataset_id, row_idx as i64, col_idx as i64, value])
-                .context("failed to insert dataset cell")?;
-        }
-    }
-    drop(insert_cell);
-
-    tx.execute(
-        "UPDATE dataset SET row_count = ?1 WHERE id = ?2",
-        params![rows.len() as i64, dataset_id],
-    )
-    .context("failed to update dataset row_count")?;
-
-    tx.commit().context("failed to commit dataset create")?;
-    Ok(dataset_id)
-}
+// moved to infra::sqlite::queries
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_test_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("dioxus-{prefix}-{nanos}"))
-    }
-
-    #[test]
-    fn init_db_creates_required_tables() {
-        let temp_dir = unique_test_dir("init-db");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-        let db_path = temp_dir.join("app.sqlite");
-
-        let result = init_db(&db_path);
-
-        assert!(result.is_ok(), "init_db should succeed: {result:?}");
-
-        let conn = Connection::open(&db_path).expect("should open sqlite db");
-        let table_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('dataset','column_name','cell')",
-                [],
-                |row| row.get(0),
-            )
-            .expect("table count query should succeed");
-
-        assert_eq!(table_count, 3, "required tables should exist");
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn import_creates_dataset_with_headers_and_rows() {
-        let temp_dir = unique_test_dir("import-db");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-        let db_path = temp_dir.join("app.sqlite");
-        let csv_path = temp_dir.join("people.csv");
-        fs::write(&csv_path, "name,city\nAlice,Paris\nBob,Tokyo\n")
-            .expect("should write csv fixture");
-
-        init_db(&db_path).expect("init_db should succeed");
-        let import_result =
-            import_csv_to_sqlite(&db_path, &csv_path).expect("import should succeed");
-
-        assert_eq!(import_result.row_count, 2, "row count should be stored");
-
-        let conn = Connection::open(&db_path).expect("should open sqlite db");
-
-        let dataset_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM dataset", [], |row| row.get(0))
-            .expect("dataset count query should succeed");
-        assert_eq!(dataset_count, 1, "exactly one dataset should be inserted");
-
-        let header_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM column_name WHERE dataset_id = ?1",
-                [import_result.dataset_id],
-                |row| row.get(0),
-            )
-            .expect("header count query should succeed");
-        assert_eq!(header_count, 2, "header count should match csv headers");
-
-        let alice_city: String = conn
-            .query_row(
-                "SELECT value FROM cell WHERE dataset_id = ?1 AND row_idx = 0 AND col_idx = 1",
-                [import_result.dataset_id],
-                |row| row.get(0),
-            )
-            .expect("cell value query should succeed");
-        assert_eq!(alice_city, "Paris", "expected imported cell value");
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn import_xlsx_selected_sheets_creates_datasets() {
-        let temp_dir = unique_test_dir("import-xlsx");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-        let db_path = temp_dir.join("app.sqlite");
-        let xlsx_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("BOM_test.xlsx");
-
-        init_db(&db_path).expect("init_db should succeed");
-        let imported = import_xlsx_selected_sheets_to_sqlite(&db_path, &xlsx_path)
-            .expect("xlsx import should succeed");
-
-        assert_eq!(imported.len(), 2, "should import assets and merged sheet");
-
-        let conn = Connection::open(&db_path).expect("should open sqlite db");
-        let dataset_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM dataset", [], |row| row.get(0))
-            .expect("dataset count query should succeed");
-        assert_eq!(dataset_count, 2, "should insert two datasets");
-
-        let names: Vec<String> = conn
-            .prepare("SELECT name FROM dataset ORDER BY id")
-            .expect("prepare should succeed")
-            .query_map([], |row| row.get(0))
-            .expect("query should succeed")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("collect should succeed");
-
-        assert!(names.iter().any(|n| n.contains("資產總表")));
-        assert!(names.iter().any(|n| n.contains("持股股息合併表")));
-
-        let mut col_stmt = conn
-            .prepare(
-                "SELECT c.name
-                 FROM column_name c
-                 JOIN dataset d ON d.id = c.dataset_id
-                 WHERE d.name = '資產總表'
-                 ORDER BY c.col_idx ASC",
-            )
-            .expect("prepare should succeed");
-        let asset_cols = col_stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .expect("query should succeed")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("collect should succeed");
-        assert!(
-            !asset_cols.iter().any(|c| c == "小計"),
-            "summary formula columns should not be imported"
-        );
-
-        let mut hold_stmt = conn
-            .prepare(
-                "SELECT c.name
-                 FROM column_name c
-                 JOIN dataset d ON d.id = c.dataset_id
-                 WHERE d.name = '持股股息合併表'
-                 ORDER BY c.col_idx ASC",
-            )
-            .expect("prepare should succeed");
-        let hold_cols = hold_stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .expect("query should succeed")
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("collect should succeed");
-        assert!(
-            !hold_cols
-                .iter()
-                .any(|c| c == "內" || c == "外" || c == "平均配息合計"),
-            "merged sheet should hide summary columns"
-        );
-        assert!(
-            hold_cols.iter().any(|c| c == "配息方式"),
-            "merged sheet should contain dividend columns"
-        );
-        assert!(
-            hold_cols.iter().any(|c| c == "總成本"),
-            "merged sheet should contain holding columns"
-        );
-
-        let total_cost: String = conn
-            .query_row(
-                "SELECT cell.value
-                 FROM cell
-                 JOIN dataset d ON d.id = cell.dataset_id
-                 JOIN column_name c ON c.dataset_id = d.id AND c.col_idx = cell.col_idx
-                 WHERE d.name = '持股股息合併表'
-                   AND c.name = '總成本'
-                   AND EXISTS (
-                     SELECT 1
-                     FROM cell code
-                     JOIN column_name cc ON cc.dataset_id = d.id AND cc.col_idx = code.col_idx
-                     WHERE code.dataset_id = d.id
-                       AND code.row_idx = cell.row_idx
-                       AND cc.name = '代號'
-                       AND code.value = '00882'
-                   )
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .expect("should find computed total cost");
-        assert_eq!(total_cost, "63203.5");
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn soft_delete_hides_dataset_from_default_list() {
-        let temp_dir = unique_test_dir("soft-delete");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-        let db_path = temp_dir.join("app.sqlite");
-        let csv_path = temp_dir.join("sample.csv");
-        fs::write(&csv_path, "name\nAlice\n").expect("should write csv fixture");
-
-        let imported = import_csv_to_sqlite(&db_path, &csv_path).expect("import should succeed");
-        soft_delete_dataset(&db_path, imported.dataset_id).expect("soft delete should succeed");
-
-        let visible = list_datasets(&db_path, false).expect("list visible should succeed");
-        assert!(visible.is_empty(), "soft deleted dataset should be hidden");
-
-        let with_deleted = list_datasets(&db_path, true).expect("list with deleted should succeed");
-        assert_eq!(with_deleted.len(), 1, "deleted dataset should still exist");
-        assert!(
-            with_deleted[0].deleted_at.is_some(),
-            "deleted_at should be set"
-        );
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn purge_dataset_removes_related_records() {
-        let temp_dir = unique_test_dir("purge-dataset");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-        let db_path = temp_dir.join("app.sqlite");
-        let csv_path = temp_dir.join("sample.csv");
-        fs::write(&csv_path, "name,city\nAlice,Paris\n").expect("should write csv fixture");
-
-        let imported = import_csv_to_sqlite(&db_path, &csv_path).expect("import should succeed");
-        purge_dataset(&db_path, imported.dataset_id).expect("purge should succeed");
-
-        let conn = Connection::open(&db_path).expect("should open sqlite db");
-        let dataset_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM dataset WHERE id=?1",
-                [imported.dataset_id],
-                |row| row.get(0),
-            )
-            .expect("dataset count query should succeed");
-        let column_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM column_name WHERE dataset_id=?1",
-                [imported.dataset_id],
-                |row| row.get(0),
-            )
-            .expect("column count query should succeed");
-        let cell_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM cell WHERE dataset_id=?1",
-                [imported.dataset_id],
-                |row| row.get(0),
-            )
-            .expect("cell count query should succeed");
-
-        assert_eq!(dataset_count, 0);
-        assert_eq!(column_count, 0);
-        assert_eq!(cell_count, 0);
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    fn seed_query_fixture() -> (PathBuf, i64) {
-        let temp_dir = unique_test_dir("query-db");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-
-        let db_path = temp_dir.join("app.sqlite");
-        let csv_path = temp_dir.join("people.csv");
-        fs::write(
-            &csv_path,
-            "name,city,dept\nAlice,Paris,Sales\nBob,Tokyo,Engineering\nCara,Boston,Sales\nDylan,Berlin,Support\n",
-        )
-        .expect("should write csv fixture");
-
-        init_db(&db_path).expect("init_db should succeed");
-        let imported = import_csv_to_sqlite(&db_path, &csv_path).expect("import should succeed");
-
-        (temp_dir, imported.dataset_id)
-    }
-
-    #[test]
-    fn query_page_returns_expected_first_page() {
-        let (temp_dir, dataset_id) = seed_query_fixture();
-        let db_path = temp_dir.join("app.sqlite");
-
-        let (columns, rows, total_rows) =
-            query_page(&db_path, dataset_id, 0, 2, &QueryOptions::default())
-                .expect("query should succeed");
-
-        assert_eq!(columns, vec!["name", "city", "dept"]);
-        assert_eq!(total_rows, 4);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], vec!["Alice", "Paris", "Sales"]);
-        assert_eq!(rows[1], vec!["Bob", "Tokyo", "Engineering"]);
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn query_page_supports_global_search() {
-        let (temp_dir, dataset_id) = seed_query_fixture();
-        let db_path = temp_dir.join("app.sqlite");
-
-        let options = QueryOptions {
-            global_search: "tok".to_string(),
-            ..QueryOptions::default()
-        };
-
-        let (columns, rows, total_rows) =
-            query_page(&db_path, dataset_id, 0, 10, &options).expect("query should succeed");
-
-        assert_eq!(columns, vec!["name", "city", "dept"]);
-        assert_eq!(total_rows, 1);
-        assert_eq!(rows, vec![vec!["Bob", "Tokyo", "Engineering"]]);
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn query_page_supports_column_search_and_sort() {
-        let (temp_dir, dataset_id) = seed_query_fixture();
-        let db_path = temp_dir.join("app.sqlite");
-
-        let options = QueryOptions {
-            column_search_col: Some(2),
-            column_search_text: "sale".to_string(),
-            sort_col: Some(0),
-            sort_desc: true,
-            ..QueryOptions::default()
-        };
-
-        let (_columns, rows, total_rows) =
-            query_page(&db_path, dataset_id, 0, 10, &options).expect("query should succeed");
-
-        assert_eq!(total_rows, 2);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], vec!["Cara", "Boston", "Sales"]);
-        assert_eq!(rows[1], vec!["Alice", "Paris", "Sales"]);
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn query_page_rejects_invalid_column_indices() {
-        let (temp_dir, dataset_id) = seed_query_fixture();
-        let db_path = temp_dir.join("app.sqlite");
-
-        let bad_search = QueryOptions {
-            column_search_col: Some(99),
-            column_search_text: "x".to_string(),
-            ..QueryOptions::default()
-        };
-        let err = query_page(&db_path, dataset_id, 0, 10, &bad_search)
-            .expect_err("invalid search column should return error");
-        assert!(
-            err.to_string().contains("column_search_col out of range"),
-            "unexpected error: {err:#}"
-        );
-
-        let bad_sort = QueryOptions {
-            sort_col: Some(99),
-            ..QueryOptions::default()
-        };
-        let err = query_page(&db_path, dataset_id, 0, 10, &bad_sort)
-            .expect_err("invalid sort column should return error");
-        assert!(
-            err.to_string().contains("sort_col out of range"),
-            "unexpected error: {err:#}"
-        );
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn default_db_path_uses_bom_app_directory() {
-        let db_path = default_db_path().expect("default db path should resolve");
-        let app_dir = db_path
-            .parent()
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str())
-            .expect("db path should include app directory");
-
-        assert_eq!(
-            db_path.file_name().and_then(|name| name.to_str()),
-            Some("datasets.sqlite")
-        );
-        assert_eq!(app_dir, "bom", "app data directory should be BOM");
-    }
-
-    #[test]
-    fn ensure_webview_data_dir_creates_webview2_subdir() {
-        let temp_dir = unique_test_dir("webview-data-dir");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-
-        let webview_dir =
-            ensure_webview_data_dir(&temp_dir).expect("webview data dir should be created");
-
-        assert_eq!(webview_dir, temp_dir.join("webview2"));
-        assert!(webview_dir.is_dir(), "webview2 directory should exist");
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn format_number_with_commas_handles_decimals() {
-        assert_eq!(format_number_with_commas(12345.678, 0), "12,346");
-        assert_eq!(format_number_with_commas(12345.678, 2), "12,345.68");
-        assert_eq!(format_number_with_commas(-1234.5, 2), "-1,234.50");
-    }
-
-    #[test]
-    fn format_cell_value_applies_header_rules() {
-        assert_eq!(format_cell_value("買進", "1234.5"), "1,234.50");
-        assert_eq!(format_cell_value("損益率", "0.1234"), "12.34%");
-        assert_eq!(format_cell_value("代號", "0050"), "0050");
-    }
-
-    #[test]
-    fn column_alignment_prefers_text_headers() {
-        let rows = vec![vec!["0050".to_string()], vec!["006208".to_string()]];
-        assert_eq!(column_alignment("代號", &rows, 0), "left");
-    }
-
-    #[test]
-    fn format_ratio_or_na_handles_zero_denominator() {
-        assert_eq!(format_ratio_or_na(10.0, 0.0), "N/A");
-        assert_eq!(format_ratio_or_na(25.0, 200.0), "0.125");
-    }
-
-    #[test]
-    fn transform_assets_sheet_keeps_required_columns_and_adds_settlement_column() {
-        let rows = vec![
-            vec![
-                "證券戶".to_string(),
-                "王小明".to_string(),
-                "元大證券".to_string(),
-                "A12345".to_string(),
-                "TWD".to_string(),
-                "100000".to_string(),
-            ],
-            vec![
-                "銀行活存".to_string(),
-                "王小明".to_string(),
-                "台灣銀行".to_string(),
-                "B67890".to_string(),
-                "TWD".to_string(),
-                "50000".to_string(),
-            ],
-            vec![
-                "銀行活存".to_string(),
-                "".to_string(),
-                "台灣銀行".to_string(),
-                "C00001".to_string(),
-                "TWD".to_string(),
-                "40000".to_string(),
-            ],
-            vec![
-                "銀行活存".to_string(),
-                "王小明".to_string(),
-                "台灣銀行".to_string(),
-                "C00002".to_string(),
-                "TWD".to_string(),
-                "N/A".to_string(),
-            ],
-            vec![
-                "交割款".to_string(),
-                "王小明".to_string(),
-                "元大證券".to_string(),
-                "A12345".to_string(),
-                "TWD".to_string(),
-                "777".to_string(),
-            ],
-        ];
-
-        let (headers, data) = transform_assets_sheet(&rows, 0.0, 0.0);
-
-        assert_eq!(
-            headers,
-            vec![
-                "資產形式",
-                "所有權人",
-                "往來機構",
-                "帳號",
-                "幣別",
-                "餘額",
-                "交割款"
-            ]
-        );
-        assert_eq!(data.len(), 2, "格式不正確與交割款列應移除");
-        assert_eq!(data[0][0], "證券戶");
-        assert_eq!(data[0][6], "", "交割款預設應為空白");
-        assert_eq!(data[1][0], "銀行活存");
-        assert_eq!(data[1][6], "");
-    }
-
-    #[test]
-    fn reorder_headers_and_rows_applies_preferred_order() {
-        let headers = vec![
-            "名稱".to_string(),
-            "類別".to_string(),
-            "性質".to_string(),
-            "國內 /國外".to_string(),
-            "代號".to_string(),
-            "買進".to_string(),
-            "市價".to_string(),
-            "數量".to_string(),
-            "所有權人".to_string(),
-            "配息方式".to_string(),
-            "期數".to_string(),
-            "其他".to_string(),
-        ];
-        let rows = vec![headers.iter().map(|h| h.clone()).collect::<Vec<_>>()];
-        let preferred = [
-            "所有權人",
-            "名稱",
-            "類別",
-            "性質",
-            "國內 /國外",
-            "代號",
-            "買進",
-            "市價",
-            "數量",
-            "配息方式",
-            "期數",
-        ];
-
-        let (new_headers, new_rows) = reorder_headers_and_rows(&headers, &rows, &preferred);
-
-        assert_eq!(
-            new_headers,
-            vec![
-                "所有權人",
-                "名稱",
-                "類別",
-                "性質",
-                "國內 /國外",
-                "代號",
-                "買進",
-                "市價",
-                "數量",
-                "配息方式",
-                "期數",
-                "其他"
-            ]
-        );
-        assert_eq!(new_rows[0], new_headers);
-    }
-
-    #[test]
-    fn holdings_editable_and_required_columns_match_spec() {
-        let required = required_columns_for_holdings();
-        let editable = editable_columns_for_holdings();
-        assert!(required.iter().all(|c| editable.contains(c)));
-        assert!(required.contains(&"所有權人".to_string()));
-        assert!(required.contains(&"配息方式".to_string()));
-        assert!(!editable.contains(&"總成本".to_string()));
-    }
-
-    #[test]
-    fn build_updated_rows_applies_staged_values() {
-        let columns = vec!["所有權人".to_string(), "名稱".to_string()];
-        let rows = vec![vec!["王小明".to_string(), "舊名稱".to_string()]];
-        let mut staged = HashMap::new();
-        staged.insert(
-            CellKey {
-                row_idx: 0,
-                col_idx: 1,
-                column: "名稱".to_string(),
-            },
-            "新名稱".to_string(),
-        );
-        let deleted = BTreeSet::new();
-        let added = Vec::new();
-
-        let updated = build_updated_rows(&columns, &rows, &staged, &deleted, &added);
-
-        assert_eq!(updated.len(), 1);
-        assert_eq!(updated[0][1], "新名稱");
-    }
-
-    #[test]
-    fn validate_required_holdings_row_rejects_empty_required_field() {
-        let headers = required_columns_for_holdings();
-        let mut row = vec!["X".to_string(); headers.len()];
-        let owner_idx = headers
-            .iter()
-            .position(|h| h == "所有權人")
-            .expect("should have required header");
-        row[owner_idx] = String::new();
-
-        let result = validate_required_holdings_row(&headers, &row);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn build_updated_rows_skips_deleted_rows() {
-        let columns = vec!["所有權人".to_string()];
-        let rows = vec![
-            vec!["A".to_string()],
-            vec!["B".to_string()],
-            vec!["C".to_string()],
-        ];
-        let staged = HashMap::new();
-        let mut deleted = BTreeSet::new();
-        deleted.insert(0);
-        deleted.insert(2);
-        let added = Vec::new();
-
-        let updated = build_updated_rows(&columns, &rows, &staged, &deleted, &added);
-
-        assert_eq!(updated, vec![vec!["B".to_string()]]);
-    }
-
-    #[test]
-    fn build_updated_rows_appends_added_rows() {
-        let columns = vec!["所有權人".to_string(), "名稱".to_string()];
-        let rows = vec![vec!["A".to_string(), "X".to_string()]];
-        let staged = HashMap::new();
-        let deleted = BTreeSet::new();
-        let added = vec![vec!["B".to_string(), "Y".to_string()]];
-
-        let updated = build_updated_rows(&columns, &rows, &staged, &deleted, &added);
-
-        assert_eq!(updated.len(), 2);
-        assert_eq!(updated[1], vec!["B".to_string(), "Y".to_string()]);
-    }
-
-    #[test]
-    fn apply_changes_to_dataset_updates_rows() {
-        let temp_dir = unique_test_dir("apply-changes");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-        let db_path = temp_dir.join("app.sqlite");
-        let csv_path = temp_dir.join("people.csv");
-        fs::write(&csv_path, "name,city\nAlice,Paris\nBob,Tokyo\n")
-            .expect("should write csv fixture");
-
-        let imported = import_csv_to_sqlite(&db_path, &csv_path).expect("import should succeed");
-        let (columns, rows, _total) = query_page(
-            &db_path,
-            imported.dataset_id,
-            0,
-            10,
-            &QueryOptions::default(),
-        )
-        .expect("query should succeed");
-
-        let mut staged = HashMap::new();
-        staged.insert(
-            CellKey {
-                row_idx: 0,
-                col_idx: 1,
-                column: "city".to_string(),
-            },
-            "Berlin".to_string(),
-        );
-        let mut deleted = BTreeSet::new();
-        deleted.insert(1);
-        let added = vec![vec!["Cara".to_string(), "Rome".to_string()]];
-
-        apply_changes_to_dataset(
-            &db_path,
-            imported.dataset_id,
-            &columns,
-            &rows,
-            &staged,
-            &deleted,
-            &added,
-        )
-        .expect("apply changes should succeed");
-
-        let (_columns, new_rows, total_rows) = query_page(
-            &db_path,
-            imported.dataset_id,
-            0,
-            10,
-            &QueryOptions::default(),
-        )
-        .expect("query should succeed");
-
-        assert_eq!(total_rows, 2);
-        assert_eq!(new_rows[0], vec!["Alice", "Berlin"]);
-        assert_eq!(new_rows[1], vec!["Cara", "Rome"]);
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-
-    #[test]
-    fn create_dataset_from_rows_inserts_dataset() {
-        let temp_dir = unique_test_dir("create-dataset");
-        fs::create_dir_all(&temp_dir).expect("should create temp dir");
-        let db_path = temp_dir.join("app.sqlite");
-        init_db(&db_path).expect("init_db should succeed");
-
-        let columns = vec!["col1".to_string(), "col2".to_string()];
-        let rows = vec![vec!["a".to_string(), "b".to_string()]];
-        let dataset_id =
-            create_dataset_from_rows(&db_path, "backup", "test#backup", &columns, &rows)
-                .expect("create dataset should succeed");
-
-        let conn = Connection::open(&db_path).expect("should open sqlite db");
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM dataset WHERE id = ?1 AND name = ?2",
-                params![dataset_id, "backup"],
-                |row| row.get(0),
-            )
-            .expect("dataset count query should succeed");
-        assert_eq!(count, 1);
-
-        let column_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM column_name WHERE dataset_id = ?1",
-                params![dataset_id],
-                |row| row.get(0),
-            )
-            .expect("column count query should succeed");
-        assert_eq!(column_count, 2);
-
-        let row_count: i64 = conn
-            .query_row(
-                "SELECT row_count FROM dataset WHERE id = ?1",
-                params![dataset_id],
-                |row| row.get(0),
-            )
-            .expect("row count query should succeed");
-        assert_eq!(row_count, 1);
-
-        fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
-    }
-}
+mod tests;

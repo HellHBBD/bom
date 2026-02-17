@@ -1,25 +1,33 @@
-# Development
+# BOM Desktop
 
-Your new bare-bones project includes minimal organization with a single `main.rs` file and a few assets.
+Desktop-only Dioxus application for CSV/XLSX import and local SQLite storage.
+
+## Structure
 
 ```
-project/
-├─ assets/ # Any assets that are used by the app should be placed here
-├─ src/
-│  ├─ main.rs # main.rs is the entry point to your application and currently contains all components for the app
-├─ Cargo.toml # The Cargo.toml file defines the dependencies and feature flags for your project
+src/
+  main.rs          # Entry point + shared helpers
+  app.rs           # Dioxus App root
+  ui/
+    state/app_state.rs
+  domain/
+  usecase/
+  infra/
+  platform/
+  tests.rs         # Unit/integration tests
 ```
 
-### Serving Your App
+## Development
 
-Run the following command in the root of your project to start developing with the default platform:
+Run the desktop app:
 
-```bash
-dx serve --platform web
-```
-
-To run for a different platform, use the `--platform platform` flag. E.g.
 ```bash
 dx serve --platform desktop
 ```
 
+Run checks:
+
+```bash
+cargo clippy
+cargo test
+```
