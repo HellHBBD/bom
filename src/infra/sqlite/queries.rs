@@ -117,6 +117,58 @@ pub fn load_column_visibility(db_path: &Path, dataset_id: i64) -> Result<BTreeMa
 }
 
 #[allow(dead_code)]
+pub fn upsert_holdings_flag(db_path: &Path, dataset_id: i64, is_holdings: bool) -> Result<()> {
+    let conn = open_connection(db_path)?;
+    let value = if is_holdings { 1 } else { 0 };
+    conn.execute(
+        "INSERT INTO dataset_flag(dataset_id, is_holdings)
+         VALUES (?1, ?2)
+         ON CONFLICT(dataset_id) DO UPDATE SET is_holdings = excluded.is_holdings",
+        params![dataset_id, value],
+    )
+    .context("failed to upsert holdings flag")?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn load_holdings_flags(db_path: &Path) -> Result<BTreeMap<i64, bool>> {
+    let conn = open_connection(db_path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT dataset_id, is_holdings
+             FROM dataset_flag",
+        )
+        .context("failed to prepare holdings flag query")?;
+
+    let mut flags = BTreeMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            let dataset_id: i64 = row.get(0)?;
+            let is_holdings: i64 = row.get(1)?;
+            Ok((dataset_id, is_holdings != 0))
+        })
+        .context("failed to query holdings flags")?;
+
+    for row in rows {
+        let (dataset_id, is_holdings) = row.context("failed to read holdings flag row")?;
+        flags.insert(dataset_id, is_holdings);
+    }
+
+    Ok(flags)
+}
+
+#[allow(dead_code)]
+pub fn rename_dataset(db_path: &Path, dataset_id: i64, name: &str) -> Result<()> {
+    let conn = open_connection(db_path)?;
+    conn.execute(
+        "UPDATE dataset SET name = ?1 WHERE id = ?2",
+        params![name, dataset_id],
+    )
+    .context("failed to rename dataset")?;
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub fn query_page(
     db_path: &Path,
     dataset_id: i64,

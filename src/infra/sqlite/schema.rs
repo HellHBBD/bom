@@ -57,6 +57,12 @@ pub fn init_db(db_path: &Path) -> Result<()> {
             FOREIGN KEY (dataset_id) REFERENCES dataset(id)
         );
 
+        CREATE TABLE IF NOT EXISTS dataset_flag (
+            dataset_id   INTEGER PRIMARY KEY,
+            is_holdings  INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (dataset_id) REFERENCES dataset(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_cell_dataset_row
             ON cell(dataset_id, row_idx);
 

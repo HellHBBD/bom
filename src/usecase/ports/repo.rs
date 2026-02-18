@@ -38,6 +38,9 @@ pub trait DatasetRepository: Send + Sync {
         id: DatasetId,
         visibility: BTreeMap<i64, bool>,
     ) -> Result<(), RepoError>;
+    fn load_holdings_flags(&self) -> Result<BTreeMap<i64, bool>, RepoError>;
+    fn upsert_holdings_flag(&self, id: DatasetId, is_holdings: bool) -> Result<(), RepoError>;
+    fn rename_dataset(&self, id: DatasetId, name: String) -> Result<(), RepoError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

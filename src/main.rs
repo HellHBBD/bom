@@ -1,5 +1,3 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
-
 mod app;
 mod domain;
 mod infra;
@@ -7,6 +5,7 @@ mod platform;
 mod ui;
 mod usecase;
 
+use calamine::{open_workbook_auto, Reader};
 use dioxus::prelude::*;
 use std::path::{Path, PathBuf};
 
@@ -73,17 +72,42 @@ fn reload_page_data_usecase(
 }
 
 fn main() {
+    hide_console_window();
     let webview_data_dir =
         default_webview_data_dir().expect("should resolve and create WebView2 data directory");
 
+    let mut config = dioxus::desktop::Config::new()
+        .with_window(dioxus::desktop::WindowBuilder::new().with_title("BOM"))
+        .with_data_directory(webview_data_dir);
+
+    if linux_menu_disabled() {
+        config = config.with_menu(None);
+    }
+
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus::desktop::Config::new()
-                .with_window(dioxus::desktop::WindowBuilder::new().with_title("BOM"))
-                .with_data_directory(webview_data_dir),
-        )
+        .with_cfg(config)
         .launch(app::App);
 }
+
+fn linux_menu_disabled() -> bool {
+    cfg!(target_os = "linux")
+}
+
+#[cfg(windows)]
+fn hide_console_window() {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    unsafe {
+        let window = GetConsoleWindow();
+        if window != 0 {
+            ShowWindow(window, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_console_window() {}
 
 #[allow(dead_code)]
 #[component]
@@ -392,7 +416,9 @@ fn App() -> Element {
                         }
 
                         let Some(file_path) = FileDialog::new()
-                            .add_filter("資料檔", &["csv", "xlsx"])
+                            .add_filter("XLSX", &["xlsx"])
+                            .add_filter("CSV", &["csv"])
+                            .add_filter("所有檔案 (*.*)", &["*"])
                             .pick_file() else {
                             *status.write() = "已取消匯入".to_string();
                             return;
@@ -2093,6 +2119,33 @@ fn dataset_group_label(source_path: &str, fallback_name: &str, id: i64) -> Strin
     format!("{fallback_name}（#{id}）")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetTabKind {
+    Assets,
+    Holdings,
+}
+
+pub fn dataset_tab_kind(name: &str) -> Option<DatasetTabKind> {
+    let trimmed = name.trim();
+    if trimmed.contains("資產總表") {
+        Some(DatasetTabKind::Assets)
+    } else if trimmed.contains("持股") {
+        Some(DatasetTabKind::Holdings)
+    } else {
+        None
+    }
+}
+
+pub fn choose_default_dataset_id(datasets: &[DatasetMeta]) -> Option<i64> {
+    if let Some(assets) = datasets
+        .iter()
+        .find(|dataset| dataset_tab_kind(&dataset.name) == Some(DatasetTabKind::Assets))
+    {
+        return Some(assets.id.0);
+    }
+    datasets.first().map(|dataset| dataset.id.0)
+}
+
 fn build_dataset_groups(list: &[DatasetMeta]) -> Vec<DatasetGroup> {
     let mut grouped: BTreeMap<String, DatasetGroup> = BTreeMap::new();
     for item in list {
@@ -2351,6 +2404,175 @@ fn is_summary_label(value: &str) -> bool {
 
 fn row_value(row: &[String], idx: usize) -> String {
     row.get(idx).cloned().unwrap_or_default()
+}
+
+pub fn apply_column_visibility(
+    columns: &[String],
+    rows: &[Vec<String>],
+    visibility: &BTreeMap<i64, bool>,
+) -> (Vec<(usize, String)>, Vec<Vec<String>>) {
+    let mut visible_columns = Vec::new();
+    let mut visible_indices = Vec::new();
+    let visibility_empty = visibility.is_empty();
+
+    for (idx, name) in columns.iter().enumerate() {
+        let visible = visibility.get(&(idx as i64)).copied().unwrap_or(true);
+        if visibility_empty || visible {
+            visible_indices.push(idx);
+            visible_columns.push((idx, name.clone()));
+        }
+    }
+
+    let visible_rows = rows
+        .iter()
+        .map(|row| {
+            visible_indices
+                .iter()
+                .map(|idx| row.get(*idx).cloned().unwrap_or_default())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    (visible_columns, visible_rows)
+}
+
+pub fn table_container_style() -> &'static str {
+    "max-height: 60vh; overflow: auto; border: 1px solid #bbb;"
+}
+
+pub fn table_header_cell_style() -> &'static str {
+    "border: 1px solid #bbb; padding: 6px; background: #f2f2f2; text-align: center; position: sticky; top: 0; z-index: 2;"
+}
+
+#[derive(Clone, Default)]
+pub struct XlsxInterestSummary {
+    pub label: String,
+    pub annual: String,
+    pub monthly: String,
+    pub yield_rate: String,
+}
+
+#[derive(Clone, Default)]
+pub struct XlsxOwnerDividendSummary {
+    pub owner: String,
+    pub monthly: String,
+    pub monthly_with_pension: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct XlsxSummaryReport {
+    pub title: String,
+    pub interest_rows: Vec<XlsxInterestSummary>,
+    pub dividend_total: Option<String>,
+    pub owner_dividends: Vec<XlsxOwnerDividendSummary>,
+    pub notes: Vec<String>,
+}
+
+pub fn read_xlsx_summary_report(xlsx_path: &Path) -> Result<XlsxSummaryReport> {
+    let mut workbook = open_workbook_auto(xlsx_path)
+        .with_context(|| format!("failed to open xlsx: {}", xlsx_path.display()))?;
+
+    let assets_range = workbook
+        .worksheet_range("資產總表")
+        .context("failed to read sheet: 資產總表")?;
+    let dividends_range = workbook
+        .worksheet_range("股息收入明細表")
+        .context("failed to read sheet: 股息收入明細表")?;
+
+    let assets_rows: Vec<Vec<String>> = assets_range
+        .rows()
+        .map(|row| {
+            row.iter()
+                .map(crate::infra::import::xlsx::cell_to_string)
+                .collect()
+        })
+        .collect();
+    let dividends_rows: Vec<Vec<String>> = dividends_range
+        .rows()
+        .map(|row| {
+            row.iter()
+                .map(crate::infra::import::xlsx::cell_to_string)
+                .collect()
+        })
+        .collect();
+
+    let mut report = XlsxSummaryReport {
+        title: "總結報表".to_string(),
+        ..XlsxSummaryReport::default()
+    };
+
+    let interest_labels = ["定存資金", "股債息(平均)", "合計(平均)", "合計(最新)"];
+    for label in interest_labels {
+        if let Some(row) = find_row_by_first_cell(&assets_rows, label) {
+            let annual = format_summary_value(row.get(1));
+            let monthly = format_summary_value(row.get(2));
+            let yield_rate = format_summary_value(row.get(3));
+            report.interest_rows.push(XlsxInterestSummary {
+                label: label.to_string(),
+                annual,
+                monthly,
+                yield_rate,
+            });
+        }
+    }
+
+    if let Some(row) = find_row_by_first_cell(&dividends_rows, "總計") {
+        report.dividend_total = Some(format_summary_value(row.get(47)));
+    }
+
+    for owner in ["Alex", "Paul", "Jim", "Anika"] {
+        if let Some(row) = find_row_by_first_cell(&dividends_rows, owner) {
+            let monthly = format_summary_value(row.get(47));
+            let monthly_with_pension = format_optional_value(row.get(48));
+            let note = row.get(49).and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            });
+            report.owner_dividends.push(XlsxOwnerDividendSummary {
+                owner: owner.to_string(),
+                monthly,
+                monthly_with_pension,
+                note,
+            });
+        }
+    }
+
+    if report.interest_rows.is_empty() && report.dividend_total.is_none() {
+        report.notes.push("找不到報表資料".to_string());
+    }
+
+    Ok(report)
+}
+
+fn find_row_by_first_cell(rows: &[Vec<String>], label: &str) -> Option<Vec<String>> {
+    rows.iter()
+        .find(|row| row.first().map(|value| value.trim()) == Some(label))
+        .cloned()
+}
+
+fn format_summary_value(value: Option<&String>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    if let Some(parsed) = parse_numeric_value(value) {
+        format_f64(parsed)
+    } else {
+        value.trim().to_string()
+    }
+}
+
+fn format_optional_value(value: Option<&String>) -> Option<String> {
+    let value = format_summary_value(value);
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2802,7 +3024,7 @@ fn merge_holdings_and_dividends(
         "累計殖利率".to_string(),
     ]);
 
-    let mut dividend_by_code: HashMap<String, Vec<String>> = HashMap::new();
+    let mut dividend_by_code: HashMap<String, Vec<Vec<String>>> = HashMap::new();
     for row in dividend_rows {
         let code = row_value(row, 2);
         if code.trim().is_empty() {
@@ -2833,18 +3055,23 @@ fn merge_holdings_and_dividends(
             row_value(row, 32),
             row_value(row, 33),
         ];
-        dividend_by_code.entry(code).or_insert(values);
+        dividend_by_code.entry(code).or_default().push(values);
     }
 
     let mut merged_rows = Vec::new();
-    for mut row in holdings_rows {
+    for row in holdings_rows {
         let code = row_value(&row, 4);
-        if let Some(div) = dividend_by_code.get(&code) {
-            row.extend(div.clone());
+        if let Some(divs) = dividend_by_code.get(&code) {
+            for div in divs {
+                let mut merged = row.clone();
+                merged.extend(div.clone());
+                merged_rows.push(merged);
+            }
         } else {
-            row.extend(std::iter::repeat_n(String::new(), 23));
+            let mut merged = row;
+            merged.extend(std::iter::repeat_n(String::new(), 23));
+            merged_rows.push(merged);
         }
-        merged_rows.push(row);
     }
 
     let preferred_order = [

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use dioxus::prelude::{use_signal, Signal};
 
@@ -11,7 +11,9 @@ pub struct AppState {
     pub selected_group_key: Signal<Option<String>>,
     pub selected_dataset_id: Signal<Option<i64>>,
     pub columns: Signal<Vec<String>>,
+    pub column_visibility: Signal<BTreeMap<i64, bool>>,
     pub rows: Signal<Vec<Vec<String>>>,
+    pub holdings_flags: Signal<BTreeMap<i64, bool>>,
     pub page: Signal<i64>,
     pub total_rows: Signal<i64>,
     pub global_search: Signal<String>,
@@ -45,7 +47,9 @@ impl AppState {
             selected_group_key: use_signal(|| None::<String>),
             selected_dataset_id: use_signal(|| None::<i64>),
             columns: use_signal(Vec::<String>::new),
+            column_visibility: use_signal(BTreeMap::<i64, bool>::new),
             rows: use_signal(Vec::<Vec<String>>::new),
+            holdings_flags: use_signal(BTreeMap::<i64, bool>::new),
             page: use_signal(|| 0_i64),
             total_rows: use_signal(|| 0_i64),
             global_search: use_signal(String::new),

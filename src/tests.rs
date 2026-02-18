@@ -10,8 +10,8 @@ use crate::infra::import::csv::import_csv_to_sqlite;
 use crate::infra::import::xlsx::import_xlsx_selected_sheets_to_sqlite;
 use crate::infra::sqlite::queries::{
     apply_changes_to_dataset, build_updated_rows, create_dataset_from_rows, list_datasets,
-    load_column_visibility, purge_dataset, query_page, soft_delete_dataset,
-    upsert_column_visibility,
+    load_column_visibility, load_holdings_flags, purge_dataset, query_page, rename_dataset,
+    soft_delete_dataset, upsert_column_visibility, upsert_holdings_flag,
 };
 use crate::infra::sqlite::schema::init_db;
 use crate::*;
@@ -82,6 +82,191 @@ fn column_visibility_persists_per_dataset() {
     );
 
     fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn holdings_flag_persists_per_dataset() {
+    let temp_dir = unique_test_dir("holdings-flag");
+    fs::create_dir_all(&temp_dir).expect("should create temp dir");
+    let db_path = temp_dir.join("app.sqlite");
+
+    init_db(&db_path).expect("init_db should succeed");
+
+    let dataset_id = create_dataset_from_rows(
+        &db_path,
+        "sample",
+        "sample.csv",
+        &["A".to_string(), "B".to_string(), "C".to_string()],
+        &[vec!["1".to_string(), "2".to_string(), "3".to_string()]],
+    )
+    .expect("dataset should be created");
+
+    upsert_holdings_flag(&db_path, dataset_id, true).expect("should store holdings flag");
+
+    let flags = load_holdings_flags(&db_path).expect("should load holdings flags");
+
+    assert_eq!(flags.get(&dataset_id), Some(&true));
+
+    fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn rename_dataset_updates_name() {
+    let temp_dir = unique_test_dir("rename-dataset");
+    fs::create_dir_all(&temp_dir).expect("should create temp dir");
+    let db_path = temp_dir.join("app.sqlite");
+
+    init_db(&db_path).expect("init_db should succeed");
+
+    let dataset_id = create_dataset_from_rows(
+        &db_path,
+        "sample",
+        "sample.csv",
+        &["A".to_string()],
+        &[vec!["1".to_string()]],
+    )
+    .expect("dataset should be created");
+
+    rename_dataset(&db_path, dataset_id, "renamed").expect("should rename dataset");
+
+    let datasets = list_datasets(&db_path, false).expect("should list datasets");
+    let name = datasets
+        .iter()
+        .find(|dataset| dataset.id.0 == dataset_id)
+        .map(|dataset| dataset.name.clone());
+
+    assert_eq!(name, Some("renamed".to_string()));
+
+    fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn apply_column_visibility_filters_columns_and_rows() {
+    let columns = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    let rows = vec![vec!["1".to_string(), "2".to_string(), "3".to_string()]];
+
+    let mut visibility = BTreeMap::new();
+    visibility.insert(0, true);
+    visibility.insert(1, false);
+    visibility.insert(2, true);
+
+    let (visible_columns, visible_rows) = apply_column_visibility(&columns, &rows, &visibility);
+
+    let visible_names: Vec<String> = visible_columns
+        .iter()
+        .map(|(_idx, name)| name.clone())
+        .collect();
+    assert_eq!(visible_names, vec!["A".to_string(), "C".to_string()]);
+    assert_eq!(visible_rows, vec![vec!["1".to_string(), "3".to_string()]]);
+}
+
+#[test]
+fn apply_column_visibility_defaults_to_all_when_empty() {
+    let columns = vec!["A".to_string(), "B".to_string()];
+    let rows = vec![vec!["1".to_string(), "2".to_string()]];
+    let visibility = BTreeMap::new();
+
+    let (visible_columns, visible_rows) = apply_column_visibility(&columns, &rows, &visibility);
+
+    let visible_names: Vec<String> = visible_columns
+        .iter()
+        .map(|(_idx, name)| name.clone())
+        .collect();
+    assert_eq!(visible_names, vec!["A".to_string(), "B".to_string()]);
+    assert_eq!(visible_rows, rows);
+}
+
+#[test]
+fn sticky_header_styles_include_positioning() {
+    let style = table_header_cell_style();
+
+    assert!(style.contains("position: sticky"));
+    assert!(style.contains("top: 0"));
+    assert!(style.contains("z-index"));
+}
+
+#[test]
+fn table_container_style_allows_scroll() {
+    let style = table_container_style();
+
+    assert!(style.contains("overflow: auto"));
+}
+
+#[test]
+fn read_xlsx_summary_report_reads_bottom_rows() {
+    let xlsx_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("BOM_test.xlsx");
+
+    let report = read_xlsx_summary_report(&xlsx_path).expect("should read xlsx summary");
+
+    let deposit = report
+        .interest_rows
+        .iter()
+        .find(|row| row.label == "定存資金")
+        .expect("should have deposit summary");
+    assert_eq!(deposit.annual, "53840");
+    assert_eq!(deposit.monthly, "4486.666667");
+    assert_eq!(deposit.yield_rate, "0.016");
+
+    assert_eq!(report.dividend_total.as_deref(), Some("23719.85119"));
+
+    let alex = report
+        .owner_dividends
+        .iter()
+        .find(|row| row.owner == "Alex")
+        .expect("should have Alex summary");
+    assert_eq!(alex.monthly, "11417.88194");
+    assert_eq!(alex.monthly_with_pension.as_deref(), Some("32004.98194"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linux_menu_disabled_in_config() {
+    assert!(linux_menu_disabled());
+}
+
+#[test]
+fn dataset_tab_kind_detects_assets_and_holdings() {
+    assert_eq!(dataset_tab_kind("資產總表"), Some(DatasetTabKind::Assets));
+    assert_eq!(
+        dataset_tab_kind("持股股息總表"),
+        Some(DatasetTabKind::Holdings)
+    );
+    assert_eq!(dataset_tab_kind("其他"), None);
+}
+
+#[test]
+fn choose_default_dataset_id_prefers_assets() {
+    let datasets = vec![
+        DatasetMeta {
+            id: 1.into(),
+            name: "持股股息總表".to_string(),
+            row_count: 0,
+            source_path: "x.xlsx#持股".to_string(),
+            deleted_at: None,
+        },
+        DatasetMeta {
+            id: 2.into(),
+            name: "資產總表".to_string(),
+            row_count: 0,
+            source_path: "x.xlsx#資產".to_string(),
+            deleted_at: None,
+        },
+    ];
+
+    assert_eq!(choose_default_dataset_id(&datasets), Some(2));
+}
+
+#[test]
+fn choose_default_dataset_id_falls_back_to_first() {
+    let datasets = vec![DatasetMeta {
+        id: 5.into(),
+        name: "其他".to_string(),
+        row_count: 0,
+        source_path: "x.csv".to_string(),
+        deleted_at: None,
+    }];
+
+    assert_eq!(choose_default_dataset_id(&datasets), Some(5));
 }
 
 #[test]
@@ -199,7 +384,7 @@ fn import_xlsx_selected_sheets_creates_datasets() {
         .expect("collect should succeed");
 
     assert!(names.iter().any(|n| n.contains("資產總表")));
-    assert!(names.iter().any(|n| n.contains("持股股息合併表")));
+    assert!(names.iter().any(|n| n.contains("持股股息總表")));
 
     let mut col_stmt = conn
         .prepare(
@@ -225,7 +410,7 @@ fn import_xlsx_selected_sheets_creates_datasets() {
             "SELECT c.name
              FROM column_name c
              JOIN dataset d ON d.id = c.dataset_id
-             WHERE d.name = '持股股息合併表'
+             WHERE d.name = '持股股息總表'
              ORDER BY c.col_idx ASC",
         )
         .expect("prepare should succeed");
@@ -255,7 +440,7 @@ fn import_xlsx_selected_sheets_creates_datasets() {
              FROM cell
              JOIN dataset d ON d.id = cell.dataset_id
              JOIN column_name c ON c.dataset_id = d.id AND c.col_idx = cell.col_idx
-             WHERE d.name = '持股股息合併表'
+             WHERE d.name = '持股股息總表'
                AND c.name = '總成本'
                AND EXISTS (
                  SELECT 1

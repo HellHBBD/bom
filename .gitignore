@@ -10,3 +10,4 @@
 docs/plans/
 *.xlsx
 *.csv
+.prompt-queue/

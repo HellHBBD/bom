@@ -37,4 +37,20 @@ impl QueryService {
     ) -> Result<(), RepoError> {
         self.repo.upsert_column_visibility(dataset_id, visibility)
     }
+
+    pub fn load_holdings_flags(&self) -> Result<BTreeMap<i64, bool>, RepoError> {
+        self.repo.load_holdings_flags()
+    }
+
+    pub fn upsert_holdings_flag(
+        &self,
+        dataset_id: DatasetId,
+        is_holdings: bool,
+    ) -> Result<(), RepoError> {
+        self.repo.upsert_holdings_flag(dataset_id, is_holdings)
+    }
+
+    pub fn rename_dataset(&self, dataset_id: DatasetId, name: String) -> Result<(), RepoError> {
+        self.repo.rename_dataset(dataset_id, name)
+    }
 }

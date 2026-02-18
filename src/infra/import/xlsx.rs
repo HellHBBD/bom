@@ -75,7 +75,7 @@ pub fn import_xlsx_selected_sheets_to_sqlite(
 
     let transformed = vec![
         ("資產總表", assets_headers, assets_data),
-        ("持股股息合併表", merged_headers, merged_data),
+        ("持股股息總表", merged_headers, merged_data),
     ];
 
     let mut imported = Vec::new();

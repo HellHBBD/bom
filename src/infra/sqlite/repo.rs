@@ -4,7 +4,8 @@ use crate::domain::entities::dataset::{DatasetId, PageQuery, PageResult, SortDir
 use crate::domain::entities::edit::StagedEdits;
 use crate::infra::sqlite::queries::{
     apply_changes_to_dataset, create_dataset_from_rows, list_datasets, load_column_visibility,
-    purge_dataset, query_page, soft_delete_dataset, upsert_column_visibility,
+    load_holdings_flags, purge_dataset, query_page, rename_dataset, soft_delete_dataset,
+    upsert_column_visibility, upsert_holdings_flag,
 };
 use crate::infra::sqlite::schema::init_db;
 use crate::usecase::ports::repo::{
@@ -117,6 +118,20 @@ impl DatasetRepository for SqliteRepo {
         visibility: BTreeMap<i64, bool>,
     ) -> Result<(), RepoError> {
         upsert_column_visibility(&self.db_path, id.0, &visibility)
+            .map_err(|err| RepoError::Message(err.to_string()))
+    }
+
+    fn load_holdings_flags(&self) -> Result<BTreeMap<i64, bool>, RepoError> {
+        load_holdings_flags(&self.db_path).map_err(|err| RepoError::Message(err.to_string()))
+    }
+
+    fn upsert_holdings_flag(&self, id: DatasetId, is_holdings: bool) -> Result<(), RepoError> {
+        upsert_holdings_flag(&self.db_path, id.0, is_holdings)
+            .map_err(|err| RepoError::Message(err.to_string()))
+    }
+
+    fn rename_dataset(&self, id: DatasetId, name: String) -> Result<(), RepoError> {
+        rename_dataset(&self.db_path, id.0, &name)
             .map_err(|err| RepoError::Message(err.to_string()))
     }
 }
