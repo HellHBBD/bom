@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::domain::entities::dataset::{DatasetId, PageQuery, PageResult};
 use crate::domain::entities::edit::StagedEdits;
 
@@ -30,6 +32,12 @@ pub trait DatasetRepository: Send + Sync {
     fn apply_edits(&self, id: DatasetId, edits: StagedEdits) -> Result<(), RepoError>;
     fn soft_delete_dataset(&self, id: DatasetId) -> Result<(), RepoError>;
     fn purge_dataset(&self, id: DatasetId) -> Result<(), RepoError>;
+    fn load_column_visibility(&self, id: DatasetId) -> Result<BTreeMap<i64, bool>, RepoError>;
+    fn upsert_column_visibility(
+        &self,
+        id: DatasetId,
+        visibility: BTreeMap<i64, bool>,
+    ) -> Result<(), RepoError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

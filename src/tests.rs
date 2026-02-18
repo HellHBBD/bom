@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +10,8 @@ use crate::infra::import::csv::import_csv_to_sqlite;
 use crate::infra::import::xlsx::import_xlsx_selected_sheets_to_sqlite;
 use crate::infra::sqlite::queries::{
     apply_changes_to_dataset, build_updated_rows, create_dataset_from_rows, list_datasets,
-    purge_dataset, query_page, soft_delete_dataset,
+    load_column_visibility, purge_dataset, query_page, soft_delete_dataset,
+    upsert_column_visibility,
 };
 use crate::infra::sqlite::schema::init_db;
 use crate::*;
@@ -45,6 +46,88 @@ fn init_db_creates_required_tables() {
     assert_eq!(table_count, 3, "required tables should exist");
 
     fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn column_visibility_persists_per_dataset() {
+    let temp_dir = unique_test_dir("column-visibility");
+    fs::create_dir_all(&temp_dir).expect("should create temp dir");
+    let db_path = temp_dir.join("app.sqlite");
+
+    init_db(&db_path).expect("init_db should succeed");
+
+    let dataset_id = create_dataset_from_rows(
+        &db_path,
+        "sample",
+        "sample.csv",
+        &["A".to_string(), "B".to_string(), "C".to_string()],
+        &[vec!["1".to_string(), "2".to_string(), "3".to_string()]],
+    )
+    .expect("dataset should be created");
+
+    let mut visibility = BTreeMap::new();
+    visibility.insert(0, true);
+    visibility.insert(1, false);
+    visibility.insert(2, true);
+
+    upsert_column_visibility(&db_path, dataset_id, &visibility)
+        .expect("should store column visibility");
+
+    let loaded =
+        load_column_visibility(&db_path, dataset_id).expect("should load column visibility");
+
+    assert_eq!(
+        loaded, visibility,
+        "loaded visibility should match saved data"
+    );
+
+    fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn summary_report_aggregates_totals_and_owners() {
+    let headers = vec![
+        "所有權人".to_string(),
+        "總成本".to_string(),
+        "估計配息".to_string(),
+        "今年度累積".to_string(),
+    ];
+    let rows = vec![
+        vec![
+            "Alex".to_string(),
+            "100".to_string(),
+            "10".to_string(),
+            "5".to_string(),
+        ],
+        vec![
+            "Paul".to_string(),
+            "200".to_string(),
+            "20".to_string(),
+            "15".to_string(),
+        ],
+    ];
+
+    let report = compute_summary_report(&headers, &rows);
+
+    let total_cost = report
+        .totals
+        .iter()
+        .find(|entry| entry.label == "總成本")
+        .map(|entry| entry.value.clone());
+    assert_eq!(total_cost, Some("300".to_string()));
+
+    let owner_alex = report
+        .owner_totals
+        .iter()
+        .find(|owner| owner.owner == "Alex")
+        .cloned()
+        .expect("Alex summary should exist");
+    let alex_estimated = owner_alex
+        .entries
+        .iter()
+        .find(|entry| entry.label == "估計配息")
+        .map(|entry| entry.value.clone());
+    assert_eq!(alex_estimated, Some("10".to_string()));
 }
 
 #[test]

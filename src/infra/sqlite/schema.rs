@@ -49,6 +49,14 @@ pub fn init_db(db_path: &Path) -> Result<()> {
             FOREIGN KEY (dataset_id) REFERENCES dataset(id)
         );
 
+        CREATE TABLE IF NOT EXISTS column_visibility (
+            dataset_id  INTEGER NOT NULL,
+            col_idx     INTEGER NOT NULL,
+            visible     INTEGER NOT NULL,
+            PRIMARY KEY (dataset_id, col_idx),
+            FOREIGN KEY (dataset_id) REFERENCES dataset(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_cell_dataset_row
             ON cell(dataset_id, row_idx);
 

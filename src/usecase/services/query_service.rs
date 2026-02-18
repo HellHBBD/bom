@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::domain::entities::dataset::{PageQuery, PageResult};
+use std::collections::BTreeMap;
+
+use crate::domain::entities::dataset::{DatasetId, PageQuery, PageResult};
 use crate::usecase::ports::repo::{DatasetMeta, DatasetRepository, RepoError};
 
 #[allow(dead_code)]
@@ -19,5 +21,20 @@ impl QueryService {
 
     pub fn query_page(&self, query: PageQuery) -> Result<PageResult, RepoError> {
         self.repo.query_page(query)
+    }
+
+    pub fn load_column_visibility(
+        &self,
+        dataset_id: DatasetId,
+    ) -> Result<BTreeMap<i64, bool>, RepoError> {
+        self.repo.load_column_visibility(dataset_id)
+    }
+
+    pub fn upsert_column_visibility(
+        &self,
+        dataset_id: DatasetId,
+        visibility: BTreeMap<i64, bool>,
+    ) -> Result<(), RepoError> {
+        self.repo.upsert_column_visibility(dataset_id, visibility)
     }
 }

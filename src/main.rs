@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod domain;
 mod infra;
@@ -101,6 +103,7 @@ fn App() -> Element {
     let mut selected_group_key = use_signal(|| None::<String>);
     let mut selected_dataset_id = use_signal(|| None::<i64>);
     let mut columns = use_signal(Vec::<String>::new);
+    let mut column_visibility = use_signal(BTreeMap::<i64, bool>::new);
     let mut rows = use_signal(Vec::<Vec<String>>::new);
     let mut page = use_signal(|| 0_i64);
     let mut total_rows = use_signal(|| 0_i64);
@@ -120,11 +123,11 @@ fn App() -> Element {
     let mut added_rows = use_signal(Vec::<Vec<String>>::new);
     let mut show_add_row = use_signal(|| false);
     let mut new_row_inputs = use_signal(HashMap::<String, String>::new);
-    let mut context_menu = use_signal(|| None::<(f64, f64)>);
-    let mut context_row = use_signal(|| None::<usize>);
     let mut pending_action = use_signal(|| None::<PendingAction>);
     let mut show_save_prompt = use_signal(|| false);
     let mut show_save_as_prompt = use_signal(|| false);
+    let mut show_summary_report = use_signal(|| false);
+    let mut summary_report = use_signal(SummaryReport::default);
     let mut save_as_name = use_signal(default_dataset_name_mmdd);
 
     let db_path = Arc::new(db_path);
@@ -212,6 +215,8 @@ fn App() -> Element {
     let query_service_for_save_as = query_service.clone();
     let query_service_for_import_overwrite = query_service.clone();
     let query_service_for_import_save_as = query_service.clone();
+    let query_service_for_visibility = query_service.clone();
+    let query_service_for_visibility_update = query_service.clone();
     let edit_service_for_save = edit_service.clone();
     let edit_service_for_save_as = edit_service.clone();
     let edit_service_for_soft_delete = edit_service.clone();
@@ -226,15 +231,29 @@ fn App() -> Element {
     let added_rows_snapshot = added_rows();
     let datasets_snapshot = datasets();
     let staged_cells_snapshot = staged_cells();
+    let column_visibility_snapshot = column_visibility();
     let deleted_rows_snapshot = deleted_rows();
     let selected_rows_snapshot = selected_rows();
     let editing_cell_snapshot = editing_cell();
+    let report_snapshot = summary_report();
     let column_alignments: Vec<&'static str> = current_columns
         .iter()
         .enumerate()
         .map(|(idx, header)| column_alignment(header, &current_rows, idx))
         .collect();
+    let visible_column_indices: Vec<usize> = current_columns
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| {
+            column_visibility_snapshot
+                .get(&(*idx as i64))
+                .copied()
+                .unwrap_or(true)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
     let is_holdings = is_holdings_table(&current_columns);
+    let table_column_count = visible_column_indices.len() + if is_holdings { 1 } else { 0 };
     let editable_columns = editable_columns_for_holdings();
     let required_columns = required_columns_for_holdings();
     let base_row_count = current_rows.len();
@@ -242,6 +261,12 @@ fn App() -> Element {
     let has_pending_changes = !staged_cells_snapshot.is_empty()
         || !deleted_rows_snapshot.is_empty()
         || !added_rows_snapshot.is_empty();
+    let any_selected_rows = !selected_rows_snapshot.is_empty();
+    let any_selected_deleted = selected_rows_snapshot
+        .iter()
+        .any(|row_idx| deleted_rows_snapshot.contains(row_idx));
+    let all_rows_selected = total_row_count > 0
+        && (0..total_row_count).all(|row_idx| selected_rows_snapshot.contains(&row_idx));
     let current_columns_for_add = current_columns.clone();
     let current_columns_for_save = current_columns.clone();
     let current_rows_for_save = current_rows.clone();
@@ -293,9 +318,10 @@ fn App() -> Element {
                 ""
             }
         );
-        let mut cells = Vec::with_capacity(current_columns.len());
-        for (col_idx, header) in current_columns.iter().enumerate() {
-            let raw_value = get_raw_value(row_idx, col_idx);
+        let mut cells = Vec::with_capacity(visible_column_indices.len());
+        for col_idx in &visible_column_indices {
+            let header = &current_columns[*col_idx];
+            let raw_value = get_raw_value(row_idx, *col_idx);
             let formatted = format_cell_value(header, &raw_value);
             let is_editing = editing_cell_snapshot
                 .as_ref()
@@ -303,13 +329,13 @@ fn App() -> Element {
                 .unwrap_or(false);
             let is_modified = staged_cells_snapshot.contains_key(&CellKey {
                 row_idx,
-                col_idx,
+                col_idx: *col_idx,
                 column: header.clone(),
             });
             let is_editable = editable_columns.iter().any(|c| c == header);
             let cell_style = format!(
                 "border: 1px solid #bbb; padding: 6px; text-align: {};{}",
-                column_alignments.get(col_idx).copied().unwrap_or("left"),
+                column_alignments.get(*col_idx).copied().unwrap_or("left"),
                 if is_modified {
                     " background: #d9f7d9;"
                 } else {
@@ -318,7 +344,7 @@ fn App() -> Element {
             );
             cells.push(CellRender {
                 row_idx,
-                col_idx,
+                col_idx: *col_idx,
                 header: header.clone(),
                 raw: raw_value,
                 formatted,
@@ -335,11 +361,26 @@ fn App() -> Element {
         });
     }
 
+    use_effect(move || {
+        let dataset_id = selected_dataset_id();
+        let columns_snapshot = columns();
+        if dataset_id.is_none() || columns_snapshot.is_empty() {
+            column_visibility.set(BTreeMap::new());
+            return;
+        }
+        match query_service_for_visibility.load_column_visibility(DatasetId(dataset_id.unwrap())) {
+            Ok(visibility) => {
+                column_visibility.set(visibility);
+            }
+            Err(err) => {
+                *status.write() = format!("載入欄位顯示設定失敗：{err}");
+            }
+        }
+    });
+
     rsx! {
         div {
             onclick: move |_| {
-                context_menu.set(None);
-                context_row.set(None);
             },
             nav {
                 style: "display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 8px 0;",
@@ -408,8 +449,6 @@ fn App() -> Element {
                                     added_rows.write().clear();
                                     show_add_row.set(false);
                                     new_row_inputs.write().clear();
-                                    context_menu.set(None);
-                                    context_row.set(None);
 
                                     let options = QueryOptions {
                                         global_search: global_search(),
@@ -459,6 +498,16 @@ fn App() -> Element {
                     "匯入資料"
                 }
 
+                button {
+                    disabled: busy() || selected_dataset_id().is_none(),
+                    onclick: move |_| {
+                        let report = compute_summary_report(&current_columns, &current_rows);
+                        summary_report.set(report);
+                        show_summary_report.set(true);
+                    },
+                    "總結報表"
+                }
+
                 label {
                     input {
                         r#type: "checkbox",
@@ -492,8 +541,6 @@ fn App() -> Element {
                                     added_rows.write().clear();
                                     show_add_row.set(false);
                                     new_row_inputs.write().clear();
-                                    context_menu.set(None);
-                                    context_row.set(None);
 
                                     let options = QueryOptions {
                                         global_search: global_search(),
@@ -538,6 +585,47 @@ fn App() -> Element {
                         },
                     }
                     "顯示已刪除"
+                }
+
+                details {
+                    style: "padding: 4px 0;",
+                    summary { "欄位顯示" }
+                    div { style: "display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px 12px; padding: 8px 0;",
+                        for (idx, header) in current_columns.iter().enumerate() {
+                            label { style: "display: flex; gap: 6px; align-items: center;",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: column_visibility()
+                                        .get(&(idx as i64))
+                                        .copied()
+                                        .unwrap_or(true),
+                                    disabled: selected_dataset_id().is_none(),
+                                    onchange: {
+                                        let query_service_for_visibility_update =
+                                            query_service_for_visibility_update.clone();
+                                        let mut column_visibility = column_visibility;
+                                        let mut status = status;
+                                        move |event| {
+                                            let checked = event.value().parse::<bool>().unwrap_or(false);
+                                            let Some(dataset_id) = selected_dataset_id() else {
+                                                return;
+                                            };
+                                            let mut next = column_visibility();
+                                            next.insert(idx as i64, checked);
+                                            column_visibility.set(next.clone());
+                                            if let Err(err) = query_service_for_visibility_update
+                                                .upsert_column_visibility(DatasetId(dataset_id), next)
+                                            {
+                                                *status.write() =
+                                                    format!("儲存欄位顯示失敗：{err}");
+                                            }
+                                        }
+                                    }
+                                }
+                                "{header}"
+                            }
+                        }
+                    }
                 }
 
                 span { " {status}" }
@@ -591,8 +679,6 @@ fn App() -> Element {
                         added_rows.write().clear();
                         show_add_row.set(false);
                         new_row_inputs.write().clear();
-                        context_menu.set(None);
-                        context_row.set(None);
                         *busy.write() = true;
 
                         let options = QueryOptions {
@@ -637,169 +723,6 @@ fn App() -> Element {
                     }
                 }
 
-                button {
-                    disabled: busy() || selected_dataset_id().is_none(),
-                    onclick: move |_| {
-                        let Some(dataset_id) = selected_dataset_id() else {
-                            return;
-                        };
-
-                        let confirmed = MessageDialog::new()
-                            .set_level(MessageLevel::Warning)
-                            .set_title("確認刪除")
-                            .set_description("確定要刪除此資料集嗎？可在顯示已刪除中查看。")
-                            .set_buttons(MessageButtons::YesNo)
-                            .show();
-                        if confirmed != MessageDialogResult::Yes {
-                            return;
-                        }
-
-                        *busy.write() = true;
-                        match edit_service_for_soft_delete
-                            .soft_delete_dataset(DatasetId(dataset_id))
-                            .map_err(|err| anyhow!(err.to_string()))
-                            .and_then(|_| {
-                                query_service_for_soft_delete
-                                    .list_datasets(show_deleted())
-                                    .map_err(|err| anyhow!(err.to_string()))
-                            }) {
-                            Ok(available) => {
-                                let groups = build_dataset_groups(&available);
-                                *datasets.write() = available;
-
-                                let next_group = selected_group_key()
-                                    .and_then(|current| groups.iter().find(|g| g.key == current).map(|g| g.key.clone()))
-                                    .or_else(|| groups.first().map(|g| g.key.clone()));
-                                let next_dataset = next_group
-                                    .as_ref()
-                                    .and_then(|k| groups.iter().find(|g| &g.key == k))
-                                    .and_then(|g| g.datasets.first())
-                                    .map(|d| d.id.0);
-
-                                *selected_group_key.write() = next_group;
-                                *selected_dataset_id.write() = next_dataset;
-
-                                let options = QueryOptions {
-                                    global_search: global_search(),
-                                    column_search_col: column_search_col(),
-                                    column_search_text: column_search_text(),
-                                    sort_col: sort_col(),
-                                    sort_desc: sort_desc(),
-                                };
-
-                                match reload_page_data_usecase(
-                                    &query_service_for_soft_delete,
-                                    next_dataset,
-                                    0,
-                                    &options,
-                                ) {
-                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                        *columns.write() = loaded_columns;
-                                        *rows.write() = loaded_rows;
-                                        *total_rows.write() = loaded_total;
-                                        *page.write() = loaded_page;
-                                        *status.write() = "已刪除資料集（可復原）".to_string();
-                                    }
-                                    Err(err) => {
-                                        *columns.write() = Vec::new();
-                                        *rows.write() = Vec::new();
-                                        *total_rows.write() = 0;
-                                        *page.write() = 0;
-                                        *status.write() = format!("刪除成功，但重新載入失敗：{err}");
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                *status.write() = format!("刪除資料集失敗：{err}");
-                            }
-                        }
-
-                        *busy.write() = false;
-                    },
-                    "刪除資料集"
-                }
-
-                button {
-                    disabled: busy() || selected_dataset_id().is_none(),
-                    onclick: move |_| {
-                        let Some(dataset_id) = selected_dataset_id() else {
-                            return;
-                        };
-
-                        let confirmed = MessageDialog::new()
-                            .set_level(MessageLevel::Warning)
-                            .set_title("確認永久刪除")
-                            .set_description("確定要永久刪除此資料集嗎？此動作不可復原。")
-                            .set_buttons(MessageButtons::YesNo)
-                            .show();
-                        if confirmed != MessageDialogResult::Yes {
-                            return;
-                        }
-
-                        *busy.write() = true;
-                        match edit_service_for_purge
-                            .purge_dataset(DatasetId(dataset_id))
-                            .map_err(|err| anyhow!(err.to_string()))
-                            .and_then(|_| {
-                                query_service_for_purge
-                                    .list_datasets(show_deleted())
-                                    .map_err(|err| anyhow!(err.to_string()))
-                            }) {
-                            Ok(available) => {
-                                let groups = build_dataset_groups(&available);
-                                *datasets.write() = available;
-
-                                let next_group = selected_group_key()
-                                    .and_then(|current| groups.iter().find(|g| g.key == current).map(|g| g.key.clone()))
-                                    .or_else(|| groups.first().map(|g| g.key.clone()));
-                                let next_dataset = next_group
-                                    .as_ref()
-                                    .and_then(|k| groups.iter().find(|g| &g.key == k))
-                                    .and_then(|g| g.datasets.first())
-                                    .map(|d| d.id.0);
-
-                                *selected_group_key.write() = next_group;
-                                *selected_dataset_id.write() = next_dataset;
-
-                                let options = QueryOptions {
-                                    global_search: global_search(),
-                                    column_search_col: column_search_col(),
-                                    column_search_text: column_search_text(),
-                                    sort_col: sort_col(),
-                                    sort_desc: sort_desc(),
-                                };
-
-                                match reload_page_data_usecase(
-                                    &query_service_for_purge,
-                                    next_dataset,
-                                    0,
-                                    &options,
-                                ) {
-                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                        *columns.write() = loaded_columns;
-                                        *rows.write() = loaded_rows;
-                                        *total_rows.write() = loaded_total;
-                                        *page.write() = loaded_page;
-                                        *status.write() = "已永久刪除資料集".to_string();
-                                    }
-                                    Err(err) => {
-                                        *columns.write() = Vec::new();
-                                        *rows.write() = Vec::new();
-                                        *total_rows.write() = 0;
-                                        *page.write() = 0;
-                                        *status.write() = format!("永久刪除成功，但重新載入失敗：{err}");
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                *status.write() = format!("永久刪除資料集失敗：{err}");
-                            }
-                        }
-
-                        *busy.write() = false;
-                    },
-                    "永久刪除"
-                }
             }
 
             if let Some(group) = active_group.clone() {
@@ -830,8 +753,6 @@ fn App() -> Element {
                                         added_rows.write().clear();
                                         show_add_row.set(false);
                                         new_row_inputs.write().clear();
-                                        context_menu.set(None);
-                                        context_row.set(None);
                                         *busy.write() = true;
 
                                         let options = QueryOptions {
@@ -1114,6 +1035,213 @@ fn App() -> Element {
                 span { "共 {current_total_rows} 筆" }
             }
 
+            div { style: "display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0;",
+                button {
+                    disabled: busy() || !is_holdings || !any_selected_rows,
+                    onclick: move |_| {
+                        let selected = selected_rows();
+                        if selected.is_empty() {
+                            return;
+                        }
+                        for row in selected.iter() {
+                            deleted_rows.write().insert(*row);
+                        }
+                        *status.write() = format!(
+                            "已標記刪除 {} 列（待儲存）",
+                            selected.len()
+                        );
+                    },
+                    "刪除列"
+                }
+                button {
+                    disabled: busy() || !is_holdings || !any_selected_deleted,
+                    onclick: move |_| {
+                        let selected = selected_rows();
+                        if selected.is_empty() {
+                            return;
+                        }
+                        for row in selected.iter() {
+                            deleted_rows.write().remove(row);
+                        }
+                        *status.write() = "已復原選取列".to_string();
+                    },
+                    "復原列"
+                }
+                button {
+                    disabled: busy() || !any_selected_rows,
+                    onclick: move |_| {
+                        selected_rows.write().clear();
+                    },
+                    "取消選取"
+                }
+                if !is_holdings {
+                    span { style: "color: #666;", "此資料集不可刪除列" }
+                }
+                span { style: "color: #666;", " | " }
+                button {
+                    disabled: busy() || selected_dataset_id().is_none(),
+                    onclick: move |_| {
+                        let Some(dataset_id) = selected_dataset_id() else {
+                            return;
+                        };
+
+                        let confirmed = MessageDialog::new()
+                            .set_level(MessageLevel::Warning)
+                            .set_title("確認刪除")
+                            .set_description("確定要刪除此資料集嗎？可在顯示已刪除中查看。")
+                            .set_buttons(MessageButtons::YesNo)
+                            .show();
+                        if confirmed != MessageDialogResult::Yes {
+                            return;
+                        }
+
+                        *busy.write() = true;
+                        match edit_service_for_soft_delete
+                            .soft_delete_dataset(DatasetId(dataset_id))
+                            .map_err(|err| anyhow!(err.to_string()))
+                            .and_then(|_| {
+                                query_service_for_soft_delete
+                                    .list_datasets(show_deleted())
+                                    .map_err(|err| anyhow!(err.to_string()))
+                            }) {
+                            Ok(available) => {
+                                let groups = build_dataset_groups(&available);
+                                *datasets.write() = available;
+
+                                let next_group = selected_group_key()
+                                    .and_then(|current| groups.iter().find(|g| g.key == current).map(|g| g.key.clone()))
+                                    .or_else(|| groups.first().map(|g| g.key.clone()));
+                                let next_dataset = next_group
+                                    .as_ref()
+                                    .and_then(|k| groups.iter().find(|g| &g.key == k))
+                                    .and_then(|g| g.datasets.first())
+                                    .map(|d| d.id.0);
+
+                                *selected_group_key.write() = next_group;
+                                *selected_dataset_id.write() = next_dataset;
+
+                                let options = QueryOptions {
+                                    global_search: global_search(),
+                                    column_search_col: column_search_col(),
+                                    column_search_text: column_search_text(),
+                                    sort_col: sort_col(),
+                                    sort_desc: sort_desc(),
+                                };
+
+                                match reload_page_data_usecase(
+                                    &query_service_for_soft_delete,
+                                    next_dataset,
+                                    0,
+                                    &options,
+                                ) {
+                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                        *columns.write() = loaded_columns;
+                                        *rows.write() = loaded_rows;
+                                        *total_rows.write() = loaded_total;
+                                        *page.write() = loaded_page;
+                                        *status.write() = "已刪除資料集（可復原）".to_string();
+                                    }
+                                    Err(err) => {
+                                        *columns.write() = Vec::new();
+                                        *rows.write() = Vec::new();
+                                        *total_rows.write() = 0;
+                                        *page.write() = 0;
+                                        *status.write() = format!("刪除成功，但重新載入失敗：{err}");
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                *status.write() = format!("刪除資料集失敗：{err}");
+                            }
+                        }
+
+                        *busy.write() = false;
+                    },
+                    "刪除資料集"
+                }
+                button {
+                    disabled: busy() || selected_dataset_id().is_none(),
+                    onclick: move |_| {
+                        let Some(dataset_id) = selected_dataset_id() else {
+                            return;
+                        };
+
+                        let confirmed = MessageDialog::new()
+                            .set_level(MessageLevel::Warning)
+                            .set_title("確認永久刪除")
+                            .set_description("確定要永久刪除此資料集嗎？此動作不可復原。")
+                            .set_buttons(MessageButtons::YesNo)
+                            .show();
+                        if confirmed != MessageDialogResult::Yes {
+                            return;
+                        }
+
+                        *busy.write() = true;
+                        match edit_service_for_purge
+                            .purge_dataset(DatasetId(dataset_id))
+                            .map_err(|err| anyhow!(err.to_string()))
+                            .and_then(|_| {
+                                query_service_for_purge
+                                    .list_datasets(show_deleted())
+                                    .map_err(|err| anyhow!(err.to_string()))
+                            }) {
+                            Ok(available) => {
+                                let groups = build_dataset_groups(&available);
+                                *datasets.write() = available;
+
+                                let next_group = selected_group_key()
+                                    .and_then(|current| groups.iter().find(|g| g.key == current).map(|g| g.key.clone()))
+                                    .or_else(|| groups.first().map(|g| g.key.clone()));
+                                let next_dataset = next_group
+                                    .as_ref()
+                                    .and_then(|k| groups.iter().find(|g| &g.key == k))
+                                    .and_then(|g| g.datasets.first())
+                                    .map(|d| d.id.0);
+
+                                *selected_group_key.write() = next_group;
+                                *selected_dataset_id.write() = next_dataset;
+
+                                let options = QueryOptions {
+                                    global_search: global_search(),
+                                    column_search_col: column_search_col(),
+                                    column_search_text: column_search_text(),
+                                    sort_col: sort_col(),
+                                    sort_desc: sort_desc(),
+                                };
+
+                                match reload_page_data_usecase(
+                                    &query_service_for_purge,
+                                    next_dataset,
+                                    0,
+                                    &options,
+                                ) {
+                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                        *columns.write() = loaded_columns;
+                                        *rows.write() = loaded_rows;
+                                        *total_rows.write() = loaded_total;
+                                        *page.write() = loaded_page;
+                                        *status.write() = "已永久刪除資料集".to_string();
+                                    }
+                                    Err(err) => {
+                                        *columns.write() = Vec::new();
+                                        *rows.write() = Vec::new();
+                                        *total_rows.write() = 0;
+                                        *page.write() = 0;
+                                        *status.write() = format!("永久刪除成功，但重新載入失敗：{err}");
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                *status.write() = format!("永久刪除資料集失敗：{err}");
+                            }
+                        }
+
+                        *busy.write() = false;
+                    },
+                    "永久刪除"
+                }
+            }
+
             if is_holdings {
                 div { style: "display: flex; gap: 8px; align-items: center; margin: 8px 0;",
                     button {
@@ -1189,137 +1317,130 @@ fn App() -> Element {
                 }
             }
 
-            table { style: "border-collapse: collapse; width: 100%; border: 1px solid #bbb;",
+            div { style: "max-height: 60vh; overflow: auto; border: 1px solid #bbb;",
+                table { style: "border-collapse: collapse; width: 100%;",
                 thead {
                     tr {
-                        for (idx, header) in current_columns.iter().enumerate() {
-                            th {
-                                style: "border: 1px solid #bbb; padding: 6px; background: #f2f2f2; text-align: {column_alignments[idx]};",
-                                "{header}"
-                            }
-                        }
-                    }
-                }
-                tbody {
-                    if total_row_count == 0 {
-                        tr {
-                            td { style: "border: 1px solid #bbb; padding: 6px;",
-                                colspan: current_columns.len().max(1),
-                                "無資料"
-                            }
-                        }
-                    } else {
-                        for row in row_render_models.clone() {
-                            tr {
-                                style: "{row.style}",
-                                onclick: move |_| {
-                                    if !is_holdings {
-                                        return;
-                                    }
-                                    let mut selected = selected_rows.write();
-                                    if selected.contains(&row.row_idx) {
+                        if is_holdings {
+                            th { style: "border: 1px solid #bbb; padding: 6px; background: #f2f2f2; position: sticky; top: 0; z-index: 2;",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: all_rows_selected,
+                                    disabled: total_row_count == 0,
+                                    onchange: move |event| {
+                                        let checked = event.value().parse::<bool>().unwrap_or(false);
+                                        let mut selected = selected_rows.write();
                                         selected.clear();
-                                    } else {
-                                        selected.clear();
-                                        selected.insert(row.row_idx);
-                                    }
-                                },
-                                oncontextmenu: move |event| {
-                                    if !is_holdings {
-                                        return;
-                                    }
-                                    let coords = event.client_coordinates();
-                                    context_menu.set(Some((coords.x, coords.y)));
-                                    context_row.set(Some(row.row_idx));
-                                },
-                                for cell in row.cells.clone() {
-                                    td {
-                                        style: "{cell.style}",
-                                        ondoubleclick: move |_| {
-                                            if !is_holdings || row.is_deleted {
-                                                return;
+                                        if checked {
+                                            for row_idx in 0..total_row_count {
+                                                selected.insert(row_idx);
                                             }
-                                            if !cell.is_editable {
-                                                return;
-                                            }
-                                            *editing_cell.write() = Some(CellKey {
-                                                row_idx: cell.row_idx,
-                                                col_idx: cell.col_idx,
-                                                column: cell.header.clone(),
-                                            });
-                                            editing_value.set(cell.raw.clone());
-                                        },
-                                        if cell.is_editing {
-                                            input {
-                                                value: "{editing_value()}",
-                                                oninput: move |event| {
-                                                    editing_value.set(event.value());
-                                                },
-                                                onkeydown: move |event| {
-                                                    if event.key() == Key::Enter {
-                                                        if let Some(active) = editing_cell() {
-                                                            let value = editing_value();
-                                                            let numeric_required = matches!(
-                                                                active.column.as_str(),
-                                                                "買進" | "市價" | "數量" | "期數"
-                                                            );
-                                                            if numeric_required
-                                                                && parse_numeric_value(&value).is_none()
-                                                            {
-                                                                *status.write() = format!(
-                                                                    "欄位 {} 必須是數字",
-                                                                    active.column
-                                                                );
-                                                                return;
-                                                            }
-                                                            if active.row_idx < base_row_count {
-                                                                staged_cells.write().insert(active, value);
-                                                            } else {
-                                                                let new_idx = active.row_idx - base_row_count;
-                                                                if let Some(row) = added_rows.write().get_mut(new_idx) {
-                                                                    if active.col_idx < row.len() {
-                                                                        row[active.col_idx] = value;
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        *editing_cell.write() = None;
-                                                    } else if event.key() == Key::Escape {
-                                                        *editing_cell.write() = None;
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            "{cell.formatted}"
                                         }
                                     }
                                 }
                             }
                         }
+                        for col_idx in visible_column_indices.iter() {
+                            th {
+                                style: "border: 1px solid #bbb; padding: 6px; background: #f2f2f2; text-align: {column_alignments[*col_idx]}; position: sticky; top: 0; z-index: 2;",
+                                "{current_columns[*col_idx]}"
+                            }
+                        }
                     }
                 }
-            }
-
-            if is_holdings {
-                if let Some((x, y)) = context_menu() {
-                    div {
-                        style: "position: fixed; left: {x}px; top: {y}px; background: #fff; border: 1px solid #999; padding: 6px; z-index: 1000;",
-                        button {
-                            onclick: move |_| {
-                                let mut targets = selected_rows();
-                                if targets.is_empty() {
-                                    if let Some(row) = context_row() {
-                                        targets.insert(row);
+                    tbody {
+                        if total_row_count == 0 {
+                            tr {
+                            td { style: "border: 1px solid #bbb; padding: 6px;",
+                                colspan: table_column_count.max(1),
+                                "無資料"
+                            }
+                        }
+                        } else {
+                            for row in row_render_models.clone() {
+                                tr {
+                                    style: "{row.style}",
+                                    if is_holdings {
+                                        td { style: "border: 1px solid #bbb; padding: 6px; text-align: center;",
+                                            input {
+                                                r#type: "checkbox",
+                                                checked: selected_rows_snapshot.contains(&row.row_idx),
+                                                onchange: move |event| {
+                                                    let checked = event.value().parse::<bool>().unwrap_or(false);
+                                                    let mut selected = selected_rows.write();
+                                                    if checked {
+                                                        selected.insert(row.row_idx);
+                                                    } else {
+                                                        selected.remove(&row.row_idx);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for cell in row.cells.clone() {
+                                        td {
+                                            style: "{cell.style}",
+                                            ondoubleclick: move |_| {
+                                                if !is_holdings || row.is_deleted {
+                                                    return;
+                                                }
+                                                if !cell.is_editable {
+                                                    return;
+                                                }
+                                                *editing_cell.write() = Some(CellKey {
+                                                    row_idx: cell.row_idx,
+                                                    col_idx: cell.col_idx,
+                                                    column: cell.header.clone(),
+                                                });
+                                                editing_value.set(cell.raw.clone());
+                                            },
+                                            if cell.is_editing {
+                                                input {
+                                                    value: "{editing_value()}",
+                                                    oninput: move |event| {
+                                                        editing_value.set(event.value());
+                                                    },
+                                                    onkeydown: move |event| {
+                                                        if event.key() == Key::Enter {
+                                                            if let Some(active) = editing_cell() {
+                                                                let value = editing_value();
+                                                                let numeric_required = matches!(
+                                                                    active.column.as_str(),
+                                                                    "買進" | "市價" | "數量" | "期數"
+                                                                );
+                                                                if numeric_required
+                                                                    && parse_numeric_value(&value).is_none()
+                                                                {
+                                                                    *status.write() = format!(
+                                                                        "欄位 {} 必須是數字",
+                                                                        active.column
+                                                                    );
+                                                                    return;
+                                                                }
+                                                                if active.row_idx < base_row_count {
+                                                                    staged_cells.write().insert(active, value);
+                                                                } else {
+                                                                    let new_idx = active.row_idx - base_row_count;
+                                                                    if let Some(row) = added_rows.write().get_mut(new_idx) {
+                                                                        if active.col_idx < row.len() {
+                                                                            row[active.col_idx] = value;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            *editing_cell.write() = None;
+                                                        } else if event.key() == Key::Escape {
+                                                            *editing_cell.write() = None;
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                "{cell.formatted}"
+                                            }
+                                        }
                                     }
                                 }
-                                for row in targets {
-                                    deleted_rows.write().insert(row);
-                                }
-                                context_menu.set(None);
-                                context_row.set(None);
-                                *status.write() = "已標記刪除（待儲存）".to_string();
-                            },
-                            "刪除"
+                            }
                         }
                     }
                 }
@@ -1898,6 +2019,50 @@ fn App() -> Element {
                     }
                 }
             }
+
+            if show_summary_report() {
+                div {
+                    style: "position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; z-index: 1250;",
+                    div {
+                        style: "background: #fff; padding: 16px; border: 1px solid #999; min-width: 320px; max-width: 720px; max-height: 70vh; overflow: auto;",
+                        div { style: "margin-bottom: 8px; font-weight: 600;", "{report_snapshot.title}" }
+                        if report_snapshot.totals.is_empty() {
+                            div { "沒有可計算的摘要欄位" }
+                        } else {
+                            div { style: "display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 12px;",
+                                for entry in report_snapshot.totals.clone() {
+                                    div { "{entry.label}: {entry.value}" }
+                                }
+                            }
+                        }
+                        if !report_snapshot.owner_totals.is_empty() {
+                            div { style: "margin-top: 12px; font-weight: 600;", "依所有權人" }
+                            for owner in report_snapshot.owner_totals.clone() {
+                                div { style: "margin-top: 6px; font-weight: 600;", "{owner.owner}" }
+                                div { style: "display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 12px;",
+                                    for entry in owner.entries {
+                                        div { "{entry.label}: {entry.value}" }
+                                    }
+                                }
+                            }
+                        }
+                        if !report_snapshot.notes.is_empty() {
+                            div { style: "margin-top: 12px; font-weight: 600;", "備註" }
+                            for note in report_snapshot.notes.clone() {
+                                div { "{note}" }
+                            }
+                        }
+                        div { style: "display: flex; justify-content: flex-end; margin-top: 12px;",
+                            button {
+                                onclick: move |_| {
+                                    show_summary_report.set(false);
+                                },
+                                "關閉"
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2186,6 +2351,120 @@ fn is_summary_label(value: &str) -> bool {
 
 fn row_value(row: &[String], idx: usize) -> String {
     row.get(idx).cloned().unwrap_or_default()
+}
+
+#[derive(Clone, Default)]
+struct SummaryEntry {
+    label: String,
+    value: String,
+}
+
+#[derive(Clone, Default)]
+struct OwnerSummary {
+    owner: String,
+    entries: Vec<SummaryEntry>,
+}
+
+#[derive(Clone, Default)]
+struct SummaryReport {
+    title: String,
+    totals: Vec<SummaryEntry>,
+    owner_totals: Vec<OwnerSummary>,
+    notes: Vec<String>,
+}
+
+fn compute_summary_report(headers: &[String], rows: &[Vec<String>]) -> SummaryReport {
+    let mut header_map = HashMap::new();
+    for (idx, header) in headers.iter().enumerate() {
+        header_map.insert(header.clone(), idx);
+    }
+
+    let total_columns = [
+        "總成本",
+        "資本利得",
+        "淨值",
+        "已收配息",
+        "總損益",
+        "估計配息",
+        "股票成本",
+        "股票淨值",
+        "債券成本",
+        "債券淨值",
+        "今年度累積",
+        "總累積",
+        "預估累積",
+        "預算實際差異",
+    ];
+
+    let owner_columns = ["估計配息", "今年度累積", "總累積", "預估累積"];
+
+    let mut report = SummaryReport {
+        title: "總結報表".to_string(),
+        ..SummaryReport::default()
+    };
+
+    for column in total_columns {
+        if let Some(idx) = header_map.get(column) {
+            let mut sum = 0.0;
+            for row in rows {
+                if let Some(value) = row.get(*idx) {
+                    if let Some(parsed) = parse_numeric_value(value) {
+                        sum += parsed;
+                    }
+                }
+            }
+            report.totals.push(SummaryEntry {
+                label: column.to_string(),
+                value: format_f64(sum),
+            });
+        }
+    }
+
+    if report.totals.is_empty() {
+        report.notes.push("沒有可計算的摘要欄位".to_string());
+    }
+
+    if let Some(owner_idx) = header_map.get("所有權人") {
+        let mut owner_map: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
+        for row in rows {
+            let owner = row.get(*owner_idx).cloned().unwrap_or_default();
+            if owner.trim().is_empty() {
+                continue;
+            }
+            for column in owner_columns {
+                if let Some(idx) = header_map.get(column) {
+                    let value = row
+                        .get(*idx)
+                        .and_then(|raw| parse_numeric_value(raw))
+                        .unwrap_or(0.0);
+                    let entries = owner_map.entry(owner.clone()).or_default();
+                    if let Some(existing) = entries.iter_mut().find(|(label, _)| label == column) {
+                        existing.1 += value;
+                    } else {
+                        entries.push((column.to_string(), value));
+                    }
+                }
+            }
+        }
+
+        for (owner, entries) in owner_map {
+            let mut mapped = Vec::new();
+            for (label, value) in entries {
+                mapped.push(SummaryEntry {
+                    label,
+                    value: format_f64(value),
+                });
+            }
+            if !mapped.is_empty() {
+                report.owner_totals.push(OwnerSummary {
+                    owner,
+                    entries: mapped,
+                });
+            }
+        }
+    }
+
+    report
 }
 
 fn transform_holdings_sheet(rows: &[Vec<String>]) -> HoldingsTransform {

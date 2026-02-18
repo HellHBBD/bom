@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use crate::domain::entities::dataset::{DatasetId, PageQuery, PageResult, SortDirection};
 use crate::domain::entities::edit::StagedEdits;
 use crate::infra::sqlite::queries::{
-    apply_changes_to_dataset, create_dataset_from_rows, list_datasets, purge_dataset, query_page,
-    soft_delete_dataset,
+    apply_changes_to_dataset, create_dataset_from_rows, list_datasets, load_column_visibility,
+    purge_dataset, query_page, soft_delete_dataset, upsert_column_visibility,
 };
 use crate::infra::sqlite::schema::init_db;
 use crate::usecase::ports::repo::{
     DatasetMeta, DatasetRepository, NewDatasetMeta, RepoError, TabularData,
 };
 use crate::QueryOptions;
+use std::collections::BTreeMap;
 
 #[allow(dead_code)]
 pub struct SqliteRepo {
@@ -103,5 +104,19 @@ impl DatasetRepository for SqliteRepo {
 
     fn purge_dataset(&self, id: DatasetId) -> Result<(), RepoError> {
         purge_dataset(&self.db_path, id.0).map_err(|err| RepoError::Message(err.to_string()))
+    }
+
+    fn load_column_visibility(&self, id: DatasetId) -> Result<BTreeMap<i64, bool>, RepoError> {
+        load_column_visibility(&self.db_path, id.0)
+            .map_err(|err| RepoError::Message(err.to_string()))
+    }
+
+    fn upsert_column_visibility(
+        &self,
+        id: DatasetId,
+        visibility: BTreeMap<i64, bool>,
+    ) -> Result<(), RepoError> {
+        upsert_column_visibility(&self.db_path, id.0, &visibility)
+            .map_err(|err| RepoError::Message(err.to_string()))
     }
 }

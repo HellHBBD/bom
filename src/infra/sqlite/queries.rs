@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -48,6 +48,72 @@ pub fn insert_header_names(
     }
 
     Ok(())
+}
+
+#[allow(dead_code)]
+pub fn upsert_column_visibility(
+    db_path: &Path,
+    dataset_id: i64,
+    visibility: &BTreeMap<i64, bool>,
+) -> Result<()> {
+    let mut conn = open_connection(db_path)?;
+    let tx = conn
+        .transaction()
+        .context("failed to start column visibility transaction")?;
+
+    tx.execute(
+        "DELETE FROM column_visibility WHERE dataset_id = ?1",
+        [dataset_id],
+    )
+    .context("failed to clear existing column visibility")?;
+
+    let mut insert_stmt = tx
+        .prepare(
+            "INSERT INTO column_visibility(dataset_id, col_idx, visible)
+             VALUES (?1, ?2, ?3)",
+        )
+        .context("failed to prepare column visibility insert")?;
+
+    for (col_idx, visible) in visibility {
+        let value = if *visible { 1 } else { 0 };
+        insert_stmt
+            .execute(params![dataset_id, *col_idx, value])
+            .context("failed to insert column visibility")?;
+    }
+
+    drop(insert_stmt);
+    tx.commit()
+        .context("failed to commit column visibility updates")?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn load_column_visibility(db_path: &Path, dataset_id: i64) -> Result<BTreeMap<i64, bool>> {
+    let conn = open_connection(db_path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT col_idx, visible
+             FROM column_visibility
+             WHERE dataset_id = ?1
+             ORDER BY col_idx ASC",
+        )
+        .context("failed to prepare column visibility query")?;
+
+    let visibility_iter = stmt
+        .query_map([dataset_id], |row| {
+            let col_idx: i64 = row.get(0)?;
+            let visible: i64 = row.get(1)?;
+            Ok((col_idx, visible != 0))
+        })
+        .context("failed to query column visibility")?;
+
+    let mut visibility = BTreeMap::new();
+    for item in visibility_iter {
+        let (col_idx, visible) = item.context("failed to read column visibility row")?;
+        visibility.insert(col_idx, visible);
+    }
+
+    Ok(visibility)
 }
 
 #[allow(dead_code)]
