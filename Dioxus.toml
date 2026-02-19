@@ -1,5 +1,9 @@
 [application]
 
+[bundle]
+identifier = "com.hellhbbd.bom"
+publisher = "Hell HBBD"
+
 [web.app]
 
 # HTML title tag content
