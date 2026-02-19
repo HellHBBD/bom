@@ -24,9 +24,8 @@ use crate::{
     normalize_column_visibility, parse_numeric_value, reload_page_data_usecase,
     required_columns_for_holdings, root_container_style_for_scroll,
     table_container_style_for_scroll, table_header_cell_style, table_overflow_style_for_scroll,
-    table_scroll_mode,
-    validate_required_holdings_row, DatasetTabKind, PendingAction, QueryOptions, SummaryReport,
-    NONE_OPTION_VALUE, PAGE_SIZE,
+    table_scroll_mode, validate_required_holdings_row, DatasetTabKind, PendingAction, QueryOptions,
+    SummaryReport, NONE_OPTION_VALUE, PAGE_SIZE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
