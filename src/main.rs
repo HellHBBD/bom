@@ -392,14 +392,27 @@ fn App() -> Element {
             column_visibility.set(BTreeMap::new());
             return;
         }
-        match query_service_for_visibility.load_column_visibility(DatasetId(dataset_id.unwrap())) {
-            Ok(visibility) => {
-                column_visibility.set(visibility);
-            }
+        let visibility_result =
+            query_service_for_visibility.load_column_visibility(DatasetId(dataset_id.unwrap()));
+        let visibility_loaded = visibility_result.is_ok();
+        let visibility = match visibility_result {
+            Ok(map) => map,
             Err(err) => {
                 *status.write() = format!("載入欄位顯示設定失敗：{err}");
+                BTreeMap::new()
+            }
+        };
+        let normalized = normalize_column_visibility(&columns_snapshot, &visibility);
+        let should_persist_default =
+            visibility_loaded && visibility.is_empty() && is_holdings_table(&columns_snapshot);
+        if should_persist_default {
+            if let Err(err) = query_service_for_visibility
+                .upsert_column_visibility(DatasetId(dataset_id.unwrap()), normalized.clone())
+            {
+                *status.write() = format!("保存欄位顯示失敗：{err}");
             }
         }
+        column_visibility.set(normalized);
     });
 
     rsx! {
@@ -532,85 +545,6 @@ fn App() -> Element {
                         show_summary_report.set(true);
                     },
                     "總結報表"
-                }
-
-                label {
-                    input {
-                        r#type: "checkbox",
-                        checked: show_deleted(),
-                        onchange: move |event| {
-                            let checked = event.value().parse::<bool>().unwrap_or(false);
-                            *busy.write() = true;
-                            *show_deleted.write() = checked;
-
-                            match query_service_for_show_deleted.list_datasets(checked) {
-                                Ok(available) => {
-                                    let groups = build_dataset_groups(&available);
-                                    *datasets.write() = available;
-
-                                    let next_group = selected_group_key()
-                                        .and_then(|current| groups.iter().find(|g| g.key == current).map(|g| g.key.clone()))
-                                        .or_else(|| groups.first().map(|g| g.key.clone()));
-                                    let next_dataset = next_group
-                                        .as_ref()
-                                        .and_then(|k| groups.iter().find(|g| &g.key == k))
-                                        .and_then(|g| g.datasets.first())
-                                        .map(|d| d.id.0);
-
-                                    *selected_group_key.write() = next_group;
-                                    *selected_dataset_id.write() = next_dataset;
-                                    staged_cells.write().clear();
-                                    deleted_rows.write().clear();
-                                    selected_rows.write().clear();
-                                    *editing_cell.write() = None;
-                                    editing_value.set(String::new());
-                                    added_rows.write().clear();
-                                    show_add_row.set(false);
-                                    new_row_inputs.write().clear();
-
-                                    let options = QueryOptions {
-                                        global_search: global_search(),
-                                        column_search_col: column_search_col(),
-                                        column_search_text: column_search_text(),
-                                        sort_col: sort_col(),
-                                        sort_desc: sort_desc(),
-                                    };
-
-                                    match reload_page_data_usecase(
-                                        &query_service_for_show_deleted,
-                                        next_dataset,
-                                        0,
-                                        &options,
-                                    ) {
-                                        Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                            *columns.write() = loaded_columns;
-                                            *rows.write() = loaded_rows;
-                                            *total_rows.write() = loaded_total;
-                                            *page.write() = loaded_page;
-                                            *status.write() = if checked {
-                                                "已顯示已刪除資料集".to_string()
-                                            } else {
-                                                "已隱藏已刪除資料集".to_string()
-                                            };
-                                        }
-                                        Err(err) => {
-                                            *columns.write() = Vec::new();
-                                            *rows.write() = Vec::new();
-                                            *total_rows.write() = 0;
-                                            *page.write() = 0;
-                                            *status.write() = format!("切換顯示狀態失敗：{err}");
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    *status.write() = format!("刷新資料集失敗：{err}");
-                                }
-                            }
-
-                            *busy.write() = false;
-                        },
-                    }
-                    "顯示已刪除"
                 }
 
                 details {
@@ -2146,6 +2080,22 @@ pub fn choose_default_dataset_id(datasets: &[DatasetMeta]) -> Option<i64> {
     datasets.first().map(|dataset| dataset.id.0)
 }
 
+pub fn choose_next_dataset_after_delete(datasets: &[DatasetMeta], deleted_id: i64) -> Option<i64> {
+    let pos = datasets
+        .iter()
+        .position(|dataset| dataset.id.0 == deleted_id)?;
+
+    if pos + 1 < datasets.len() {
+        return Some(datasets[pos + 1].id.0);
+    }
+
+    if pos >= 1 {
+        return Some(datasets[pos - 1].id.0);
+    }
+
+    None
+}
+
 fn build_dataset_groups(list: &[DatasetMeta]) -> Vec<DatasetGroup> {
     let mut grouped: BTreeMap<String, DatasetGroup> = BTreeMap::new();
     for item in list {
@@ -2437,7 +2387,41 @@ pub fn apply_column_visibility(
 }
 
 pub fn table_container_style() -> &'static str {
-    "max-height: 60vh; overflow: auto; border: 1px solid #bbb;"
+    "flex: 1 1 auto; min-height: 0; overflow: auto; border: 1px solid #bbb;"
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableScrollMode {
+    TableOnly,
+    PageThenTable,
+}
+
+pub fn table_scroll_mode(is_assets: bool, is_holdings: bool) -> TableScrollMode {
+    let _ = (is_assets, is_holdings);
+    TableScrollMode::TableOnly
+}
+
+pub fn root_container_style_for_scroll(mode: TableScrollMode) -> &'static str {
+    match mode {
+        TableScrollMode::PageThenTable => {
+            "font-family: 'Noto Sans TC', sans-serif; padding: 12px; background: #fff; min-height: 100vh; height: 100vh; display: flex; flex-direction: column; overflow: hidden; backface-visibility: hidden; transform: translateZ(0);"
+        }
+        TableScrollMode::TableOnly => {
+            "font-family: 'Noto Sans TC', sans-serif; padding: 12px; background: #fff; min-height: 100vh; height: 100vh; display: flex; flex-direction: column; overflow: hidden; backface-visibility: hidden; transform: translateZ(0);"
+        }
+    }
+}
+
+pub fn table_container_style_for_scroll(mode: TableScrollMode) -> &'static str {
+    match mode {
+        TableScrollMode::PageThenTable => table_container_style(),
+        TableScrollMode::TableOnly => table_container_style(),
+    }
+}
+
+pub fn table_overflow_style_for_scroll(mode: TableScrollMode, header_stuck: bool) -> &'static str {
+    let _ = (mode, header_stuck);
+    ""
 }
 
 pub fn table_header_cell_style() -> &'static str {
@@ -2575,27 +2559,44 @@ fn format_optional_value(value: Option<&String>) -> Option<String> {
     }
 }
 
-#[derive(Clone, Default)]
-struct SummaryEntry {
-    label: String,
-    value: String,
+fn resolve_summary_value(row: Option<&Vec<String>>, idx: usize, derived: Option<f64>) -> String {
+    if let Some(value) = derived {
+        return format_f64(value);
+    }
+    if let Some(row) = row {
+        if let Some(value) = row.get(idx) {
+            if !value.trim().is_empty() {
+                return format_summary_value(Some(value));
+            }
+        }
+    }
+    String::new()
 }
 
 #[derive(Clone, Default)]
-struct OwnerSummary {
-    owner: String,
-    entries: Vec<SummaryEntry>,
+pub struct SummaryEntry {
+    pub label: String,
+    pub value: String,
 }
 
 #[derive(Clone, Default)]
-struct SummaryReport {
-    title: String,
-    totals: Vec<SummaryEntry>,
-    owner_totals: Vec<OwnerSummary>,
-    notes: Vec<String>,
+pub struct OwnerSummary {
+    pub owner: String,
+    pub entries: Vec<SummaryEntry>,
 }
 
-fn compute_summary_report(headers: &[String], rows: &[Vec<String>]) -> SummaryReport {
+#[derive(Clone, Default)]
+pub struct SummaryReport {
+    pub title: String,
+    pub totals: Vec<SummaryEntry>,
+    pub owner_totals: Vec<OwnerSummary>,
+    pub notes: Vec<String>,
+}
+
+pub fn compute_summary_report(headers: &[String], rows: &[Vec<String>]) -> SummaryReport {
+    if is_assets_headers(headers) {
+        return compute_assets_summary_report(headers, rows);
+    }
     let mut header_map = HashMap::new();
     for (idx, header) in headers.iter().enumerate() {
         header_map.insert(header.clone(), idx);
@@ -2618,7 +2619,7 @@ fn compute_summary_report(headers: &[String], rows: &[Vec<String>]) -> SummaryRe
         "預算實際差異",
     ];
 
-    let owner_columns = ["估計配息", "今年度累積", "總累積", "預估累積"];
+    let owner_columns = ["數量", "總成本", "淨值", "市值", "估計配息"];
 
     let mut report = SummaryReport {
         title: "總結報表".to_string(),
@@ -2684,6 +2685,187 @@ fn compute_summary_report(headers: &[String], rows: &[Vec<String>]) -> SummaryRe
                 });
             }
         }
+    }
+
+    if report.owner_totals.is_empty() {
+        report.notes.push("沒有可計算的所有權人欄位".to_string());
+    }
+
+    report
+}
+
+fn is_assets_headers(headers: &[String]) -> bool {
+    headers.iter().any(|header| header == "資產形式")
+}
+
+fn compute_assets_summary_report(headers: &[String], rows: &[Vec<String>]) -> SummaryReport {
+    let mut header_map = HashMap::new();
+    for (idx, header) in headers.iter().enumerate() {
+        header_map.insert(header.clone(), idx);
+    }
+
+    let mut report = SummaryReport {
+        title: "總結報表".to_string(),
+        ..SummaryReport::default()
+    };
+
+    let label_idx = header_map.get("資產形式").copied().unwrap_or(0);
+    let cost_idx = header_map
+        .get("投入金額")
+        .or_else(|| header_map.get("交割款"))
+        .copied();
+    let net_idx = header_map
+        .get("目前淨值")
+        .or_else(|| header_map.get("餘額"))
+        .copied();
+    let rate_idx = header_map
+        .get("利率")
+        .or_else(|| header_map.get("定存利率"))
+        .or_else(|| header_map.get("殖利率"))
+        .copied();
+    let estimated_dividend_idx = header_map
+        .get("估計配息")
+        .or_else(|| header_map.get("估計配息金額"))
+        .copied();
+
+    let interest_labels = ["定存資金", "股債息(平均)", "合計(平均)"];
+
+    let mut deposit_total = 0.0;
+    let mut deposit_rate: Option<f64> = None;
+    let mut average_dividend_total = 0.0;
+
+    if net_idx.is_some() && (rate_idx.is_some() || estimated_dividend_idx.is_some()) {
+        for row in rows {
+            let label = row.get(label_idx).map(|value| value.trim()).unwrap_or("");
+            if label.is_empty()
+                || is_summary_label(label)
+                || interest_labels.iter().any(|token| label.contains(token))
+            {
+                continue;
+            }
+
+            if label.contains("定存") {
+                if let Some(net_idx) = net_idx {
+                    if let Some(value) = row.get(net_idx).and_then(|raw| parse_numeric_value(raw)) {
+                        deposit_total += value;
+                    }
+                }
+                if deposit_rate.is_none() {
+                    if let Some(rate_idx) = rate_idx {
+                        if let Some(rate) =
+                            row.get(rate_idx).and_then(|raw| parse_numeric_value(raw))
+                        {
+                            deposit_rate = Some(rate);
+                        }
+                    }
+                }
+            }
+
+            if let Some(estimate_idx) = estimated_dividend_idx {
+                if label.contains("投資") || label.contains('股') || label.contains('債') {
+                    if let Some(value) = row
+                        .get(estimate_idx)
+                        .and_then(|raw| parse_numeric_value(raw))
+                    {
+                        average_dividend_total += value;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut derived_interest: HashMap<&str, (Option<f64>, Option<f64>)> = HashMap::new();
+    if deposit_total > 0.0 {
+        if let Some(rate) = deposit_rate {
+            let annual = deposit_total * rate;
+            let monthly = annual / 12.0;
+            derived_interest.insert("定存資金", (Some(annual), Some(monthly)));
+        }
+    }
+    if average_dividend_total > 0.0 {
+        let monthly = average_dividend_total / 12.0;
+        derived_interest.insert(
+            "股債息(平均)",
+            (Some(average_dividend_total), Some(monthly)),
+        );
+    }
+    let total_average = derived_interest
+        .get("定存資金")
+        .and_then(|entry| entry.0)
+        .unwrap_or(0.0)
+        + derived_interest
+            .get("股債息(平均)")
+            .and_then(|entry| entry.0)
+            .unwrap_or(0.0);
+    if total_average > 0.0 {
+        let monthly = total_average / 12.0;
+        derived_interest.insert("合計(平均)", (Some(total_average), Some(monthly)));
+    }
+
+    if let (Some(cost_idx), Some(net_idx)) = (cost_idx, net_idx) {
+        let mut total_cost = 0.0;
+        let mut total_net = 0.0;
+
+        for row in rows {
+            let label = row.get(label_idx).map(|value| value.trim()).unwrap_or("");
+            if label.is_empty()
+                || is_summary_label(label)
+                || interest_labels.iter().any(|token| label.contains(token))
+            {
+                continue;
+            }
+            if let Some(value) = row.get(cost_idx).and_then(|raw| parse_numeric_value(raw)) {
+                total_cost += value;
+            }
+            if let Some(value) = row.get(net_idx).and_then(|raw| parse_numeric_value(raw)) {
+                total_net += value;
+            }
+        }
+
+        let total_profit = total_net - total_cost;
+        let total_rate = safe_div(total_profit, total_cost);
+
+        report.totals.push(SummaryEntry {
+            label: "合計-投入金額".to_string(),
+            value: format_f64(total_cost),
+        });
+        report.totals.push(SummaryEntry {
+            label: "合計-目前淨值".to_string(),
+            value: format_f64(total_net),
+        });
+        report.totals.push(SummaryEntry {
+            label: "合計-損益率".to_string(),
+            value: format_f64(total_rate),
+        });
+        report.totals.push(SummaryEntry {
+            label: "合計-損益".to_string(),
+            value: format_f64(total_profit),
+        });
+    } else {
+        report.notes.push("找不到投入金額/目前淨值欄位".to_string());
+    }
+
+    for label in interest_labels {
+        let row = find_row_by_first_cell(rows, label);
+        let derived = derived_interest.get(label);
+        let annual = resolve_summary_value(row.as_ref(), 1, derived.and_then(|entry| entry.0));
+        let monthly = resolve_summary_value(row.as_ref(), 2, derived.and_then(|entry| entry.1));
+        if !annual.trim().is_empty() {
+            report.totals.push(SummaryEntry {
+                label: format!("{label}-年化"),
+                value: annual,
+            });
+        }
+        if !monthly.trim().is_empty() {
+            report.totals.push(SummaryEntry {
+                label: format!("{label}-月化"),
+                value: monthly,
+            });
+        }
+    }
+
+    if report.totals.is_empty() {
+        report.notes.push("找不到可計算的資產總結資料".to_string());
     }
 
     report
@@ -3144,6 +3326,31 @@ fn required_columns_for_holdings() -> Vec<String> {
     ]
 }
 
+fn default_holdings_visibility_map(headers: &[String]) -> BTreeMap<i64, bool> {
+    let required = required_columns_for_holdings();
+    let required_set: BTreeSet<String> = required.into_iter().collect();
+    let mut visibility = BTreeMap::new();
+    for (idx, header) in headers.iter().enumerate() {
+        visibility.insert(idx as i64, required_set.contains(header));
+    }
+    visibility
+}
+
+fn normalize_column_visibility(
+    headers: &[String],
+    visibility: &BTreeMap<i64, bool>,
+) -> BTreeMap<i64, bool> {
+    let mut next = if visibility.is_empty() && is_holdings_table(headers) {
+        default_holdings_visibility_map(headers)
+    } else {
+        visibility.clone()
+    };
+    for idx in 0..headers.len() {
+        next.entry(idx as i64).or_insert(true);
+    }
+    next
+}
+
 fn is_holdings_table(headers: &[String]) -> bool {
     let required = required_columns_for_holdings();
     required.iter().all(|col| headers.iter().any(|h| h == col))
@@ -3151,6 +3358,10 @@ fn is_holdings_table(headers: &[String]) -> bool {
 
 fn editable_columns_for_holdings() -> Vec<String> {
     required_columns_for_holdings()
+}
+
+fn editable_columns_for_assets(headers: &[String]) -> Vec<String> {
+    headers.to_vec()
 }
 
 fn default_dataset_name_mmdd() -> String {

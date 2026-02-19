@@ -13,7 +13,9 @@ use crate::infra::sqlite::queries::{
     load_column_visibility, load_holdings_flags, purge_dataset, query_page, rename_dataset,
     soft_delete_dataset, upsert_column_visibility, upsert_holdings_flag,
 };
+use crate::infra::sqlite::repo::SqliteRepo;
 use crate::infra::sqlite::schema::init_db;
+use crate::usecase::services::edit_service::EditService;
 use crate::*;
 
 fn unique_test_dir(prefix: &str) -> PathBuf {
@@ -177,6 +179,43 @@ fn apply_column_visibility_defaults_to_all_when_empty() {
 }
 
 #[test]
+fn default_holdings_visibility_is_required_only() {
+    let mut headers = required_columns_for_holdings();
+    headers.push("總成本".to_string());
+    headers.push("備註".to_string());
+    let visibility = BTreeMap::new();
+
+    let normalized = normalize_column_visibility(&headers, &visibility);
+
+    for (idx, header) in headers.iter().enumerate() {
+        let expected = required_columns_for_holdings().iter().any(|c| c == header);
+        assert_eq!(normalized.get(&(idx as i64)), Some(&expected));
+    }
+
+    let rows = vec![headers.clone()];
+    let (visible_columns, _visible_rows) = apply_column_visibility(&headers, &rows, &normalized);
+    let visible_names: Vec<String> = visible_columns
+        .iter()
+        .map(|(_idx, name)| name.clone())
+        .collect();
+    assert_eq!(visible_names, required_columns_for_holdings());
+}
+
+#[test]
+fn normalize_column_visibility_fills_missing_and_keeps_existing() {
+    let headers = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    let mut visibility = BTreeMap::new();
+    visibility.insert(0, false);
+    visibility.insert(2, true);
+
+    let normalized = normalize_column_visibility(&headers, &visibility);
+
+    assert_eq!(normalized.get(&0), Some(&false));
+    assert_eq!(normalized.get(&1), Some(&true));
+    assert_eq!(normalized.get(&2), Some(&true));
+}
+
+#[test]
 fn sticky_header_styles_include_positioning() {
     let style = table_header_cell_style();
 
@@ -190,6 +229,55 @@ fn table_container_style_allows_scroll() {
     let style = table_container_style();
 
     assert!(style.contains("overflow: auto"));
+    assert!(style.contains("flex: 1"));
+}
+
+#[test]
+fn root_container_style_uses_viewport_height_and_flex() {
+    let page_style = root_container_style_for_scroll(TableScrollMode::PageThenTable);
+    let table_only_style = root_container_style_for_scroll(TableScrollMode::TableOnly);
+
+    for style in [page_style, table_only_style] {
+        assert!(style.contains("height: 100vh"));
+        assert!(style.contains("display: flex"));
+        assert!(style.contains("flex-direction: column"));
+        assert!(style.contains("overflow: hidden"));
+    }
+}
+
+#[test]
+fn table_container_style_for_scroll_is_flexible() {
+    let page_style = table_container_style_for_scroll(TableScrollMode::PageThenTable);
+    let table_only_style = table_container_style_for_scroll(TableScrollMode::TableOnly);
+
+    for style in [page_style, table_only_style] {
+        assert!(style.contains("flex: 1"));
+        assert!(style.contains("min-height: 0"));
+        assert!(style.contains("overflow: auto"));
+    }
+}
+
+#[test]
+fn table_scroll_mode_defaults_to_table_only() {
+    assert_eq!(table_scroll_mode(true, false), TableScrollMode::TableOnly);
+    assert_eq!(table_scroll_mode(false, true), TableScrollMode::TableOnly);
+    assert_eq!(table_scroll_mode(false, false), TableScrollMode::TableOnly);
+}
+
+#[test]
+fn table_overflow_style_is_empty() {
+    assert_eq!(
+        table_overflow_style_for_scroll(TableScrollMode::PageThenTable, false),
+        ""
+    );
+    assert_eq!(
+        table_overflow_style_for_scroll(TableScrollMode::PageThenTable, true),
+        ""
+    );
+    assert_eq!(
+        table_overflow_style_for_scroll(TableScrollMode::TableOnly, true),
+        ""
+    );
 }
 
 #[test]
@@ -270,6 +358,37 @@ fn choose_default_dataset_id_falls_back_to_first() {
 }
 
 #[test]
+fn choose_next_dataset_after_delete_prefers_next_then_previous() {
+    let datasets = vec![
+        DatasetMeta {
+            id: 3.into(),
+            name: "第三".to_string(),
+            row_count: 0,
+            source_path: "x.csv".to_string(),
+            deleted_at: None,
+        },
+        DatasetMeta {
+            id: 2.into(),
+            name: "第二".to_string(),
+            row_count: 0,
+            source_path: "x.csv".to_string(),
+            deleted_at: None,
+        },
+        DatasetMeta {
+            id: 1.into(),
+            name: "第一".to_string(),
+            row_count: 0,
+            source_path: "x.csv".to_string(),
+            deleted_at: None,
+        },
+    ];
+
+    assert_eq!(choose_next_dataset_after_delete(&datasets, 2), Some(1));
+    assert_eq!(choose_next_dataset_after_delete(&datasets, 1), Some(2));
+    assert_eq!(choose_next_dataset_after_delete(&datasets, 3), Some(2));
+}
+
+#[test]
 fn summary_report_aggregates_totals_and_owners() {
     let headers = vec![
         "所有權人".to_string(),
@@ -313,6 +432,310 @@ fn summary_report_aggregates_totals_and_owners() {
         .find(|entry| entry.label == "估計配息")
         .map(|entry| entry.value.clone());
     assert_eq!(alex_estimated, Some("10".to_string()));
+}
+
+#[test]
+fn summary_report_owner_totals_include_holdings_fields() {
+    let headers = vec![
+        "所有權人".to_string(),
+        "數量".to_string(),
+        "總成本".to_string(),
+        "淨值".to_string(),
+        "估計配息".to_string(),
+    ];
+    let rows = vec![
+        vec![
+            "Alex".to_string(),
+            "2".to_string(),
+            "100".to_string(),
+            "110".to_string(),
+            "5".to_string(),
+        ],
+        vec![
+            "Alex".to_string(),
+            "3".to_string(),
+            "200".to_string(),
+            "220".to_string(),
+            "10".to_string(),
+        ],
+    ];
+
+    let report = compute_summary_report(&headers, &rows);
+
+    let owner_alex = report
+        .owner_totals
+        .iter()
+        .find(|owner| owner.owner == "Alex")
+        .cloned()
+        .expect("Alex summary should exist");
+
+    let qty = owner_alex
+        .entries
+        .iter()
+        .find(|entry| entry.label == "數量")
+        .map(|entry| entry.value.clone());
+    let cost = owner_alex
+        .entries
+        .iter()
+        .find(|entry| entry.label == "總成本")
+        .map(|entry| entry.value.clone());
+    let net = owner_alex
+        .entries
+        .iter()
+        .find(|entry| entry.label == "淨值")
+        .map(|entry| entry.value.clone());
+    let dividend = owner_alex
+        .entries
+        .iter()
+        .find(|entry| entry.label == "估計配息")
+        .map(|entry| entry.value.clone());
+
+    assert_eq!(qty, Some("5".to_string()));
+    assert_eq!(cost, Some("300".to_string()));
+    assert_eq!(net, Some("330".to_string()));
+    assert_eq!(dividend, Some("15".to_string()));
+}
+
+#[test]
+fn assets_summary_report_aggregates_cost_and_net() {
+    let headers = vec![
+        "資產形式".to_string(),
+        "投入金額".to_string(),
+        "目前淨值".to_string(),
+    ];
+    let rows = vec![
+        vec!["活存".to_string(), "100".to_string(), "110".to_string()],
+        vec!["定存".to_string(), "200".to_string(), "190".to_string()],
+    ];
+
+    let report = compute_summary_report(&headers, &rows);
+
+    let total_cost = report
+        .totals
+        .iter()
+        .find(|entry| entry.label == "合計-投入金額")
+        .map(|entry| entry.value.clone());
+    let total_net = report
+        .totals
+        .iter()
+        .find(|entry| entry.label == "合計-目前淨值")
+        .map(|entry| entry.value.clone());
+    let total_profit = report
+        .totals
+        .iter()
+        .find(|entry| entry.label == "合計-損益")
+        .map(|entry| entry.value.clone());
+
+    assert_eq!(total_cost, Some("300".to_string()));
+    assert_eq!(total_net, Some("300".to_string()));
+    assert_eq!(total_profit, Some("0".to_string()));
+}
+
+#[test]
+fn assets_summary_report_reads_interest_rows() {
+    let headers = vec![
+        "資產形式".to_string(),
+        "欄位B".to_string(),
+        "欄位C".to_string(),
+        "欄位D".to_string(),
+        "投入金額".to_string(),
+        "目前淨值".to_string(),
+    ];
+    let rows = vec![vec![
+        "定存資金".to_string(),
+        "1200".to_string(),
+        "100".to_string(),
+        "0.1".to_string(),
+        "0".to_string(),
+        "0".to_string(),
+    ]];
+
+    let report = compute_summary_report(&headers, &rows);
+
+    let annual = report
+        .totals
+        .iter()
+        .find(|entry| entry.label == "定存資金-年化")
+        .map(|entry| entry.value.clone());
+    let monthly = report
+        .totals
+        .iter()
+        .find(|entry| entry.label == "定存資金-月化")
+        .map(|entry| entry.value.clone());
+
+    assert_eq!(annual, Some("1200".to_string()));
+    assert_eq!(monthly, Some("100".to_string()));
+    assert!(!report
+        .totals
+        .iter()
+        .any(|entry| entry.label == "定存資金-殖利率"));
+}
+
+#[test]
+fn assets_summary_report_reads_interest_rows_from_data() {
+    let headers = vec![
+        "資產形式".to_string(),
+        "欄位B".to_string(),
+        "欄位C".to_string(),
+        "利率".to_string(),
+        "欄位E".to_string(),
+        "欄位F".to_string(),
+        "欄位G".to_string(),
+        "目前淨值".to_string(),
+        "估計配息".to_string(),
+    ];
+    let rows = vec![
+        vec![
+            "定存".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "0.02".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "100000".to_string(),
+            "".to_string(),
+        ],
+        vec![
+            "定存".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "0.02".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "50000".to_string(),
+            "".to_string(),
+        ],
+        vec![
+            "投資".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "0".to_string(),
+            "1200".to_string(),
+        ],
+        vec![
+            "投資".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "0".to_string(),
+            "600".to_string(),
+        ],
+    ];
+
+    let report = compute_summary_report(&headers, &rows);
+
+    let value_for = |label: &str| {
+        report
+            .totals
+            .iter()
+            .find(|entry| entry.label == label)
+            .map(|entry| entry.value.clone())
+    };
+
+    assert_eq!(value_for("定存資金-年化"), Some("3000".to_string()));
+    assert_eq!(value_for("定存資金-月化"), Some("250".to_string()));
+    assert_eq!(value_for("股債息(平均)-年化"), Some("1800".to_string()));
+    assert_eq!(value_for("股債息(平均)-月化"), Some("150".to_string()));
+    assert_eq!(value_for("合計(平均)-年化"), Some("4800".to_string()));
+    assert_eq!(value_for("合計(平均)-月化"), Some("400".to_string()));
+}
+
+#[test]
+fn assets_summary_report_prefers_derived_interest_over_summary_rows() {
+    let headers = vec![
+        "資產形式".to_string(),
+        "欄位B".to_string(),
+        "欄位C".to_string(),
+        "利率".to_string(),
+        "欄位E".to_string(),
+        "欄位F".to_string(),
+        "欄位G".to_string(),
+        "目前淨值".to_string(),
+        "估計配息".to_string(),
+    ];
+    let rows = vec![
+        vec![
+            "定存".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "0.02".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "100000".to_string(),
+            "".to_string(),
+        ],
+        vec![
+            "投資".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "0".to_string(),
+            "1200".to_string(),
+        ],
+        vec![
+            "定存資金".to_string(),
+            "9999".to_string(),
+            "999".to_string(),
+            "0.1".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+        ],
+        vec![
+            "股債息(平均)".to_string(),
+            "8888".to_string(),
+            "888".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+        ],
+        vec![
+            "合計(平均)".to_string(),
+            "7777".to_string(),
+            "777".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+        ],
+    ];
+
+    let report = compute_summary_report(&headers, &rows);
+
+    let value_for = |label: &str| {
+        report
+            .totals
+            .iter()
+            .find(|entry| entry.label == label)
+            .map(|entry| entry.value.clone())
+    };
+
+    assert_eq!(value_for("定存資金-年化"), Some("2000".to_string()));
+    assert_eq!(value_for("定存資金-月化"), Some("166.666667".to_string()));
+    assert_eq!(value_for("股債息(平均)-年化"), Some("1200".to_string()));
+    assert_eq!(value_for("股債息(平均)-月化"), Some("100".to_string()));
+    assert_eq!(value_for("合計(平均)-年化"), Some("3200".to_string()));
+    assert_eq!(value_for("合計(平均)-月化"), Some("266.666667".to_string()));
 }
 
 #[test]
@@ -522,6 +945,81 @@ fn purge_dataset_removes_related_records() {
     assert_eq!(dataset_count, 0);
     assert_eq!(column_count, 0);
     assert_eq!(cell_count, 0);
+
+    fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn purge_dataset_removes_related_records_and_flags() {
+    let temp_dir = unique_test_dir("purge-dataset-flags");
+    fs::create_dir_all(&temp_dir).expect("should create temp dir");
+    let db_path = temp_dir.join("app.sqlite");
+
+    let dataset_id = create_dataset_from_rows(
+        &db_path,
+        "sample",
+        "sample.csv",
+        &["A".to_string(), "B".to_string()],
+        &[vec!["1".to_string(), "2".to_string()]],
+    )
+    .expect("dataset should be created");
+
+    let mut visibility = BTreeMap::new();
+    visibility.insert(0, true);
+    upsert_column_visibility(&db_path, dataset_id, &visibility)
+        .expect("should store column visibility");
+    upsert_holdings_flag(&db_path, dataset_id, true).expect("should store holdings flag");
+
+    purge_dataset(&db_path, dataset_id).expect("purge should succeed");
+
+    let conn = Connection::open(&db_path).expect("should open sqlite db");
+    let visibility_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM column_visibility WHERE dataset_id=?1",
+            [dataset_id],
+            |row| row.get(0),
+        )
+        .expect("column visibility count query should succeed");
+    let flag_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dataset_flag WHERE dataset_id=?1",
+            [dataset_id],
+            |row| row.get(0),
+        )
+        .expect("dataset flag count query should succeed");
+
+    assert_eq!(visibility_count, 0);
+    assert_eq!(flag_count, 0);
+
+    fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
+}
+
+#[test]
+fn edit_service_hard_delete_removes_dataset() {
+    let temp_dir = unique_test_dir("hard-delete");
+    fs::create_dir_all(&temp_dir).expect("should create temp dir");
+    let db_path = temp_dir.join("app.sqlite");
+    let csv_path = temp_dir.join("sample.csv");
+    fs::write(&csv_path, "name\nAlice\n").expect("should write csv fixture");
+
+    let imported = import_csv_to_sqlite(&db_path, &csv_path).expect("import should succeed");
+
+    let repo = SqliteRepo {
+        db_path: db_path.clone(),
+    };
+    let edit_service = EditService::new(std::sync::Arc::new(repo));
+    edit_service
+        .hard_delete_dataset(imported.dataset_id.into())
+        .expect("hard delete should succeed");
+
+    let visible = list_datasets(&db_path, false).expect("list visible should succeed");
+    let with_deleted = list_datasets(&db_path, true).expect("list with deleted should succeed");
+
+    assert!(visible.is_empty(), "hard deleted dataset should be gone");
+    assert!(
+        with_deleted.is_empty(),
+        "hard deleted dataset should be gone"
+    );
 
     fs::remove_dir_all(&temp_dir).expect("should cleanup temp dir");
 }
@@ -820,6 +1318,13 @@ fn holdings_editable_and_required_columns_match_spec() {
     assert!(required.contains(&"所有權人".to_string()));
     assert!(required.contains(&"配息方式".to_string()));
     assert!(!editable.contains(&"總成本".to_string()));
+}
+
+#[test]
+fn assets_editable_columns_include_all_headers() {
+    let headers = vec!["欄位A".to_string(), "欄位B".to_string()];
+    let editable = editable_columns_for_assets(&headers);
+    assert_eq!(editable, headers);
 }
 
 #[test]

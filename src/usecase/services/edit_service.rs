@@ -34,4 +34,8 @@ impl EditService {
     pub fn purge_dataset(&self, dataset_id: DatasetId) -> Result<(), RepoError> {
         self.repo.purge_dataset(dataset_id)
     }
+
+    pub fn hard_delete_dataset(&self, dataset_id: DatasetId) -> Result<(), RepoError> {
+        self.repo.purge_dataset(dataset_id)
+    }
 }

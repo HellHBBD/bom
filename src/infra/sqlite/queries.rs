@@ -436,6 +436,16 @@ pub fn purge_dataset(db_path: &Path, dataset_id: i64) -> Result<()> {
         .transaction()
         .context("failed to start purge transaction")?;
     tx.execute(
+        "DELETE FROM column_visibility WHERE dataset_id = ?1",
+        params![dataset_id],
+    )
+    .with_context(|| format!("failed to delete column visibility for dataset #{dataset_id}"))?;
+    tx.execute(
+        "DELETE FROM dataset_flag WHERE dataset_id = ?1",
+        params![dataset_id],
+    )
+    .with_context(|| format!("failed to delete dataset flags for dataset #{dataset_id}"))?;
+    tx.execute(
         "DELETE FROM cell WHERE dataset_id = ?1",
         params![dataset_id],
     )

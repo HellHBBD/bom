@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -8,7 +7,7 @@ use anyhow::anyhow;
 use dioxus::prelude::*;
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
-use crate::domain::entities::dataset::DatasetId;
+use crate::domain::entities::dataset::{DatasetId, PageQuery};
 use crate::domain::entities::edit::{CellKey, StagedEdits};
 use crate::infra::sqlite::repo::SqliteRepo;
 use crate::platform::desktop::blocking::run_blocking;
@@ -18,12 +17,16 @@ use crate::usecase::services::edit_service::EditService;
 use crate::usecase::services::import_service::ImportService;
 use crate::usecase::services::query_service::QueryService;
 use crate::{
-    apply_column_visibility, build_dataset_groups, choose_default_dataset_id, column_alignment,
-    dataset_tab_kind, default_dataset_name_mmdd, default_db_path, editable_columns_for_holdings,
-    format_cell_value, is_holdings_table, parse_numeric_value, read_xlsx_summary_report,
-    reload_page_data_usecase, required_columns_for_holdings, table_container_style,
-    table_header_cell_style, validate_required_holdings_row, DatasetTabKind, PendingAction,
-    QueryOptions, XlsxSummaryReport, NONE_OPTION_VALUE, PAGE_SIZE,
+    apply_column_visibility, build_dataset_groups, choose_default_dataset_id,
+    choose_next_dataset_after_delete, column_alignment, compute_summary_report, dataset_tab_kind,
+    default_dataset_name_mmdd, default_db_path, editable_columns_for_assets,
+    editable_columns_for_holdings, format_cell_value, is_holdings_table,
+    normalize_column_visibility, parse_numeric_value, reload_page_data_usecase,
+    required_columns_for_holdings, root_container_style_for_scroll,
+    table_container_style_for_scroll, table_header_cell_style, table_overflow_style_for_scroll,
+    table_scroll_mode,
+    validate_required_holdings_row, DatasetTabKind, PendingAction, QueryOptions, SummaryReport,
+    NONE_OPTION_VALUE, PAGE_SIZE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +203,7 @@ pub fn App() -> Element {
         mut staged_cells,
         mut deleted_rows,
         mut selected_rows,
+        mut edit_mode,
         mut editing_cell,
         mut editing_value,
         mut added_rows,
@@ -214,8 +218,7 @@ pub fn App() -> Element {
     } = AppState::new();
 
     let mut show_summary_report = use_signal(|| false);
-    let mut summary_report = use_signal(|| None::<XlsxSummaryReport>);
-    let mut summary_selection = use_signal(BTreeMap::<String, bool>::new);
+    let mut summary_report = use_signal(SummaryReport::default);
     let mut show_dataset_manager = use_signal(|| false);
     let mut manage_dataset_id = use_signal(|| None::<i64>);
     let mut manage_name_input = use_signal(String::new);
@@ -233,6 +236,53 @@ pub fn App() -> Element {
     let query_service_for_holdings_flags = query_service.clone();
     let mut open_dropdown = use_signal(|| None::<DropdownId>);
     let dropdown_pos = use_signal(|| None::<(f64, f64)>);
+    let mut table_header_stuck = use_signal(|| false);
+    let mut eval_started = use_signal(|| false);
+    let mut eval_handle = use_signal(|| None::<document::Eval>);
+    use_effect(move || {
+        if eval_started() {
+            return;
+        }
+        eval_started.set(true);
+        let mut eval = document::eval(
+            r#"
+const sendState = () => {
+  const header = document.getElementById("table-head");
+  if (!header) {
+    dioxus.send(false);
+    return;
+  }
+  const top = header.getBoundingClientRect().top;
+  dioxus.send(top <= 0);
+};
+const root = document.getElementById("app-root");
+const scrollTarget = root ?? window;
+const scrollOptions = { passive: true };
+scrollTarget.addEventListener("scroll", sendState, scrollOptions);
+window.addEventListener("resize", sendState);
+sendState();
+await dioxus.recv();
+scrollTarget.removeEventListener("scroll", sendState, scrollOptions);
+window.removeEventListener("resize", sendState);
+"#,
+        );
+        let mut eval_for_recv = eval.clone();
+        eval_handle.set(Some(eval));
+        spawn(async move {
+            loop {
+                let next: bool = match eval_for_recv.recv().await {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                table_header_stuck.set(next);
+            }
+        });
+    });
+    use_on_unmount(move || {
+        if let Some(eval) = eval_handle() {
+            let _ = eval.send(());
+        }
+    });
     use_effect(move || {
         *busy.write() = true;
         let init_result = run_blocking(|| {
@@ -294,26 +344,40 @@ pub fn App() -> Element {
 
     use_effect(move || {
         let dataset_id = selected_dataset_id();
-        let column_count = columns().len();
+        let columns_snapshot = columns();
         if let Some(id) = dataset_id {
+            if columns_snapshot.is_empty() {
+                column_visibility.set(BTreeMap::new());
+                return;
+            }
             let visibility_result = run_blocking(|| {
                 query_service_for_visibility
                     .load_column_visibility(DatasetId(id))
                     .map_err(|err| anyhow!(err.to_string()))
             });
 
-            let mut visibility = match visibility_result {
+            let visibility_loaded = visibility_result.is_ok();
+            let visibility = match visibility_result {
                 Ok(map) => map,
                 Err(err) => {
                     *status.write() = format!("載入欄位顯示失敗：{err}");
                     BTreeMap::new()
                 }
             };
-
-            for idx in 0..column_count {
-                visibility.entry(idx as i64).or_insert(true);
+            let normalized = normalize_column_visibility(&columns_snapshot, &visibility);
+            let should_persist_default =
+                visibility_loaded && visibility.is_empty() && is_holdings_table(&columns_snapshot);
+            if should_persist_default {
+                let save_result = run_blocking(|| {
+                    query_service_for_visibility
+                        .upsert_column_visibility(DatasetId(id), normalized.clone())
+                        .map_err(|err| anyhow!(err.to_string()))
+                });
+                if let Err(err) = save_result {
+                    *status.write() = format!("保存欄位顯示失敗：{err}");
+                }
             }
-            column_visibility.set(visibility);
+            column_visibility.set(normalized);
         } else {
             column_visibility.set(BTreeMap::new());
         }
@@ -342,7 +406,6 @@ pub fn App() -> Element {
 
     let current_total_rows = total_rows();
     let report_snapshot = summary_report();
-    let selection_snapshot = summary_selection();
 
     let query_service_for_import = query_service.clone();
     let import_service_for_import = import_service.clone();
@@ -353,8 +416,8 @@ pub fn App() -> Element {
     let query_service_for_sort_toggle = query_service.clone();
     let query_service_for_tab_switch = query_service.clone();
     let query_service_for_show_deleted = query_service.clone();
+    let query_service_for_summary = query_service.clone();
     let query_service_for_visibility_update = query_service.clone();
-    let query_service_for_holdings_update = query_service.clone();
     let query_service_for_save = query_service.clone();
     let query_service_for_save_as = query_service.clone();
     let query_service_for_import_overwrite = query_service.clone();
@@ -454,7 +517,7 @@ pub fn App() -> Element {
     let (_, visible_added_rows) =
         apply_column_visibility(&current_columns, &added_rows_snapshot, &visibility_snapshot);
     let datasets_snapshot = datasets();
-    let staged_cells_snapshot = staged_cells();
+    let staged_cells_snapshot = Arc::new(staged_cells());
     let deleted_rows_snapshot = deleted_rows();
     let selected_rows_snapshot = selected_rows();
     let editing_cell_snapshot = editing_cell();
@@ -469,21 +532,37 @@ pub fn App() -> Element {
             .find(|dataset| dataset.id.0 == id)
             .map(|dataset| dataset.name.clone())
     });
-    let auto_holdings = selected_dataset_name
-        .as_deref()
-        .and_then(dataset_tab_kind)
+    let dataset_kind = selected_dataset_name.as_deref().and_then(dataset_tab_kind);
+    let auto_holdings = dataset_kind
         .map(|kind| kind == DatasetTabKind::Holdings)
         .unwrap_or(false)
         || is_holdings_table(&current_columns);
+    let is_assets = dataset_kind
+        .map(|kind| kind == DatasetTabKind::Assets)
+        .unwrap_or(false);
     let is_holdings = selected_dataset_id()
         .and_then(|id| holdings_flags_snapshot.get(&id).copied())
         .unwrap_or(auto_holdings);
-    let editable_columns = Arc::new(editable_columns_for_holdings());
-    let required_columns = Arc::new(required_columns_for_holdings());
+    let is_editable_table = is_holdings || is_assets;
+    let scroll_mode = table_scroll_mode(is_assets, is_holdings);
+    let editable_columns = Arc::new(if is_holdings {
+        editable_columns_for_holdings()
+    } else if is_assets {
+        editable_columns_for_assets(&current_columns)
+    } else {
+        Vec::new()
+    });
+    let required_columns = Arc::new(if is_holdings {
+        required_columns_for_holdings()
+    } else {
+        Vec::new()
+    });
     let base_row_count = current_rows.len();
     let has_pending_changes = !staged_cells_snapshot.is_empty()
         || !deleted_rows_snapshot.is_empty()
         || !added_rows_snapshot.is_empty();
+    let edit_mode_snapshot = edit_mode();
+    let editing_enabled = is_editable_table && edit_mode_snapshot;
     let current_columns_for_add = Arc::new(current_columns.clone());
     let current_columns_for_save = current_columns.clone();
     let current_rows_for_save = current_rows.clone();
@@ -500,7 +579,7 @@ pub fn App() -> Element {
 
     let switch_dataset = Rc::new(RefCell::new(move |next_dataset: Option<i64>| {
         let query_service_for_tab_switch = query_service_for_tab_switch_dropdown.clone();
-        if is_holdings && has_pending_changes {
+        if is_editable_table && has_pending_changes {
             if let Some(id) = next_dataset {
                 pending_action.set(Some(PendingAction::TabSwitch { dataset_id: id }));
                 show_save_prompt.set(true);
@@ -508,6 +587,17 @@ pub fn App() -> Element {
             return;
         }
 
+        staged_cells.write().clear();
+        deleted_rows.write().clear();
+        selected_rows.write().clear();
+        *editing_cell.write() = None;
+        editing_value.set(String::new());
+        added_rows.write().clear();
+        show_add_row.set(false);
+        new_row_inputs.write().clear();
+        context_menu.set(None);
+        context_row.set(None);
+        edit_mode.set(true);
         *selected_dataset_id.write() = next_dataset;
         *page.write() = 0;
         *busy.write() = true;
@@ -538,7 +628,7 @@ pub fn App() -> Element {
         let query_service_for_import = query_service_for_import.clone();
         let import_service_for_import = import_service_for_import.clone();
 
-        if is_holdings && has_pending_changes {
+        if is_editable_table && has_pending_changes {
             if let Some(file_path) = FileDialog::new()
                 .add_filter("Excel", &["xlsx"])
                 .add_filter("CSV", &["csv"])
@@ -640,6 +730,7 @@ pub fn App() -> Element {
 
     rsx! {
         div {
+            id: "app-root",
             onclick: move |_| {
                 context_menu.set(None);
                 context_row.set(None);
@@ -648,295 +739,202 @@ pub fn App() -> Element {
             oncontextmenu: move |event| {
                 event.prevent_default();
             },
-            style: "font-family: 'Noto Sans TC', sans-serif; padding: 12px; background: #fff; min-height: 100vh; height: 100vh; overflow: auto; backface-visibility: hidden; transform: translateZ(0);",
-
-            h2 { "BOM" }
+            style: "{root_container_style_for_scroll(scroll_mode)}",
 
             div {
-                style: "display: flex; gap: 8px; align-items: center; margin-bottom: 12px; position: sticky; top: 0; background: #fff; z-index: 900; padding: 8px 0;",
-                button {
-                    disabled: busy(),
-                    onclick: move |_| {
-                        manage_dataset_id.set(selected_dataset_id());
-                        let datasets_snapshot = datasets();
-                        let current_name = selected_dataset_id()
-                            .and_then(|id| datasets_snapshot.iter().find(|d| d.id.0 == id))
-                            .map(|d| d.name.clone())
-                            .unwrap_or_default();
-                        manage_name_input.set(current_name);
-                        show_dataset_manager.set(true);
-                    },
-                    "資料集管理"
-                }
+                style: "flex: 1 1 auto; min-height: 0; overflow: auto;",
+                h2 { "BOM" }
 
-                button {
-                    disabled: busy(),
-                    onclick: move |_| {
-                        let Some(dataset_id) = selected_dataset_id() else {
-                            *status.write() = "請先選擇資料集".to_string();
-                            return;
-                        };
-                        let Some(dataset) = datasets()
-                            .iter()
-                            .find(|dataset| dataset.id.0 == dataset_id)
-                            .cloned()
-                        else {
-                            *status.write() = "找不到資料集".to_string();
-                            return;
-                        };
-                        let source_path = dataset.source_path;
-                        let file_path = source_path.split('#').next().unwrap_or(&source_path);
-                        if !file_path.to_ascii_lowercase().ends_with(".xlsx") {
-                            *status.write() = "總結報表僅支援 XLSX 資料集".to_string();
-                            return;
-                        }
-                        *busy.write() = true;
-                        let report_result = run_blocking(|| {
-                            read_xlsx_summary_report(Path::new(file_path))
-                                .map_err(|err| anyhow!(err.to_string()))
-                        });
-                        match report_result {
-                            Ok(report) => {
-                                let mut next_selection = summary_selection();
-                                for row in &report.interest_rows {
-                                    next_selection
-                                        .entry(format!("interest:{}", row.label))
-                                        .or_insert(true);
-                                }
-                                if report.dividend_total.is_some() {
-                                    next_selection.entry("dividend_total".to_string()).or_insert(true);
-                                }
-                                for row in &report.owner_dividends {
-                                    next_selection
-                                        .entry(format!("owner:{}", row.owner))
-                                        .or_insert(true);
-                                }
-                                summary_selection.set(next_selection);
-                                summary_report.set(Some(report));
-                                show_summary_report.set(true);
-                            }
-                            Err(err) => {
-                                *status.write() = format!("載入總結報表失敗：{err}");
-                            }
-                        }
-                        *busy.write() = false;
-                    },
-                    "總結報表"
-                }
-
-                label { "顯示已刪除" }
-                input {
-                    r#type: "checkbox",
-                    disabled: busy(),
-                    checked: show_deleted(),
-                    onchange: move |event| {
-                        let checked = event.value().parse::<bool>().unwrap_or(false);
-                        show_deleted.set(checked);
-                        *busy.write() = true;
-
-                        match query_service_for_show_deleted.list_datasets(checked) {
-                            Ok(available) => {
-                                let groups = build_dataset_groups(&available);
-                                *datasets.write() = available;
-                                let next_dataset = if checked {
-                                    selected_dataset_id()
-                                } else {
-                                    groups
-                                        .iter()
-                                        .find(|g| g.datasets.iter().any(|d| d.id.0 == selected_dataset_id().unwrap_or(-1)))
-                                        .and_then(|g| choose_default_dataset_id(&g.datasets))
-                                };
-                                *selected_dataset_id.write() = next_dataset;
-                                *selected_group_key.write() = groups
-                                    .iter()
-                                    .find(|g| g.datasets.iter().any(|d| d.id.0 == next_dataset.unwrap_or(-1)))
-                                    .map(|g| g.key.clone());
-                                *page.write() = 0;
-
-                                let options = QueryOptions {
-                                    global_search: global_search(),
-                                    column_search_col: column_search_col(),
-                                    column_search_text: column_search_text(),
-                                    sort_col: sort_col(),
-                                    sort_desc: sort_desc(),
-                                };
-
-                                match reload_page_data_usecase(
-                                    &query_service_for_show_deleted,
-                                    next_dataset,
-                                    0,
-                                    &options,
-                                ) {
-                                    Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                        *columns.write() = loaded_columns;
-                                        *rows.write() = loaded_rows;
-                                        *total_rows.write() = loaded_total;
-                                        *page.write() = loaded_page;
-                                    }
-                                    Err(err) => {
-                                        *columns.write() = Vec::new();
-                                        *rows.write() = Vec::new();
-                                        *total_rows.write() = 0;
-                                        *page.write() = 0;
-                                        *status.write() = format!("切換顯示狀態失敗：{err}");
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                *status.write() = format!("刷新資料集失敗：{err}");
-                            }
-                        }
-
-                        *busy.write() = false;
-                    },
-                }
-
-                span { " {status}" }
-            }
-
-            div {
-                DropdownSelect {
-                    id: DropdownId::Dataset,
-                    label: "資料集",
-                    options: dataset_options.clone(),
-                    selected: selected_group_key(),
-                    open_dropdown: open_dropdown,
-                    dropdown_pos: dropdown_pos,
-                    on_select: move |value: String| {
-                        let query_service_for_dataset_change =
-                            query_service_for_dataset_change_dropdown.clone();
-                        let groups = build_dataset_groups(&datasets());
-                        let next_group = if value == NONE_OPTION_VALUE {
-                            None::<String>
-                        } else {
-                            Some(value)
-                        };
-                        let next_dataset = next_group
-                            .as_ref()
-                            .and_then(|group_key| groups.iter().find(|g| &g.key == group_key))
-                            .and_then(|g| choose_default_dataset_id(&g.datasets));
-
-                        if is_holdings && has_pending_changes {
-                            pending_action.set(Some(PendingAction::DatasetChange {
-                                next_group: next_group.clone(),
-                                next_dataset,
-                            }));
-                            show_save_prompt.set(true);
-                            return;
-                        }
-
-                        *selected_group_key.write() = next_group;
-                        *selected_dataset_id.write() = next_dataset;
-                        *column_search_col.write() = None;
-                        *column_search_text.write() = String::new();
-                        *sort_col.write() = None;
-                        *sort_desc.write() = false;
-                        *page.write() = 0;
-                        staged_cells.write().clear();
-                        deleted_rows.write().clear();
-                        selected_rows.write().clear();
-                        *editing_cell.write() = None;
-                        editing_value.set(String::new());
-                        added_rows.write().clear();
-                        show_add_row.set(false);
-                        new_row_inputs.write().clear();
-                        context_menu.set(None);
-                        context_row.set(None);
-                        *busy.write() = true;
-
-                        let options = QueryOptions {
-                            global_search: global_search(),
-                            column_search_col: column_search_col(),
-                            column_search_text: column_search_text(),
-                            sort_col: sort_col(),
-                            sort_desc: sort_desc(),
-                        };
-
-                        match reload_page_data_usecase(
-                            &query_service_for_dataset_change,
-                            next_dataset,
-                            0,
-                            &options,
-                        ) {
-                            Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                *columns.write() = loaded_columns;
-                                *rows.write() = loaded_rows;
-                                *total_rows.write() = loaded_total;
-                                *page.write() = loaded_page;
-                            }
-                            Err(err) => {
-                                *status.write() = format!("載入資料集失敗：{err}");
-                            }
-                        }
-
-                        *busy.write() = false;
+                div {
+                    style: "display: flex; gap: 8px; align-items: center; margin-bottom: 12px; background: #fff; padding: 8px 0;",
+                    button {
+                        disabled: busy(),
+                        onclick: move |_| {
+                            manage_dataset_id.set(selected_dataset_id());
+                            let datasets_snapshot = datasets();
+                            let current_name = selected_dataset_id()
+                                .and_then(|id| datasets_snapshot.iter().find(|d| d.id.0 == id))
+                                .map(|d| d.name.clone())
+                                .unwrap_or_default();
+                            manage_name_input.set(current_name);
+                            show_dataset_manager.set(true);
+                        },
+                        "資料集管理"
                     }
-                }
 
-                if let Some(_active_group) = active_group {
-                    if assets_sheet.is_some() || holdings_sheet.is_some() {
-                        div { style: "display: flex; gap: 8px; align-items: center;",
-                            if let Some(assets_id) = assets_sheet {
-                                button {
-                                    style: if selected_dataset_id() == Some(assets_id) {
-                                        "padding: 4px 10px; border: 1px solid #4c6ef5; background: #eef4ff; border-radius: 6px;"
-                                    } else {
-                                        "padding: 4px 10px; border: 1px solid #bbb; background: #fff; border-radius: 6px;"
-                                    },
-                                    onclick: move |_| {
-                                        switch_dataset_for_assets.borrow_mut()(Some(assets_id));
-                                    },
-                                    "資產總表"
-                                }
-                            }
-                            if let Some(holdings_id) = holdings_sheet {
-                                button {
-                                    style: if selected_dataset_id() == Some(holdings_id) {
-                                        "padding: 4px 10px; border: 1px solid #4c6ef5; background: #eef4ff; border-radius: 6px;"
-                                    } else {
-                                        "padding: 4px 10px; border: 1px solid #bbb; background: #fff; border-radius: 6px;"
-                                    },
-                                    onclick: move |_| {
-                                        switch_dataset_for_holdings.borrow_mut()(Some(holdings_id));
-                                    },
-                                    "持股"
-                                }
-                            }
-                        }
-                    } else {
-                        DropdownSelect {
-                            id: DropdownId::Sheet,
-                            label: "工作表",
-                            options: sheet_options.clone(),
-                            selected: selected_dataset_id().map(|id| id.to_string()),
-                            open_dropdown: open_dropdown,
-                            dropdown_pos: dropdown_pos,
-                            on_select: move |value: String| {
-                                let next_dataset = value.parse::<i64>().ok();
-                                switch_dataset_for_sheet.borrow_mut()(next_dataset);
-                            }
-                        }
-                    }
-                }
-
-                if let Some(dataset_id) = selected_dataset_id() {
-                    label { "編輯模式" }
-                    input {
-                        r#type: "checkbox",
-                        checked: is_holdings,
-                        onchange: move |event| {
-                            let checked = event.value().parse::<bool>().unwrap_or(false);
-                            let mut next_flags = holdings_flags();
-                            next_flags.insert(dataset_id, checked);
-                            holdings_flags.set(next_flags);
-                            let result = run_blocking(|| {
-                                query_service_for_holdings_update
-                                    .upsert_holdings_flag(DatasetId(dataset_id), checked)
+                    button {
+                        disabled: busy(),
+                        onclick: move |_| {
+                            *busy.write() = true;
+                            let Some(dataset_id) = selected_dataset_id() else {
+                                *status.write() = "請先選擇資料集".to_string();
+                                *busy.write() = false;
+                                return;
+                            };
+                            let report_result = run_blocking(|| {
+                                query_service_for_summary
+                                    .query_page(PageQuery {
+                                        dataset_id: DatasetId(dataset_id),
+                                        page: 0,
+                                        page_size: i64::MAX,
+                                        global_search: String::new(),
+                                        column_filter: None,
+                                        sort: None,
+                                    })
                                     .map_err(|err| anyhow!(err.to_string()))
                             });
-                            if let Err(err) = result {
-                                *status.write() = format!("更新持股標記失敗：{err}");
+                            match report_result {
+                                Ok(page) => {
+                                    let report = compute_summary_report(&page.columns, &page.rows);
+                                    summary_report.set(report);
+                                    show_summary_report.set(true);
+                                }
+                                Err(err) => {
+                                    *status.write() = format!("載入總結報表失敗：{err}");
+                                }
                             }
+                            *busy.write() = false;
+                        },
+                        "總結報表"
+                    }
+
+                    span { " {status}" }
+                }
+
+                div {
+                    DropdownSelect {
+                        id: DropdownId::Dataset,
+                        label: "資料集",
+                        options: dataset_options.clone(),
+                        selected: selected_group_key(),
+                        open_dropdown: open_dropdown,
+                        dropdown_pos: dropdown_pos,
+                        on_select: move |value: String| {
+                            let query_service_for_dataset_change =
+                                query_service_for_dataset_change_dropdown.clone();
+                            let groups = build_dataset_groups(&datasets());
+                            let next_group = if value == NONE_OPTION_VALUE {
+                                None::<String>
+                            } else {
+                                Some(value)
+                            };
+                            let next_dataset = next_group
+                                .as_ref()
+                                .and_then(|group_key| groups.iter().find(|g| &g.key == group_key))
+                                .and_then(|g| choose_default_dataset_id(&g.datasets));
+
+                            if is_editable_table && has_pending_changes {
+                                pending_action.set(Some(PendingAction::DatasetChange {
+                                    next_group: next_group.clone(),
+                                    next_dataset,
+                                }));
+                                show_save_prompt.set(true);
+                                return;
+                            }
+
+                            *selected_group_key.write() = next_group;
+                            *selected_dataset_id.write() = next_dataset;
+                            *column_search_col.write() = None;
+                            *column_search_text.write() = String::new();
+                            *sort_col.write() = None;
+                            *sort_desc.write() = false;
+                            *page.write() = 0;
+                            staged_cells.write().clear();
+                            deleted_rows.write().clear();
+                            selected_rows.write().clear();
+                            edit_mode.set(false);
+                            *editing_cell.write() = None;
+                            editing_value.set(String::new());
+                            added_rows.write().clear();
+                            show_add_row.set(false);
+                            new_row_inputs.write().clear();
+                            context_menu.set(None);
+                            context_row.set(None);
+                            *busy.write() = true;
+
+                            let options = QueryOptions {
+                                global_search: global_search(),
+                                column_search_col: column_search_col(),
+                                column_search_text: column_search_text(),
+                                sort_col: sort_col(),
+                                sort_desc: sort_desc(),
+                            };
+
+                            match reload_page_data_usecase(
+                                &query_service_for_dataset_change,
+                                next_dataset,
+                                0,
+                                &options,
+                            ) {
+                                Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                    *columns.write() = loaded_columns;
+                                    *rows.write() = loaded_rows;
+                                    *total_rows.write() = loaded_total;
+                                    *page.write() = loaded_page;
+                                }
+                                Err(err) => {
+                                    *status.write() = format!("載入資料集失敗：{err}");
+                                }
+                            }
+
+                            *busy.write() = false;
+                        }
+                    }
+
+                    if let Some(_active_group) = active_group {
+                        if assets_sheet.is_some() || holdings_sheet.is_some() {
+                            div { style: "display: flex; gap: 8px; align-items: center;",
+                                if let Some(assets_id) = assets_sheet {
+                                    button {
+                                        style: if selected_dataset_id() == Some(assets_id) {
+                                            "padding: 4px 10px; border: 1px solid #4c6ef5; background: #eef4ff; border-radius: 6px;"
+                                        } else {
+                                            "padding: 4px 10px; border: 1px solid #bbb; background: #fff; border-radius: 6px;"
+                                        },
+                                        onclick: move |_| {
+                                            switch_dataset_for_assets.borrow_mut()(Some(assets_id));
+                                        },
+                                        "資產總表"
+                                    }
+                                }
+                                if let Some(holdings_id) = holdings_sheet {
+                                    button {
+                                        style: if selected_dataset_id() == Some(holdings_id) {
+                                            "padding: 4px 10px; border: 1px solid #4c6ef5; background: #eef4ff; border-radius: 6px;"
+                                        } else {
+                                            "padding: 4px 10px; border: 1px solid #bbb; background: #fff; border-radius: 6px;"
+                                        },
+                                        onclick: move |_| {
+                                            switch_dataset_for_holdings.borrow_mut()(Some(holdings_id));
+                                        },
+                                        "持股股息總表"
+                                    }
+                                }
+                            }
+                        } else {
+                            DropdownSelect {
+                                id: DropdownId::Sheet,
+                                label: "工作表",
+                                options: sheet_options.clone(),
+                                selected: selected_dataset_id().map(|id| id.to_string()),
+                                open_dropdown: open_dropdown,
+                                dropdown_pos: dropdown_pos,
+                                on_select: move |value: String| {
+                                    let next_dataset = value.parse::<i64>().ok();
+                                    switch_dataset_for_sheet.borrow_mut()(next_dataset);
+                                }
+                            }
+                        }
+                    }
+
+                    if selected_dataset_id().is_some() {
+                        label { "編輯模式" }
+                        input {
+                            r#type: "checkbox",
+                            checked: edit_mode_snapshot,
+                            onchange: move |event| {
+                            let checked = event.value().parse::<bool>().unwrap_or(false);
+                            edit_mode.set(checked);
                         }
                     }
                 }
@@ -1177,7 +1175,7 @@ pub fn App() -> Element {
                 }
             }
 
-            if is_holdings {
+            if editing_enabled {
                 div { style: "margin-bottom: 12px; display: flex; gap: 8px;",
                     button {
                         disabled: busy(),
@@ -1258,7 +1256,12 @@ pub fn App() -> Element {
                                             row[idx] = value;
                                         }
                                     }
-                                    match validate_required_holdings_row(&current_columns_for_add, &row) {
+                                    let validation = if is_holdings {
+                                        validate_required_holdings_row(&current_columns_for_add, &row)
+                                    } else {
+                                        Ok(())
+                                    };
+                                    match validation {
                                         Ok(_) => {
                                             added_rows.write().push(row);
                                             show_add_row.set(false);
@@ -1285,11 +1288,11 @@ pub fn App() -> Element {
             }
 
             div {
-                style: "{table_container_style()}",
+                style: "{table_container_style_for_scroll(scroll_mode)}{table_overflow_style_for_scroll(scroll_mode, table_header_stuck())} flex: 0 0 auto; min-height: calc(100vh - 72px); overflow: visible;",
                 table { style: "border-collapse: collapse; width: 100%; background: #fff;",
-                    thead {
+                    thead { id: "table-head",
                         tr {
-                            if is_holdings {
+                            if editing_enabled {
                                 th { style: "{table_header_cell_style()}",
                                     input {
                                         r#type: "checkbox",
@@ -1322,24 +1325,18 @@ pub fn App() -> Element {
                         let editable_columns = editable_columns.clone();
                         let required_columns = required_columns.clone();
                         let column_alignments = column_alignments.clone();
+                        let staged_cells_for_row = staged_cells_snapshot.clone();
                         let row = row.clone();
-                        let row_style = format!(
-                            "{}{}",
-                            if selected_rows_snapshot.contains(&row_idx) {
-                                "background: #eef4ff;"
-                            } else {
-                                ""
-                            },
-                            if deleted_rows_snapshot.contains(&row_idx) {
-                                "border-top: 2px solid #d24; border-bottom: 2px solid #d24;"
-                            } else {
-                                ""
-                            }
-                        );
+                        let row_selected = selected_rows_snapshot.contains(&row_idx);
+                        let row_deleted = deleted_rows_snapshot.contains(&row_idx);
+                        let row_background = if row_selected { "#eef4ff" } else { "transparent" };
+                        let row_border = if row_deleted { "#d24" } else { "transparent" };
+                        let row_style =
+                            format!("background: {row_background}; border-top: 2px solid {row_border}; border-bottom: 2px solid {row_border};");
                         rsx!(
                             tr {
                                 style: "{row_style}",
-                                if is_holdings {
+                                if editing_enabled {
                                     td { style: "border: 1px solid #bbb; padding: 4px; text-align: center;",
                                         input {
                                             r#type: "checkbox",
@@ -1361,7 +1358,6 @@ pub fn App() -> Element {
                                         .get(visible_idx)
                                         .cloned()
                                         .unwrap_or((0, String::new()));
-                                    let formatted = format_cell_value(&header, &value);
                                     let alignment = column_alignments
                                         .get(visible_idx)
                                         .copied()
@@ -1373,6 +1369,11 @@ pub fn App() -> Element {
                                         col_idx,
                                         column: header.clone(),
                                     };
+                                    let staged_value = staged_cells_for_row
+                                        .get(&cell_key)
+                                        .cloned()
+                                        .unwrap_or_else(|| value.clone());
+                                    let formatted = format_cell_value(&header, &staged_value);
                                     let is_editing = editing_cell_snapshot.as_ref() == Some(&cell_key);
                                     if is_editing {
                                         rsx!(
@@ -1387,12 +1388,25 @@ pub fn App() -> Element {
                                                         if event.key() == Key::Enter {
                                                             let next_value = editing_value();
                                                             if required_columns_for_cell.contains(&header)
-                                                                && parse_numeric_value(&next_value).is_none()
+                                                                && next_value.trim().is_empty()
                                                             {
                                                                 *status.write() = "必填欄位不可空白".to_string();
                                                                 return;
                                                             }
-                                                            staged_cells.write().insert(cell_key.clone(), next_value.clone());
+                                                            let numeric_required = matches!(
+                                                                header.as_str(),
+                                                                "買進" | "市價" | "數量" | "期數"
+                                                            );
+                                                            if numeric_required
+                                                                && parse_numeric_value(&next_value).is_none()
+                                                            {
+                                                                *status.write() =
+                                                                    format!("欄位 {} 必須是數字", header);
+                                                                return;
+                                                            }
+                                                            staged_cells
+                                                                .write()
+                                                                .insert(cell_key.clone(), next_value.clone());
                                                             *editing_cell.write() = None;
                                                             editing_value.set(String::new());
                                                         } else if event.key() == Key::Escape {
@@ -1408,12 +1422,12 @@ pub fn App() -> Element {
                                             td {
                                                 style: "border: 1px solid #bbb; padding: 4px; text-align: {alignment};",
                                             ondoubleclick: move |_| {
-                                                    if !is_holdings {
+                                                    if !editing_enabled {
                                                         return;
                                                     }
                                                     if editable_columns_for_cell.contains(&header) {
                                                         *editing_cell.write() = Some(cell_key.clone());
-                                                        editing_value.set(value.clone());
+                                                        editing_value.set(staged_value.clone());
                                                     }
                                                 },
                                                 "{formatted}"
@@ -1431,10 +1445,17 @@ pub fn App() -> Element {
                             let column_alignments = column_alignments.clone();
                             let row = row.clone();
                             let display_row = base_row_count + row_idx;
+                            let added_selected = selected_rows_snapshot.contains(&display_row);
+                            let added_deleted = deleted_rows_snapshot.contains(&display_row);
+                            let added_background = if added_selected { "#eef4ff" } else { "#d9f7d9" };
+                            let added_border = if added_deleted { "#d24" } else { "transparent" };
+                            let row_style = format!(
+                                "background: {added_background}; border-top: 2px solid {added_border}; border-bottom: 2px solid {added_border};"
+                            );
                             rsx!(
                                 tr {
-                                    style: "background: #d9f7d9;",
-                                    if is_holdings {
+                                    style: "{row_style}",
+                                    if editing_enabled {
                                         td { style: "border: 1px solid #bbb; padding: 4px; text-align: center;",
                                             input {
                                                 r#type: "checkbox",
@@ -1475,113 +1496,112 @@ pub fn App() -> Element {
                 }
             }
 
+            if let Some(dataset_id) = selected_dataset_id() {
+                div { style: "display: flex; gap: 8px; align-items: center; margin-top: 12px; background: #fff; padding: 8px 0;",
+                    button {
+                        disabled: busy() || page() == 0,
+                        onclick: {
+                            let query_service_for_global_search =
+                                query_service_for_global_search.clone();
+                            move |_| {
+                            let next_page = (page() - 1).max(0);
+                            let options = QueryOptions {
+                                global_search: global_search(),
+                                column_search_col: column_search_col(),
+                                column_search_text: column_search_text(),
+                                sort_col: sort_col(),
+                                sort_desc: sort_desc(),
+                            };
+                            match reload_page_data_usecase(
+                                &query_service_for_global_search,
+                                Some(dataset_id),
+                                next_page,
+                                &options,
+                            ) {
+                                Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                    *columns.write() = loaded_columns;
+                                    *rows.write() = loaded_rows;
+                                    *total_rows.write() = loaded_total;
+                                    *page.write() = loaded_page;
+                                }
+                                Err(err) => {
+                                    *status.write() = format!("上一頁失敗：{err}");
+                                }
+                            }
+                            }
+                        },
+                        "上一頁"
+                    }
+                    button {
+                        disabled: busy() || (page() + 1) * PAGE_SIZE >= current_total_rows,
+                        onclick: {
+                            let query_service_for_global_search =
+                                query_service_for_global_search.clone();
+                            move |_| {
+                            let next_page = page() + 1;
+                            let options = QueryOptions {
+                                global_search: global_search(),
+                                column_search_col: column_search_col(),
+                                column_search_text: column_search_text(),
+                                sort_col: sort_col(),
+                                sort_desc: sort_desc(),
+                            };
+                            match reload_page_data_usecase(
+                                &query_service_for_global_search,
+                                Some(dataset_id),
+                                next_page,
+                                &options,
+                            ) {
+                                Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
+                                    *columns.write() = loaded_columns;
+                                    *rows.write() = loaded_rows;
+                                    *total_rows.write() = loaded_total;
+                                    *page.write() = loaded_page;
+                                }
+                                Err(err) => {
+                                    *status.write() = format!("下一頁失敗：{err}");
+                                }
+                            }
+                            }
+                        },
+                        "下一頁"
+                    }
+                    span { "第 {page() + 1} 頁" }
+                }
+            }
+        }
+
             if show_summary_report() {
                 div {
                     style: "position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; z-index: 1200;",
                     div {
                         style: "background: #fff; padding: 16px; border: 1px solid #999; min-width: 360px; max-width: 720px; max-height: 80vh; overflow: auto;",
-                        div { style: "margin-bottom: 8px; font-weight: 600;", "總結報表" }
-                        if let Some(report) = report_snapshot.clone() {
-                            if !report.interest_rows.is_empty() {
-                                div { style: "margin-bottom: 12px; font-weight: 600;", "年/月領息與殖利率" }
-                                {report.interest_rows.iter().map(|row| {
-                                    let key = format!("interest:{}", row.label);
-                                    let checked = selection_snapshot.get(&key).copied().unwrap_or(true);
-                                    let label = row.label.clone();
-                                    let annual = row.annual.clone();
-                                    let monthly = row.monthly.clone();
-                                    let yield_rate = row.yield_rate.clone();
-                                    rsx!(
-                                        div { style: "display: flex; align-items: center; gap: 8px; margin-bottom: 6px;",
-                                            input {
-                                                r#type: "checkbox",
-                                                checked: checked,
-                                                onclick: move |_| {
-                                                    let mut next_selection = summary_selection();
-                                                    let next_value = !next_selection.get(&key).copied().unwrap_or(true);
-                                                    next_selection.insert(key.clone(), next_value);
-                                                    summary_selection.set(next_selection);
-                                                }
-                                            }
-                                            span { style: "min-width: 110px;", "{label}" }
-                                            if checked {
-                                                span { "年 {annual}" }
-                                                span { "月 {monthly}" }
-                                                span { "殖利率 {yield_rate}" }
-                                            }
-                                        }
-                                    )
-                                })}
-                            }
-
-                            if let Some(total) = report.dividend_total.clone() {
-                                {
-                                    let key = "dividend_total".to_string();
-                                    let checked = selection_snapshot.get(&key).copied().unwrap_or(true);
-                                    rsx!(
-                                        div { style: "display: flex; align-items: center; gap: 8px; margin: 12px 0;",
-                                            input {
-                                                r#type: "checkbox",
-                                                checked: checked,
-                                                onclick: move |_| {
-                                                    let mut next_selection = summary_selection();
-                                                    let next_value = !next_selection.get(&key).copied().unwrap_or(true);
-                                                    next_selection.insert(key.clone(), next_value);
-                                                    summary_selection.set(next_selection);
-                                                }
-                                            }
-                                            span { style: "min-width: 110px;", "股息收入總計" }
-                                            if checked {
-                                                span { "{total}" }
-                                            }
-                                        }
-                                    )
-                                }
-                            }
-
-                            if !report.owner_dividends.is_empty() {
-                                div { style: "margin: 12px 0 6px; font-weight: 600;", "股息收入-人員分攤" }
-                                {report.owner_dividends.iter().map(|row| {
-                                    let key = format!("owner:{}", row.owner);
-                                    let checked = selection_snapshot.get(&key).copied().unwrap_or(true);
-                                    let owner = row.owner.clone();
-                                    let monthly = row.monthly.clone();
-                                    let monthly_with_pension = row.monthly_with_pension.clone();
-                                    let note = row.note.clone();
-                                    rsx!(
-                                        div { style: "display: flex; align-items: center; gap: 8px; margin-bottom: 6px;",
-                                            input {
-                                                r#type: "checkbox",
-                                                checked: checked,
-                                                onclick: move |_| {
-                                                    let mut next_selection = summary_selection();
-                                                    let next_value = !next_selection.get(&key).copied().unwrap_or(true);
-                                                    next_selection.insert(key.clone(), next_value);
-                                                    summary_selection.set(next_selection);
-                                                }
-                                            }
-                                            span { style: "min-width: 110px;", "{owner}" }
-                                            if checked {
-                                                span { "月 {monthly}" }
-                                                if let Some(extra) = monthly_with_pension.clone() {
-                                                    span { "加計月退 {extra}" }
-                                                }
-                                                if let Some(text) = note.clone() {
-                                                    span { "{text}" }
-                                                }
-                                            }
-                                        }
-                                    )
-                                })}
-                            }
-
-                            if !report.notes.is_empty() {
-                                div { style: "margin-top: 8px; color: #666;",
-                                    {report.notes.iter().map(|note| rsx!(div { "{note}" }))}
-                                }
-                            }
+                        div { style: "margin-bottom: 8px; font-weight: 600;", "{report_snapshot.title}" }
+                        if report_snapshot.totals.is_empty() {
+                            div { "沒有可計算的摘要欄位" }
                         } else {
-                            div { "尚無可用的總結報表" }
+                            div { style: "display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 12px;",
+                                for entry in report_snapshot.totals.clone() {
+                                    div { "{entry.label}: {entry.value}" }
+                                }
+                            }
+                        }
+                        if !report_snapshot.owner_totals.is_empty() {
+                            div { style: "margin-top: 12px; font-weight: 600;", "依所有權人" }
+                            for owner in report_snapshot.owner_totals.clone() {
+                                div { style: "margin-top: 6px; font-weight: 600;", "{owner.owner}" }
+                                div { style: "display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 12px;",
+                                    for entry in owner.entries {
+                                        div { "{entry.label}: {entry.value}" }
+                                    }
+                                }
+                            }
+                        }
+                        if !report_snapshot.notes.is_empty() {
+                            div { style: "margin-top: 12px; font-weight: 600;", "備註" }
+                            for note in report_snapshot.notes.clone() {
+                                div { "{note}" }
+                            }
                         }
                         div { style: "display: flex; justify-content: flex-end; margin-top: 12px;",
                             button {
@@ -1682,10 +1702,12 @@ pub fn App() -> Element {
                                                 *status.write() = "請先選擇資料集".to_string();
                                                 return;
                                             };
+                                            let next_dataset_candidate =
+                                                choose_next_dataset_after_delete(&datasets(), dataset_id);
                                             let confirm = MessageDialog::new()
                                                 .set_level(MessageLevel::Warning)
-                                                .set_title("刪除資料集")
-                                                .set_description("確定要刪除資料集？")
+                                                .set_title("永久刪除資料集")
+                                                .set_description("確定要永久刪除資料集？此動作不可復原。")
                                                 .set_buttons(MessageButtons::YesNo)
                                                 .show();
                                             if confirm != MessageDialogResult::Yes {
@@ -1694,7 +1716,7 @@ pub fn App() -> Element {
                                             *busy.write() = true;
                                             let result = run_blocking(|| {
                                                 edit_service_for_manage
-                                                    .soft_delete_dataset(DatasetId(dataset_id))
+                                                    .hard_delete_dataset(DatasetId(dataset_id))
                                                     .map_err(|err| anyhow!(err.to_string()))
                                             });
                                             if let Err(err) = result {
@@ -1702,12 +1724,24 @@ pub fn App() -> Element {
                                             } else if let Ok(available) = query_service_for_manage_delete.list_datasets(show_deleted()) {
                                                 let groups = build_dataset_groups(&available);
                                                 *datasets.write() = available;
-                                                let next_group = selected_group_key()
-                                                    .and_then(|key| groups.iter().find(|g| g.key == key))
-                                                    .or_else(|| groups.first());
-                                                let next_dataset = next_group
-                                                    .and_then(|g| choose_default_dataset_id(&g.datasets));
-                                                *selected_group_key.write() = next_group.map(|g| g.key.clone());
+                                                let next_dataset = next_dataset_candidate
+                                                    .and_then(|id| {
+                                                        groups
+                                                            .iter()
+                                                            .flat_map(|g| g.datasets.iter())
+                                                            .find(|d| d.id.0 == id)
+                                                            .map(|d| d.id.0)
+                                                    })
+                                                    .or_else(|| {
+                                                        selected_group_key()
+                                                            .and_then(|key| groups.iter().find(|g| g.key == key))
+                                                            .or_else(|| groups.first())
+                                                            .and_then(|g| choose_default_dataset_id(&g.datasets))
+                                                    });
+                                                *selected_group_key.write() = groups
+                                                    .iter()
+                                                    .find(|g| g.datasets.iter().any(|d| d.id.0 == next_dataset.unwrap_or(-1)))
+                                                    .map(|g| g.key.clone());
                                                 *selected_dataset_id.write() = next_dataset;
                                                 *page.write() = 0;
                                                 match reload_page_data_usecase(
@@ -1727,6 +1761,7 @@ pub fn App() -> Element {
                                                     }
                                                 }
                                                 manage_dataset_id.set(next_dataset);
+                                                *status.write() = "已永久刪除資料集".to_string();
                                             }
                                             *busy.write() = false;
                                         },
@@ -2326,80 +2361,7 @@ pub fn App() -> Element {
                         }
                     }
                 }
-            }
 
-            if let Some(dataset_id) = selected_dataset_id() {
-                div { style: "display: flex; gap: 8px; align-items: center; margin-top: 12px;",
-                    button {
-                        disabled: busy() || page() == 0,
-                        onclick: {
-                            let query_service_for_global_search =
-                                query_service_for_global_search.clone();
-                            move |_| {
-                            let next_page = (page() - 1).max(0);
-                            let options = QueryOptions {
-                                global_search: global_search(),
-                                column_search_col: column_search_col(),
-                                column_search_text: column_search_text(),
-                                sort_col: sort_col(),
-                                sort_desc: sort_desc(),
-                            };
-                            match reload_page_data_usecase(
-                                &query_service_for_global_search,
-                                Some(dataset_id),
-                                next_page,
-                                &options,
-                            ) {
-                                Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                    *columns.write() = loaded_columns;
-                                    *rows.write() = loaded_rows;
-                                    *total_rows.write() = loaded_total;
-                                    *page.write() = loaded_page;
-                                }
-                                Err(err) => {
-                                    *status.write() = format!("上一頁失敗：{err}");
-                                }
-                            }
-                            }
-                        },
-                        "上一頁"
-                    }
-                    button {
-                        disabled: busy() || (page() + 1) * PAGE_SIZE >= current_total_rows,
-                        onclick: {
-                            let query_service_for_global_search =
-                                query_service_for_global_search.clone();
-                            move |_| {
-                            let next_page = page() + 1;
-                            let options = QueryOptions {
-                                global_search: global_search(),
-                                column_search_col: column_search_col(),
-                                column_search_text: column_search_text(),
-                                sort_col: sort_col(),
-                                sort_desc: sort_desc(),
-                            };
-                            match reload_page_data_usecase(
-                                &query_service_for_global_search,
-                                Some(dataset_id),
-                                next_page,
-                                &options,
-                            ) {
-                                Ok((loaded_columns, loaded_rows, loaded_total, loaded_page)) => {
-                                    *columns.write() = loaded_columns;
-                                    *rows.write() = loaded_rows;
-                                    *total_rows.write() = loaded_total;
-                                    *page.write() = loaded_page;
-                                }
-                                Err(err) => {
-                                    *status.write() = format!("下一頁失敗：{err}");
-                                }
-                            }
-                            }
-                        },
-                        "下一頁"
-                    }
-                    span { "第 {page() + 1} 頁" }
-                }
             }
         }
     }
