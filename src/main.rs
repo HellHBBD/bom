@@ -1,5 +1,14 @@
 use dioxus::prelude::*;
 
+mod db;
+mod format;
+mod layout;
+mod models;
+mod pages;
+mod routes;
+
+use routes::Route;
+
 fn main() {
     dioxus::launch(App);
 }
@@ -7,18 +16,7 @@ fn main() {
 #[component]
 fn App() -> Element {
     rsx! {
-        main {
-            style: "
-                min-height: 100vh;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                font-family: sans-serif;
-            ",
-
-            h1 { "Asset Manager" }
-            p { "Dioxus Desktop is running." }
-        }
+        document::Stylesheet { href: asset!("/assets/main.css") }
+        Router::<Route> {}
     }
 }
