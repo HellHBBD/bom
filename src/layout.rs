@@ -15,9 +15,10 @@ pub fn AppLayout() -> Element {
                     }
                 }
                 nav { class: "nav-list",
-                    NavLink { route: Route::DashboardPage {}, label: "資產總覽" }
+                    NavLink { route: Route::DashboardPage {}, label: "總覽" }
                     NavLink { route: Route::AccountsPage {}, label: "帳戶資產" }
                     NavLink { route: Route::HoldingsPage {}, label: "持股明細" }
+                    NavLink { route: Route::DividendIncomePage {}, label: "股息收入" }
                     NavLink { route: Route::DividendsLegacyPage {}, label: "Excel 歷史股息" }
                 }
             }
@@ -31,6 +32,6 @@ pub fn AppLayout() -> Element {
 #[component]
 fn NavLink(route: Route, label: &'static str) -> Element {
     rsx! {
-        Link { class: "nav-link", to: route, "{label}" }
+        Link { class: "nav-link", active_class: "active", to: route, "{label}" }
     }
 }

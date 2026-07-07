@@ -27,7 +27,8 @@ pub struct AccountAsset {
     pub account_type: String,
     pub asset_type: String,
     pub currency_code: String,
-    pub original_amount: Option<f64>,
+    pub invested_amount: Option<f64>,
+    pub quantity: Option<f64>,
     pub current_value_ntd: Option<f64>,
     pub snapshot_date: String,
 }
@@ -46,6 +47,28 @@ pub struct DashboardSummary {
     pub estimated_monthly_dividend: Option<f64>,
     pub latest_account_asset_date: Option<String>,
     pub latest_holding_date: Option<String>,
+    pub owner_totals: Vec<OwnerAssetTotal>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnerAssetTotal {
+    pub owner_name: String,
+    pub value_ntd: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DividendReceiptRow {
+    pub owner_name: String,
+    pub account_name: String,
+    pub symbol: String,
+    pub instrument_name: String,
+    pub received_on: String,
+    pub gross_amount: Option<f64>,
+    pub tax_amount: Option<f64>,
+    pub fee_amount: Option<f64>,
+    pub net_amount: Option<f64>,
+    pub currency_code: String,
+    pub note: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]

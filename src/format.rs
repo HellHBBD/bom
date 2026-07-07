@@ -1,21 +1,21 @@
 pub fn money(value: Option<f64>) -> String {
     match value {
         Some(value) => format_number(value, 0),
-        None => "-".to_string(),
+        None => "—".to_string(),
     }
 }
 
 pub fn decimal(value: Option<f64>, digits: usize) -> String {
     match value {
         Some(value) => format_number(value, digits),
-        None => "-".to_string(),
+        None => "—".to_string(),
     }
 }
 
 pub fn percent(value: Option<f64>) -> String {
     match value {
         Some(value) => format!("{}%", format_number(value * 100.0, 2)),
-        None => "-".to_string(),
+        None => "—".to_string(),
     }
 }
 
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn formats_missing_values_as_dash() {
-        assert_eq!(money(None), "-");
-        assert_eq!(percent(None), "-");
+        assert_eq!(money(None), "—");
+        assert_eq!(percent(None), "—");
     }
 }

@@ -9,3 +9,6 @@
 # SQLite runtime sidecar files
 *.sqlite-wal
 *.sqlite-shm
+
+AGENTS.md
+IMPLEMENTATION_PLAN.md

@@ -1,12 +1,13 @@
 use dioxus::prelude::*;
 
 use crate::db::{
-    load_account_assets, load_dashboard_summary, load_holding_metrics, load_legacy_dividends,
+    load_account_assets, load_dashboard_summary, load_dividend_receipts, load_holding_metrics,
+    load_legacy_dividends,
 };
 use crate::format::{decimal, money, percent};
 use crate::models::{
-    AccountAsset, DashboardSummary, HoldingMetric, LegacyDividendData, LegacyDividendMonthlyRow,
-    LegacyDividendSummaryRow,
+    AccountAsset, DashboardSummary, DividendReceiptRow, HoldingMetric, LegacyDividendData,
+    LegacyDividendMonthlyRow, LegacyDividendSummaryRow,
 };
 
 #[component]
@@ -61,6 +62,36 @@ pub fn HoldingsPage() -> Element {
             Some(Err(error)) => rsx! { StatusCard { text: format!("讀取持股資料失敗：{error}") } },
             Some(Ok(rows)) if rows.is_empty() => rsx! { StatusCard { text: "目前沒有持股資料。".to_string() } },
             Some(Ok(rows)) => rsx! { HoldingsTable { rows } },
+        }
+    }
+}
+
+#[component]
+pub fn DividendIncomePage() -> Element {
+    let receipts = use_resource(move || async move { load_dividend_receipts() });
+
+    rsx! {
+        PageHeader {
+            title: "股息收入".to_string(),
+            description: "第一階段僅查看新制逐筆股息；舊 Excel 彙總請至 Excel 歷史股息頁。".to_string(),
+        }
+
+        div { class: "stack",
+            section { class: "section-block",
+                h3 { "新制逐筆股息" }
+                Link { class: "inline-link", to: crate::routes::Route::DividendsLegacyPage {}, "查看 Excel 歷史股息彙總" }
+                match receipts() {
+                    None => rsx! { StatusCard { text: "正在載入資料…".to_string() } },
+                    Some(Err(error)) => rsx! { StatusCard { text: format!("無法讀取逐筆股息資料：{error}") } },
+                    Some(Ok(rows)) if rows.is_empty() => rsx! {
+                        section { class: "card empty-state",
+                            h3 { "目前沒有逐筆股息紀錄" }
+                            p { "這不是錯誤。第一階段不新增資料；Excel 匯入的歷史彙總保留為唯讀歷史參考。" }
+                        }
+                    },
+                    Some(Ok(rows)) => rsx! { DividendReceiptTable { rows } },
+                }
+            }
         }
     }
 }
@@ -186,6 +217,17 @@ fn DashboardCards(summary: DashboardSummary) -> Element {
                     }
                 }
             }
+            section { class: "card owner-totals",
+                h3 { "各所有權人資產總額" }
+                div { class: "owner-total-list",
+                    for owner_total in summary.owner_totals {
+                        div {
+                            span { "{owner_total.owner_name}" }
+                            strong { "{money(owner_total.value_ntd)}" }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -233,11 +275,119 @@ fn MetricCard(label: String, value: String, hint: String, accent: String) -> Ele
 }
 
 #[component]
+fn DividendReceiptTable(rows: Vec<DividendReceiptRow>) -> Element {
+    rsx! {
+        section { class: "card table-card",
+            div { class: "table-summary",
+                strong { "{rows.len()} 筆逐筆股息" }
+                span { "來源 dividend_receipt / v_dividend_receipt_amount" }
+            }
+            div { class: "table-wrap",
+                table { class: "dividend-receipt-table",
+                    thead {
+                        tr {
+                            th { "所有權人" }
+                            th { "入帳帳戶" }
+                            th { "代號" }
+                            th { "商品" }
+                            th { "入帳日期" }
+                            th { "稅前金額" }
+                            th { "稅額" }
+                            th { "費用" }
+                            th { "實收金額" }
+                            th { "幣別" }
+                            th { "備註" }
+                        }
+                    }
+                    tbody {
+                        for row in rows {
+                            tr {
+                                td { "{row.owner_name}" }
+                                td { "{row.account_name}" }
+                                td { class: "mono", "{row.symbol}" }
+                                td { class: "name-cell", "{row.instrument_name}" }
+                                td { class: "mono", "{row.received_on}" }
+                                td { class: "number", "{money(row.gross_amount)}" }
+                                td { class: "number", "{money(row.tax_amount)}" }
+                                td { class: "number", "{money(row.fee_amount)}" }
+                                td { class: "number strong", "{money(row.net_amount)}" }
+                                td { class: "mono", "{row.currency_code}" }
+                                td { "{row.note}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn LegacyDividendTables(data: LegacyDividendData) -> Element {
+    let mut owner_filter = use_signal(String::new);
+    let mut instrument_filter = use_signal(String::new);
+    let mut period_filter = use_signal(String::new);
+
+    let owner_options = unique_strings(
+        data.summaries
+            .iter()
+            .map(|row| row.owner_name.as_str())
+            .chain(data.monthly.iter().map(|row| row.owner_name.as_str())),
+    );
+    let instrument_options = unique_strings(
+        data.summaries
+            .iter()
+            .map(|row| row.instrument_name.as_str())
+            .chain(data.monthly.iter().map(|row| row.instrument_name.as_str())),
+    );
+    let period_options = unique_strings(
+        data.summaries
+            .iter()
+            .map(|row| row.period_label.as_str())
+            .chain(data.monthly.iter().map(|row| row.series_type.as_str())),
+    );
+
+    let owner_value = owner_filter();
+    let instrument_value = instrument_filter();
+    let period_value = period_filter();
+    let summaries = data
+        .summaries
+        .iter()
+        .filter(|row| owner_value.is_empty() || row.owner_name == owner_value)
+        .filter(|row| instrument_value.is_empty() || row.instrument_name == instrument_value)
+        .filter(|row| period_value.is_empty() || row.period_label == period_value)
+        .cloned()
+        .collect::<Vec<_>>();
+    let monthly = data
+        .monthly
+        .iter()
+        .filter(|row| owner_value.is_empty() || row.owner_name == owner_value)
+        .filter(|row| instrument_value.is_empty() || row.instrument_name == instrument_value)
+        .filter(|row| period_value.is_empty() || row.series_type == period_value)
+        .cloned()
+        .collect::<Vec<_>>();
+    let summary_total = summaries.iter().filter_map(|row| row.amount).sum::<f64>();
+    let monthly_total = monthly.iter().filter_map(|row| row.amount).sum::<f64>();
+
     rsx! {
         div { class: "stack",
-            LegacySummaryTable { rows: data.summaries }
-            LegacyMonthlyTable { rows: data.monthly }
+            div { class: "filters card",
+                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, on_change: move |value| owner_filter.set(value) }
+                SelectFilter { label: "商品".to_string(), value: instrument_filter(), options: instrument_options, on_change: move |value| instrument_filter.set(value) }
+                SelectFilter { label: "期間類型".to_string(), value: period_filter(), options: period_options, on_change: move |value| period_filter.set(value) }
+                div { class: "filter-total", "彙總金額：年度／累積 {money(Some(summary_total))}，月份 {money(Some(monthly_total))}" }
+                button {
+                    r#type: "button",
+                    onclick: move |_| {
+                        owner_filter.set(String::new());
+                        instrument_filter.set(String::new());
+                        period_filter.set(String::new());
+                    },
+                    "清除篩選"
+                }
+            }
+            LegacySummaryTable { rows: summaries }
+            LegacyMonthlyTable { rows: monthly }
         }
     }
 }
@@ -358,39 +508,156 @@ fn series_type_text(series_type: &str) -> &'static str {
 }
 
 #[component]
+fn SelectFilter(
+    label: String,
+    value: String,
+    options: Vec<String>,
+    on_change: EventHandler<String>,
+) -> Element {
+    rsx! {
+        label { class: "filter-field",
+            span { "{label}" }
+            select {
+                value: "{value}",
+                oninput: move |event| on_change.call(event.value()),
+                option { value: "", "全部" }
+                for option_value in options {
+                    option { value: "{option_value}", "{option_value}" }
+                }
+            }
+        }
+    }
+}
+
+fn unique_strings<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut values = values
+        .filter(|value| !value.is_empty() && *value != "-")
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn compare_optional_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    right
+        .unwrap_or(f64::NEG_INFINITY)
+        .partial_cmp(&left.unwrap_or(f64::NEG_INFINITY))
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+#[component]
 fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
+    let mut owner_filter = use_signal(String::new);
+    let mut type_filter = use_signal(String::new);
+    let mut asset_class_filter = use_signal(String::new);
+    let mut region_filter = use_signal(String::new);
+    let mut search = use_signal(String::new);
+    let mut sort_by = use_signal(|| "market_value".to_string());
+
+    let owner_options = unique_strings(rows.iter().map(|row| row.owner_name.as_str()));
+    let type_options = unique_strings(rows.iter().map(|row| row.instrument_type.as_str()));
+    let asset_class_options = unique_strings(rows.iter().map(|row| row.asset_class.as_str()));
+    let region_options = unique_strings(rows.iter().map(|row| row.region_type.as_str()));
+
+    let owner_value = owner_filter();
+    let type_value = type_filter();
+    let asset_class_value = asset_class_filter();
+    let region_value = region_filter();
+    let search_value = search().to_lowercase();
+    let sort_value = sort_by();
+    let mut filtered_rows = rows
+        .iter()
+        .filter(|row| owner_value.is_empty() || row.owner_name == owner_value)
+        .filter(|row| type_value.is_empty() || row.instrument_type == type_value)
+        .filter(|row| asset_class_value.is_empty() || row.asset_class == asset_class_value)
+        .filter(|row| region_value.is_empty() || row.region_type == region_value)
+        .filter(|row| {
+            search_value.is_empty()
+                || row.symbol.to_lowercase().contains(&search_value)
+                || row.instrument_name.to_lowercase().contains(&search_value)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let filtered_total = filtered_rows
+        .iter()
+        .filter_map(|row| row.market_value)
+        .sum::<f64>();
+
+    filtered_rows.sort_by(|left, right| match sort_value.as_str() {
+        "profit" => compare_optional_desc(left.unrealized_profit, right.unrealized_profit),
+        "return" => {
+            compare_optional_desc(left.unrealized_return_rate, right.unrealized_return_rate)
+        }
+        _ => compare_optional_desc(left.market_value, right.market_value),
+    });
+
     rsx! {
         section { class: "card table-card",
             div { class: "table-summary",
-                strong { "{rows.len()} 筆持股" }
-                span { "依目前市值由高到低排序" }
+                strong { "{filtered_rows.len()} / {rows.len()} 筆持股" }
+                span { "篩選後市值：{money(Some(filtered_total))}" }
             }
-            div { class: "table-wrap",
-                table { class: "holdings-table",
-                    thead {
-                        tr {
-                            th { "所有權人" }
-                            th { "證券帳戶" }
-                            th { "代號" }
-                            th { "商品名稱" }
-                            th { "類型" }
-                            th { "資產類別" }
-                            th { "區域" }
-                            th { "數量" }
-                            th { "平均成本" }
-                            th { "市價" }
-                            th { "總成本" }
-                            th { "市值" }
-                            th { "未實現損益" }
-                            th { "損益率" }
-                            th { "預估年配息" }
-                            th { "預估殖利率" }
-                            th { "更新日" }
+            div { class: "filters",
+                input {
+                    placeholder: "搜尋商品名稱或代號",
+                    value: "{search}",
+                    oninput: move |event| search.set(event.value()),
+                }
+                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, on_change: move |value| owner_filter.set(value) }
+                SelectFilter { label: "商品類型".to_string(), value: type_filter(), options: type_options, on_change: move |value| type_filter.set(value) }
+                SelectFilter { label: "資產類別".to_string(), value: asset_class_filter(), options: asset_class_options, on_change: move |value| asset_class_filter.set(value) }
+                SelectFilter { label: "國內／國外".to_string(), value: region_filter(), options: region_options, on_change: move |value| region_filter.set(value) }
+                select {
+                    value: "{sort_by}",
+                    oninput: move |event| sort_by.set(event.value()),
+                    option { value: "market_value", "依市值排序" }
+                    option { value: "profit", "依損益排序" }
+                    option { value: "return", "依報酬率排序" }
+                }
+                button {
+                    r#type: "button",
+                    onclick: move |_| {
+                        owner_filter.set(String::new());
+                        type_filter.set(String::new());
+                        asset_class_filter.set(String::new());
+                        region_filter.set(String::new());
+                        search.set(String::new());
+                        sort_by.set("market_value".to_string());
+                    },
+                    "清除篩選"
+                }
+            }
+            if filtered_rows.is_empty() {
+                div { class: "empty-state", h3 { "目前沒有符合條件的持股資料" } }
+            } else {
+                div { class: "table-wrap",
+                    table { class: "holdings-table",
+                        thead {
+                            tr {
+                                th { "所有權人" }
+                                th { "證券帳戶" }
+                                th { "代號" }
+                                th { "商品名稱" }
+                                th { "類型" }
+                                th { "資產類別" }
+                                th { "區域" }
+                                th { "數量" }
+                                th { "平均成本" }
+                                th { "市價" }
+                                th { "總成本" }
+                                th { "市值" }
+                                th { "未實現損益" }
+                                th { "損益率" }
+                                th { "預估年配息" }
+                                th { "預估殖利率" }
+                                th { "更新日" }
+                            }
                         }
-                    }
-                    tbody {
-                        for row in rows {
-                            HoldingRow { row }
+                        tbody {
+                            for row in filtered_rows {
+                                HoldingRow { row }
+                            }
                         }
                     }
                 }
@@ -401,30 +668,106 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
 
 #[component]
 fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
+    let mut owner_filter = use_signal(String::new);
+    let mut institution_filter = use_signal(String::new);
+    let mut asset_type_filter = use_signal(String::new);
+    let mut currency_filter = use_signal(String::new);
+    let mut search = use_signal(String::new);
+    let mut sort_by = use_signal(|| "value".to_string());
+
+    let owner_options = unique_strings(rows.iter().map(|row| row.owner_name.as_str()));
+    let institution_options = unique_strings(rows.iter().map(|row| row.institution_name.as_str()));
+    let asset_type_options = unique_strings(rows.iter().map(|row| row.asset_type.as_str()));
+    let currency_options = unique_strings(rows.iter().map(|row| row.currency_code.as_str()));
+
+    let owner_value = owner_filter();
+    let institution_value = institution_filter();
+    let asset_type_value = asset_type_filter();
+    let currency_value = currency_filter();
+    let search_value = search().to_lowercase();
+    let sort_value = sort_by();
+    let mut filtered_rows = rows
+        .iter()
+        .filter(|row| owner_value.is_empty() || row.owner_name == owner_value)
+        .filter(|row| institution_value.is_empty() || row.institution_name == institution_value)
+        .filter(|row| asset_type_value.is_empty() || row.asset_type == asset_type_value)
+        .filter(|row| currency_value.is_empty() || row.currency_code == currency_value)
+        .filter(|row| {
+            search_value.is_empty() || row.account_name.to_lowercase().contains(&search_value)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    filtered_rows.sort_by(|left, right| match sort_value.as_str() {
+        "owner" => left.owner_name.cmp(&right.owner_name),
+        "institution" => left.institution_name.cmp(&right.institution_name),
+        "asset_type" => left.asset_type.cmp(&right.asset_type),
+        _ => compare_optional_desc(left.current_value_ntd, right.current_value_ntd),
+    });
+    let filtered_total = filtered_rows
+        .iter()
+        .filter_map(|row| row.current_value_ntd)
+        .sum::<f64>();
+
     rsx! {
         section { class: "card table-card",
             div { class: "table-summary",
-                strong { "{rows.len()} 筆帳戶資產" }
-                span { "依台幣價值由高到低排序" }
+                strong { "{filtered_rows.len()} / {rows.len()} 筆帳戶資產" }
+                span { "篩選後總額：{money(Some(filtered_total))}" }
             }
-            div { class: "table-wrap",
-                table { class: "account-assets-table",
-                    thead {
-                        tr {
-                            th { "所有權人" }
-                            th { "金融機構" }
-                            th { "帳戶名稱" }
-                            th { "帳戶類型" }
-                            th { "資產類型" }
-                            th { "幣別" }
-                            th { "原幣金額" }
-                            th { "台幣價值" }
-                            th { "更新日" }
+            div { class: "filters",
+                input {
+                    placeholder: "搜尋帳戶名稱",
+                    value: "{search}",
+                    oninput: move |event| search.set(event.value()),
+                }
+                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, on_change: move |value| owner_filter.set(value) }
+                SelectFilter { label: "金融機構".to_string(), value: institution_filter(), options: institution_options, on_change: move |value| institution_filter.set(value) }
+                SelectFilter { label: "資產類型".to_string(), value: asset_type_filter(), options: asset_type_options, on_change: move |value| asset_type_filter.set(value) }
+                SelectFilter { label: "幣別".to_string(), value: currency_filter(), options: currency_options, on_change: move |value| currency_filter.set(value) }
+                select {
+                    value: "{sort_by}",
+                    oninput: move |event| sort_by.set(event.value()),
+                    option { value: "value", "依台幣價值排序" }
+                    option { value: "owner", "依所有權人排序" }
+                    option { value: "institution", "依金融機構排序" }
+                    option { value: "asset_type", "依資產類型排序" }
+                }
+                button {
+                    r#type: "button",
+                    onclick: move |_| {
+                        owner_filter.set(String::new());
+                        institution_filter.set(String::new());
+                        asset_type_filter.set(String::new());
+                        currency_filter.set(String::new());
+                        search.set(String::new());
+                        sort_by.set("value".to_string());
+                    },
+                    "清除篩選"
+                }
+            }
+            if filtered_rows.is_empty() {
+                div { class: "empty-state", h3 { "目前沒有符合條件的帳戶資產資料" } }
+            } else {
+                div { class: "table-wrap",
+                    table { class: "account-assets-table",
+                        thead {
+                            tr {
+                                th { "所有權人" }
+                                th { "金融機構" }
+                                th { "帳戶名稱" }
+                                th { "帳戶類型" }
+                                th { "資產類型" }
+                                th { "幣別" }
+                                th { "投入金額" }
+                                th { "數量" }
+                                th { "台幣價值" }
+                                th { "更新日" }
+                            }
                         }
-                    }
-                    tbody {
-                        for row in rows {
-                            AccountAssetRow { row }
+                        tbody {
+                            for row in filtered_rows {
+                                AccountAssetRow { row }
+                            }
                         }
                     }
                 }
@@ -443,7 +786,8 @@ fn AccountAssetRow(row: AccountAsset) -> Element {
             td { "{row.account_type}" }
             td { "{row.asset_type}" }
             td { class: "mono", "{row.currency_code}" }
-            td { class: "number", "{decimal(row.original_amount, 2)}" }
+            td { class: "number", "{money(row.invested_amount)}" }
+            td { class: "number", "{decimal(row.quantity, 2)}" }
             td { class: "number strong", "{money(row.current_value_ntd)}" }
             td { class: "mono", "{row.snapshot_date}" }
         }

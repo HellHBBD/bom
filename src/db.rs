@@ -2,16 +2,17 @@
 use std::path::PathBuf;
 
 #[cfg(not(target_arch = "wasm32"))]
-use rusqlite::{Connection, Result as SqlResult};
+use rusqlite::{Connection, OpenFlags, Result as SqlResult};
 
-use crate::models::{AccountAsset, DashboardSummary, HoldingMetric, LegacyDividendData};
+use crate::models::{
+    AccountAsset, DashboardSummary, DividendReceiptRow, HoldingMetric, LegacyDividendData,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::models::{LegacyDividendMonthlyRow, LegacyDividendSummaryRow};
+use crate::models::{LegacyDividendMonthlyRow, LegacyDividendSummaryRow, OwnerAssetTotal};
 
 #[cfg(not(target_arch = "wasm32"))]
 const DATABASE_PATH: &str = "assets/data.sqlite";
-
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_holding_metrics() -> Result<Vec<HoldingMetric>, String> {
     load_holding_metrics_native().map_err(|error| error.to_string())
@@ -32,6 +33,11 @@ pub fn load_legacy_dividends() -> Result<LegacyDividendData, String> {
     load_legacy_dividends_native().map_err(|error| error.to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_dividend_receipts() -> Result<Vec<DividendReceiptRow>, String> {
+    load_dividend_receipts_native().map_err(|error| error.to_string())
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn load_holding_metrics() -> Result<Vec<HoldingMetric>, String> {
     Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
@@ -52,9 +58,59 @@ pub fn load_legacy_dividends() -> Result<LegacyDividendData, String> {
     Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn load_dividend_receipts() -> Result<Vec<DividendReceiptRow>, String> {
+    Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_dividend_receipts_native() -> SqlResult<Vec<DividendReceiptRow>> {
+    let connection = open_database()?;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            COALESCE(p.display_name, '未指定') AS owner_name,
+            COALESCE(a.display_name, '帳戶 #' || r.account_id) AS account_name,
+            COALESCE(i.symbol, '-') AS symbol,
+            COALESCE(i.name, '未命名商品') AS instrument_name,
+            COALESCE(r.received_on, '-') AS received_on,
+            r.gross_amount_text,
+            r.tax_amount_text,
+            r.fee_amount_text,
+            r.net_amount,
+            COALESCE(r.currency_code, '-') AS currency_code,
+            COALESCE(r.note, '') AS note
+        FROM v_dividend_receipt_amount r
+        LEFT JOIN account a ON a.account_id = r.account_id
+        LEFT JOIN account_owner ao ON ao.account_id = a.account_id
+        LEFT JOIN person p ON p.person_id = ao.person_id
+        LEFT JOIN instrument i ON i.instrument_id = r.instrument_id
+        ORDER BY r.received_on DESC, i.name ASC
+        "#,
+    )?;
+
+    let rows = statement.query_map([], |row| {
+        Ok(DividendReceiptRow {
+            owner_name: row.get(0)?,
+            account_name: row.get(1)?,
+            symbol: row.get(2)?,
+            instrument_name: row.get(3)?,
+            received_on: row.get(4)?,
+            gross_amount: parse_number_text(row.get(5)?),
+            tax_amount: parse_number_text(row.get(6)?),
+            fee_amount: parse_number_text(row.get(7)?),
+            net_amount: row.get(8)?,
+            currency_code: row.get(9)?,
+            note: row.get(10)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load_legacy_dividends_native() -> SqlResult<LegacyDividendData> {
-    let connection = Connection::open(database_path())?;
+    let connection = open_database()?;
 
     Ok(LegacyDividendData {
         summaries: load_legacy_dividend_summaries(&connection)?,
@@ -150,35 +206,48 @@ fn load_legacy_dividend_monthly(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_dashboard_summary_native() -> SqlResult<DashboardSummary> {
-    let connection = Connection::open(database_path())?;
-    let (
-        account_asset_count,
-        account_assets,
-        account_asset_missing_value_count,
-        latest_account_asset_date,
-    ) = connection.query_row(
+    let connection = open_database()?;
+    let (total_assets, account_assets, investment_assets) = connection.query_row(
         r#"
         SELECT
-            COUNT(*),
-            SUM(current_value_ntd),
-            COUNT(CASE WHEN current_value_ntd IS NULL THEN 1 END),
-            MAX(snapshot_date)
-        FROM v_account_asset_value
+            SUM(value_ntd),
+            SUM(CASE WHEN source_type = 'ACCOUNT_ASSET' THEN value_ntd END),
+            SUM(CASE WHEN source_type = 'HOLDING' THEN value_ntd END)
+        FROM v_asset_total
         "#,
         [],
         |row| {
             Ok((
-                row.get::<_, i64>(0)?,
+                row.get::<_, Option<f64>>(0)?,
                 row.get::<_, Option<f64>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<f64>>(2)?,
             ))
         },
     )?;
 
+    let owner_totals = load_owner_totals(&connection)?;
+
+    let (account_asset_count, account_asset_missing_value_count, latest_account_asset_date) =
+        connection.query_row(
+            r#"
+        SELECT
+            COUNT(*),
+            COUNT(CASE WHEN current_value_ntd IS NULL THEN 1 END),
+            MAX(snapshot_date)
+        FROM v_account_asset_value
+        "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+
     let (
         holding_count,
-        investment_assets,
         holding_missing_market_value_count,
         holding_missing_dividend_count,
         estimated_annual_dividend,
@@ -206,7 +275,6 @@ fn load_dashboard_summary_native() -> SqlResult<DashboardSummary> {
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, Option<f64>>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, Option<f64>>(4)?,
@@ -215,7 +283,6 @@ fn load_dashboard_summary_native() -> SqlResult<DashboardSummary> {
         },
     )?;
 
-    let total_assets = add_optional(account_assets, investment_assets);
     let estimated_monthly_dividend = estimated_annual_dividend.map(|value| value / 12.0);
 
     Ok(DashboardSummary {
@@ -231,22 +298,34 @@ fn load_dashboard_summary_native() -> SqlResult<DashboardSummary> {
         estimated_monthly_dividend,
         latest_account_asset_date,
         latest_holding_date,
+        owner_totals,
     })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn add_optional(left: Option<f64>, right: Option<f64>) -> Option<f64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
+fn load_owner_totals(connection: &Connection) -> SqlResult<Vec<OwnerAssetTotal>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT COALESCE(owner_name, '未指定') AS owner_name, SUM(value_ntd)
+        FROM v_asset_total
+        GROUP BY owner_name
+        ORDER BY SUM(value_ntd) DESC
+        "#,
+    )?;
+
+    let rows = statement.query_map([], |row| {
+        Ok(OwnerAssetTotal {
+            owner_name: row.get(0)?,
+            value_ntd: row.get(1)?,
+        })
+    })?;
+
+    rows.collect()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_account_assets_native() -> SqlResult<Vec<AccountAsset>> {
-    let connection = Connection::open(database_path())?;
+    let connection = open_database()?;
     let mut statement = connection.prepare(
         r#"
         SELECT
@@ -278,22 +357,14 @@ fn load_account_assets_native() -> SqlResult<Vec<AccountAsset>> {
             account_type: row.get(3)?,
             asset_type: row.get(4)?,
             currency_code: row.get(5)?,
-            original_amount: first_number([
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-            ]),
+            quantity: parse_number_text(row.get::<_, Option<String>>(6)?),
+            invested_amount: parse_number_text(row.get::<_, Option<String>>(8)?),
             current_value_ntd: row.get(9)?,
             snapshot_date: row.get(10)?,
         })
     })?;
 
     rows.collect()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn first_number<const N: usize>(values: [Option<String>; N]) -> Option<f64> {
-    values.into_iter().find_map(parse_number_text)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -306,30 +377,9 @@ fn parse_number_text(value: Option<String>) -> Option<f64> {
     normalized.parse::<f64>().ok()
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_first_valid_number_text() {
-        assert_eq!(
-            first_number([Some("".to_string()), Some("1,234.5".to_string())]),
-            Some(1234.5)
-        );
-    }
-
-    #[test]
-    fn ignores_invalid_number_text() {
-        assert_eq!(
-            first_number([Some("not a number".to_string()), Some("42".to_string())]),
-            Some(42.0)
-        );
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
-    let connection = Connection::open(database_path())?;
+    let connection = open_database()?;
     let mut statement = connection.prepare(
         r#"
         SELECT
@@ -398,4 +448,9 @@ fn database_path() -> PathBuf {
     }
 
     PathBuf::from(DATABASE_PATH)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_database() -> SqlResult<Connection> {
+    Connection::open_with_flags(database_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
