@@ -263,9 +263,7 @@ mod tests {
             ..sample_input()
         };
         let validated = validate_account_asset_input(&input).expect("valid");
-        let stored = validated
-            .current_value_override
-            .map(|v| normalize_decimal_text(v));
+        let stored = validated.current_value_override.map(normalize_decimal_text);
         assert_eq!(stored, Some("100.5".to_string()));
     }
 
