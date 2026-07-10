@@ -2,8 +2,6 @@ name: Windows CI and Dioxus Bundle
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
 
@@ -35,6 +33,10 @@ concurrency:
 jobs:
   check:
     name: Windows checks
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
+      (github.event_name == 'workflow_dispatch' && !inputs.bundle_windows)
     runs-on: windows-latest
 
     steps:
@@ -69,11 +71,207 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-  bundle-windows:
-    name: Bundle Windows EXE
+  bundle-windows-manual:
+    name: Bundle Windows EXE (Manual)
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.bundle_windows)
+      github.event_name == 'workflow_dispatch' && inputs.bundle_windows
+    runs-on: windows-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Show Rust versions
+        run: |
+          rustc -Vv
+          cargo -V
+          cargo clippy -V
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Validate bundle inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredFiles = @(
+            "Cargo.toml",
+            "Cargo.lock",
+            "Dioxus.toml",
+            "assets\data.sqlite"
+          )
+
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file)) {
+              throw "Required bundle file not found: $file"
+            }
+          }
+
+          Write-Host "Bundle input files are present."
+
+      - name: Install pinned Dioxus CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $assetName = "dx-x86_64-pc-windows-msvc.zip"
+          $checksumName = "dx-x86_64-pc-windows-msvc.sha256"
+          $baseUrl = "https://github.com/DioxusLabs/dioxus/releases/download/$env:DX_VERSION"
+          $zipPath = Join-Path $env:RUNNER_TEMP $assetName
+          $checksumPath = Join-Path $env:RUNNER_TEMP $checksumName
+          $extractPath = Join-Path $env:RUNNER_TEMP "dioxus-cli"
+
+          Invoke-WebRequest -Uri "$baseUrl/$assetName" -OutFile $zipPath
+          Invoke-WebRequest -Uri "$baseUrl/$checksumName" -OutFile $checksumPath
+
+          $checksumText = Get-Content $checksumPath -Raw
+          $expectedHash = [regex]::Match($checksumText, "[A-Fa-f0-9]{64}").Value.ToLowerInvariant()
+
+          if (-not $expectedHash) {
+            throw "Could not parse the expected Dioxus CLI SHA-256."
+          }
+
+          $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          Write-Host "Expected SHA-256: $expectedHash"
+          Write-Host "Actual SHA-256:   $actualHash"
+
+          if ($actualHash -ne $expectedHash) {
+            throw "Dioxus CLI SHA-256 verification failed."
+          }
+
+          if (Test-Path $extractPath) {
+            Remove-Item -Path $extractPath -Recurse -Force
+          }
+
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+          $dxExecutable = Get-ChildItem -Path $extractPath -Recurse -Filter "dx.exe" -File |
+            Select-Object -First 1
+
+          if (-not $dxExecutable) {
+            throw "dx.exe was not found in the downloaded archive."
+          }
+
+          $dxExecutable.Directory.FullName |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          Write-Host "Dioxus CLI location: $($dxExecutable.FullName)"
+          & $dxExecutable.FullName --version
+
+      - name: Show dx bundle help
+        shell: pwsh
+        run: dx bundle --help
+
+      - name: Bundle Windows desktop app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+
+          $output = @(
+            & dx bundle `
+              --desktop `
+              --release `
+              --features bundle `
+              --package-types nsis `
+              --json-output `
+              --verbose 2>&1
+          )
+
+          $exitCode = $LASTEXITCODE
+
+          $output |
+            ForEach-Object { $_.ToString() } |
+            Tee-Object -FilePath "dist\dx-bundle.log" |
+            ForEach-Object { Write-Host $_ }
+
+          if ($exitCode -ne 0) {
+            throw "dx bundle failed with exit code $exitCode."
+          }
+
+          $resultLine = $output |
+            ForEach-Object { $_.ToString() } |
+            Where-Object { $_ -match '"BundleOutput"' } |
+            Select-Object -Last 1
+
+          if (-not $resultLine) {
+            throw "BundleOutput was not found in dx JSON output."
+          }
+
+          $envelope = $resultLine | ConvertFrom-Json
+
+          if ($envelope.json -is [string]) {
+            $bundleResult = $envelope.json | ConvertFrom-Json
+          }
+          else {
+            $bundleResult = $envelope
+          }
+
+          $bundlePaths = @($bundleResult.BundleOutput.bundles)
+
+          if ($bundlePaths.Count -eq 0) {
+            throw "dx did not report any bundle output."
+          }
+
+          Write-Host "Reported bundle paths:"
+          foreach ($path in $bundlePaths) {
+            Write-Host " - $path"
+          }
+
+          $exePath = $bundlePaths |
+            Where-Object { [System.IO.Path]::GetExtension($_) -ieq ".exe" } |
+            Select-Object -First 1
+
+          if (-not $exePath) {
+            Write-Host "Bundle output did not contain an EXE:"
+            $bundlePaths | ForEach-Object { Write-Host " - $_" }
+            throw "No Windows NSIS EXE was found in BundleOutput."
+          }
+
+          $resolvedExe = Resolve-Path $exePath
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $buildLabel = "test-$env:GITHUB_RUN_NUMBER-$shortSha"
+          $safeBuildLabel = $buildLabel -replace '[^A-Za-z0-9._-]', '_'
+          $fileName = "$env:APP_NAME-$safeBuildLabel-windows-x86_64-setup.exe"
+          $destination = Join-Path "dist" $fileName
+
+          Copy-Item -Path $resolvedExe.Path -Destination $destination -Force
+
+          $releaseHash = (Get-FileHash -Path $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$releaseHash  $fileName" | Set-Content -Path "$destination.sha256" -Encoding ascii
+
+          Write-Host ""
+          Write-Host "Windows NSIS installer created:"
+          Write-Host "  $destination"
+          Write-Host ""
+          Write-Host "SHA-256:"
+          Write-Host "  $releaseHash"
+
+      - name: Upload Windows bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-windows-${{ github.ref_name }}-${{ github.run_number }}
+          path: |
+            dist/*.exe
+            dist/*.sha256
+            dist/dx-bundle.log
+          if-no-files-found: error
+          retention-days: 30
+
+  bundle-windows-release:
+    name: Bundle Windows EXE (Release)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
       - check
     runs-on: windows-latest
