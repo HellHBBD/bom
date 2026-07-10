@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::open_writable_database;
+use crate::db::open_manual_write_database;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
 
@@ -62,19 +62,19 @@ pub fn validate_dividend_receipt_input(
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn insert_manual_dividend_receipt(input: DividendReceiptInput) -> AppResult<()> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     insert_manual_dividend_receipt_with_connection(&mut connection, input)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn update_manual_dividend_receipt(input: DividendReceiptUpdateInput) -> AppResult<()> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     update_manual_dividend_receipt_with_connection(&mut connection, input)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn delete_manual_dividend_receipt(input: DividendReceiptDeleteInput) -> AppResult<()> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     delete_manual_dividend_receipt_with_connection(&mut connection, input)
 }
 

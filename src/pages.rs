@@ -320,6 +320,7 @@ fn QuickPriceUpdateRowView(
 #[component]
 pub fn DividendIncomePage() -> Element {
     let mut data_version = use_context::<Signal<u64>>();
+    let create_modal_key = "create-dividend-receipt-modal";
     let receipts = use_resource(move || async move {
         let _ = data_version();
         load_dividend_receipts()
@@ -383,6 +384,7 @@ pub fn DividendIncomePage() -> Element {
                 Some(Err(error)) => rsx! { StatusCard { text: format!("讀取新增股息選項失敗：{error}") } },
                 Some(Ok(options)) => rsx! {
                     DividendReceiptUpsertModal {
+                        key: "{create_modal_key}",
                         options,
                         institutions: institution_options()
                             .and_then(|result| result.ok())
@@ -415,6 +417,7 @@ pub fn DividendIncomePage() -> Element {
                 Some(Err(error)) => rsx! { StatusCard { text: format!("讀取編輯股息選項失敗：{error}") } },
                 Some(Ok(options)) => rsx! {
                     DividendReceiptUpsertModal {
+                        key: "edit-dividend-receipt-modal-{receipt.receipt_id}",
                         options,
                         institutions: institution_options()
                             .and_then(|result| result.ok())
@@ -970,6 +973,54 @@ struct DividendReceiptInstrumentChoice {
     currency_code: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct DividendReceiptModalForm {
+    account_id: String,
+    instrument_id: String,
+    received_on: String,
+    net_amount: String,
+    currency_code: String,
+    note: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AccountCreateModalForm {
+    display_name: String,
+    institution_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InstrumentCreateModalForm {
+    symbol: String,
+    name: String,
+    trading_currency_code: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AccountAssetEditForm {
+    snapshot_date: String,
+    quantity: String,
+    current_value_override: String,
+    invested_amount: String,
+    note: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct HoldingEditForm {
+    as_of_date: String,
+    quantity_text: String,
+    average_cost_text: String,
+    note: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct HoldingDividendAssumptionForm {
+    effective_date: String,
+    payments_per_year: String,
+    latest_dividend_per_unit: String,
+    estimated_annual_dividend_per_unit: String,
+}
+
 #[component]
 fn DividendReceiptUpsertModal(
     options: DividendReceiptFormOptions,
@@ -983,6 +1034,10 @@ fn DividendReceiptUpsertModal(
     on_instrument_created: EventHandler<(i64, String)>,
 ) -> Element {
     let is_editing = receipt.is_some();
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
     let receipt_for_account = receipt.clone();
     let receipt_for_instrument = receipt.clone();
     let receipt_for_received_on = receipt.clone();
@@ -1013,11 +1068,8 @@ fn DividendReceiptUpsertModal(
     let account_choices_for_select = account_choices.clone();
     let instrument_choices_for_select = instrument_choices.clone();
     let instrument_choices_for_lookup = instrument_choices.clone();
-    let account_choices_for_effect = account_choices.clone();
-    let instrument_choices_for_effect = instrument_choices.clone();
-
-    let mut account_id = use_signal(|| {
-        receipt_for_account
+    let initial_form = DividendReceiptModalForm {
+        account_id: receipt_for_account
             .as_ref()
             .map(|row| row.account_id.to_string())
             .or_else(|| {
@@ -1025,10 +1077,8 @@ fn DividendReceiptUpsertModal(
                     .first()
                     .map(|option| option.account_id.to_string())
             })
-            .unwrap_or_default()
-    });
-    let mut instrument_id = use_signal(|| {
-        receipt_for_instrument
+            .unwrap_or_default(),
+        instrument_id: receipt_for_instrument
             .as_ref()
             .map(|row| row.instrument_id.to_string())
             .or_else(|| {
@@ -1036,23 +1086,17 @@ fn DividendReceiptUpsertModal(
                     .first()
                     .map(|option| option.instrument_id.to_string())
             })
-            .unwrap_or_default()
-    });
-    let mut received_on = use_signal(|| {
-        receipt_for_received_on
+            .unwrap_or_default(),
+        received_on: receipt_for_received_on
             .as_ref()
             .map(|row| row.received_on.clone())
-            .unwrap_or_default()
-    });
-    let mut net_amount = use_signal(|| {
-        receipt_for_net_amount
+            .unwrap_or_else(|| today.clone()),
+        net_amount: receipt_for_net_amount
             .as_ref()
             .and_then(|row| row.net_amount)
             .map(|value| value.to_string())
-            .unwrap_or_default()
-    });
-    let mut currency_code = use_signal(|| {
-        receipt_for_currency_code
+            .unwrap_or_default(),
+        currency_code: receipt_for_currency_code
             .as_ref()
             .map(|row| row.currency_code.clone())
             .or_else(|| {
@@ -1061,48 +1105,37 @@ fn DividendReceiptUpsertModal(
                     .map(|option| option.currency_code.clone())
             })
             .or_else(|| options.currency_codes.first().cloned())
-            .unwrap_or_else(|| "NTD".to_string())
-    });
-    let mut note = use_signal(|| {
-        receipt_for_note
+            .unwrap_or_else(|| "NTD".to_string()),
+        note: receipt_for_note
             .as_ref()
             .map(|row| row.note.clone())
-            .unwrap_or_default()
-    });
+            .unwrap_or_default(),
+    };
+    let initial_form_snapshot = use_signal(|| initial_form.clone());
+
+    let mut account_id = use_signal(|| initial_form.account_id.clone());
+    let mut instrument_id = use_signal(|| initial_form.instrument_id.clone());
+    let mut received_on = use_signal(|| initial_form.received_on.clone());
+    let mut net_amount = use_signal(|| initial_form.net_amount.clone());
+    let mut currency_code = use_signal(|| initial_form.currency_code.clone());
+    let mut note = use_signal(|| initial_form.note.clone());
     let mut is_saving = use_signal(|| false);
     let mut is_deleting = use_signal(|| false);
     let mut error_message = use_signal(String::new);
     let mut confirm_delete = use_signal(|| false);
+    let mut confirm_close = use_signal(|| false);
     let mut creating_account = use_signal(|| false);
     let mut creating_instrument = use_signal(|| false);
 
-    use_effect(move || {
-        if !is_editing && received_on().is_empty() {
-            received_on.set(
-                chrono::Local::now()
-                    .date_naive()
-                    .format("%Y-%m-%d")
-                    .to_string(),
-            );
-        }
-    });
-
-    use_effect(move || {
-        if account_id().is_empty() {
-            if let Some(first_account) = account_choices_for_effect.first() {
-                account_id.set(first_account.account_id.to_string());
-            }
-        }
-    });
-
-    use_effect(move || {
-        if instrument_id().is_empty() {
-            if let Some(first_instrument) = instrument_choices_for_effect.first() {
-                instrument_id.set(first_instrument.instrument_id.to_string());
-                currency_code.set(first_instrument.currency_code.clone());
-            }
-        }
-    });
+    let interaction_locked = is_saving() || is_deleting();
+    let is_dirty = DividendReceiptModalForm {
+        account_id: account_id(),
+        instrument_id: instrument_id(),
+        received_on: received_on(),
+        net_amount: net_amount(),
+        currency_code: currency_code(),
+        note: note(),
+    } != initial_form_snapshot();
 
     rsx! {
         div { class: "modal-backdrop",
@@ -1119,7 +1152,17 @@ fn DividendReceiptUpsertModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
                         "關閉"
                     }
                 }
@@ -1132,7 +1175,7 @@ fn DividendReceiptUpsertModal(
                         select {
                             value: "{account_id}",
                             oninput: move |event| account_id.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             for option in account_choices_for_select {
                                 option { value: "{option.account_id}", "{option.label}" }
                             }
@@ -1140,7 +1183,7 @@ fn DividendReceiptUpsertModal(
                         button {
                             r#type: "button",
                             class: "ghost-button inline-action",
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             onclick: move |_| creating_account.set(true),
                             "＋新增帳戶"
                         }
@@ -1159,7 +1202,7 @@ fn DividendReceiptUpsertModal(
                                     currency_code.set(selected.currency_code.clone());
                                 }
                             },
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             for option in instrument_choices_for_select {
                                 option { value: "{option.instrument_id}", "{option.label}" }
                             }
@@ -1167,7 +1210,7 @@ fn DividendReceiptUpsertModal(
                         button {
                             r#type: "button",
                             class: "ghost-button inline-action",
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             onclick: move |_| creating_instrument.set(true),
                             "＋新增商品"
                         }
@@ -1178,7 +1221,7 @@ fn DividendReceiptUpsertModal(
                             r#type: "date",
                             value: "{received_on}",
                             oninput: move |event| received_on.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                         }
                     }
                     label { class: "form-field",
@@ -1186,7 +1229,7 @@ fn DividendReceiptUpsertModal(
                         input {
                             value: "{net_amount}",
                             oninput: move |event| net_amount.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "1000.50",
                         }
                     }
@@ -1195,7 +1238,7 @@ fn DividendReceiptUpsertModal(
                         select {
                             value: "{currency_code}",
                             oninput: move |event| currency_code.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             for currency in &options.currency_codes {
                                 option { value: "{currency}", "{currency}" }
                             }
@@ -1206,7 +1249,7 @@ fn DividendReceiptUpsertModal(
                         textarea {
                             value: "{note}",
                             oninput: move |event| note.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             rows: "3",
                             placeholder: "選填",
                         }
@@ -1216,21 +1259,45 @@ fn DividendReceiptUpsertModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        disabled: is_saving(),
+                        disabled: interaction_locked,
                         onclick: move |_| {
                             error_message.set(String::new());
-                            net_amount.set(String::new());
-                            note.set(String::new());
+                            confirm_close.set(false);
+                            confirm_delete.set(false);
+                            let reset_form = initial_form_snapshot();
+                            account_id.set(reset_form.account_id);
+                            instrument_id.set(reset_form.instrument_id);
+                            received_on.set(reset_form.received_on);
+                            net_amount.set(reset_form.net_amount);
+                            currency_code.set(reset_form.currency_code);
+                            note.set(reset_form.note);
                         },
-                        "清空"
+                        "還原"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
+                        "取消"
                     }
                     if allow_delete {
                         button {
                             r#type: "button",
                             class: "ghost-button danger",
-                            disabled: is_saving() || is_deleting(),
+                            disabled: interaction_locked,
                             onclick: move |_| {
                                 error_message.set(String::new());
+                                confirm_close.set(false);
                                 confirm_delete.set(true);
                             },
                             "刪除"
@@ -1239,9 +1306,9 @@ fn DividendReceiptUpsertModal(
                     button {
                         r#type: "button",
                         class: "primary-button",
-                        disabled: is_saving(),
+                        disabled: interaction_locked,
                         onclick: move |_| {
-                            if is_saving() {
+                            if interaction_locked {
                                 return;
                             }
 
@@ -1257,6 +1324,7 @@ fn DividendReceiptUpsertModal(
 
                             let mut is_saving = is_saving;
                             let mut error_message = error_message;
+                            let mut confirm_close = confirm_close;
                             let receipt_id = receipt_for_save.as_ref().map(|row| row.receipt_id);
 
                             spawn(async move {
@@ -1286,7 +1354,10 @@ fn DividendReceiptUpsertModal(
                                 };
 
                                 match result {
-                                    Ok(message) => on_saved.call(message),
+                                    Ok(message) => {
+                                        confirm_close.set(false);
+                                        on_saved.call(message);
+                                    }
                                     Err(error) => error_message.set(error.to_string()),
                                 }
 
@@ -1323,6 +1394,7 @@ fn DividendReceiptUpsertModal(
                                     }
 
                                     is_deleting.set(true);
+                                    confirm_close.set(false);
                                     error_message.set(String::new());
                                     let receipt_id = receipt_for_delete
                                         .as_ref()
@@ -1341,6 +1413,30 @@ fn DividendReceiptUpsertModal(
                                     });
                                 },
                                 "確認刪除"
+                            }
+                        }
+                    }
+                }
+                if confirm_close() {
+                    div { class: "delete-confirmation",
+                        p { "尚未儲存變更，確定要關閉嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| confirm_close.set(false),
+                                "繼續編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| {
+                                    confirm_close.set(false);
+                                    on_close.call(());
+                                },
+                                "確認關閉"
                             }
                         }
                     }
@@ -1379,27 +1475,25 @@ fn AccountCreateModal(
     on_close: EventHandler<()>,
     on_created: EventHandler<i64>,
 ) -> Element {
-    let mut display_name = use_signal(String::new);
-    let institutions_for_memo = institutions.clone();
-    let institutions_for_effect = institutions.clone();
-    let institution_count = use_memo(move || institutions_for_memo.len());
-    let mut institution_id = use_signal(|| {
-        institutions
+    let initial_form = AccountCreateModalForm {
+        display_name: String::new(),
+        institution_id: institutions
             .first()
             .map(|institution| institution.institution_id.to_string())
-            .unwrap_or_default()
-    });
+            .unwrap_or_default(),
+    };
+    let initial_form_snapshot = use_signal(|| initial_form.clone());
+    let mut display_name = use_signal(|| initial_form.display_name.clone());
+    let mut institution_id = use_signal(|| initial_form.institution_id.clone());
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
+    let mut confirm_close = use_signal(|| false);
 
-    use_effect(move || {
-        let _ = institution_count();
-        if institution_id().is_empty() {
-            if let Some(first) = institutions_for_effect.first() {
-                institution_id.set(first.institution_id.to_string());
-            }
-        }
-    });
+    let interaction_locked = is_saving();
+    let is_dirty = AccountCreateModalForm {
+        display_name: display_name(),
+        institution_id: institution_id(),
+    } != initial_form_snapshot();
 
     rsx! {
         div { class: "modal-backdrop",
@@ -1412,7 +1506,17 @@ fn AccountCreateModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
                         "關閉"
                     }
                 }
@@ -1425,7 +1529,7 @@ fn AccountCreateModal(
                         input {
                             value: "{display_name}",
                             oninput: move |event| display_name.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "新帳戶",
                         }
                     }
@@ -1434,7 +1538,7 @@ fn AccountCreateModal(
                         select {
                             value: "{institution_id}",
                             oninput: move |event| institution_id.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             for institution in &institutions {
                                 option { value: "{institution.institution_id}", "{institution.name}" }
                             }
@@ -1445,16 +1549,38 @@ fn AccountCreateModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        disabled: is_saving(),
-                        onclick: move |_| on_close.call(()),
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
                         "取消"
                     }
                     button {
                         r#type: "button",
-                        class: "primary-button",
-                        disabled: is_saving(),
+                        class: "ghost-button",
+                        disabled: interaction_locked,
                         onclick: move |_| {
-                            if is_saving() {
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            display_name.set(reset_form.display_name);
+                            institution_id.set(reset_form.institution_id);
+                        },
+                        "還原"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
                                 return;
                             }
 
@@ -1466,16 +1592,44 @@ fn AccountCreateModal(
                             };
                             let mut is_saving = is_saving;
                             let mut error_message = error_message;
+                            let mut confirm_close = confirm_close;
 
                             spawn(async move {
                                 match run_account_create(input).await {
-                                    Ok(account_id) => on_created.call(account_id),
+                                    Ok(account_id) => {
+                                        confirm_close.set(false);
+                                        on_created.call(account_id);
+                                    }
                                     Err(error) => error_message.set(error.to_string()),
                                 }
                                 is_saving.set(false);
                             });
                         },
                         if is_saving() { "儲存中..." } else { "儲存帳戶" }
+                    }
+                }
+                if confirm_close() {
+                    div { class: "delete-confirmation",
+                        p { "尚未儲存變更，確定要關閉嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| confirm_close.set(false),
+                                "繼續編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| {
+                                    confirm_close.set(false);
+                                    on_close.call(());
+                                },
+                                "確認關閉"
+                            }
+                        }
                     }
                 }
             }
@@ -1489,28 +1643,28 @@ fn InstrumentCreateModal(
     on_close: EventHandler<()>,
     on_created: EventHandler<(i64, String)>,
 ) -> Element {
-    let mut symbol = use_signal(String::new);
-    let mut name = use_signal(String::new);
-    let currency_codes_for_memo = currency_codes.clone();
-    let currency_codes_for_effect = currency_codes.clone();
-    let currency_count = use_memo(move || currency_codes_for_memo.len());
-    let mut trading_currency_code = use_signal(|| {
-        currency_codes
+    let initial_form = InstrumentCreateModalForm {
+        symbol: String::new(),
+        name: String::new(),
+        trading_currency_code: currency_codes
             .first()
             .cloned()
-            .unwrap_or_else(|| "NTD".to_string())
-    });
+            .unwrap_or_else(|| "NTD".to_string()),
+    };
+    let initial_form_snapshot = use_signal(|| initial_form.clone());
+    let mut symbol = use_signal(|| initial_form.symbol.clone());
+    let mut name = use_signal(|| initial_form.name.clone());
+    let mut trading_currency_code = use_signal(|| initial_form.trading_currency_code.clone());
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
+    let mut confirm_close = use_signal(|| false);
 
-    use_effect(move || {
-        let _ = currency_count();
-        if trading_currency_code().is_empty() {
-            if let Some(first) = currency_codes_for_effect.first() {
-                trading_currency_code.set(first.clone());
-            }
-        }
-    });
+    let interaction_locked = is_saving();
+    let is_dirty = InstrumentCreateModalForm {
+        symbol: symbol(),
+        name: name(),
+        trading_currency_code: trading_currency_code(),
+    } != initial_form_snapshot();
 
     rsx! {
         div { class: "modal-backdrop",
@@ -1523,7 +1677,17 @@ fn InstrumentCreateModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
                         "關閉"
                     }
                 }
@@ -1536,7 +1700,7 @@ fn InstrumentCreateModal(
                         input {
                             value: "{symbol}",
                             oninput: move |event| symbol.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "ABC",
                         }
                     }
@@ -1545,7 +1709,7 @@ fn InstrumentCreateModal(
                         input {
                             value: "{name}",
                             oninput: move |event| name.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "新商品",
                         }
                     }
@@ -1554,7 +1718,7 @@ fn InstrumentCreateModal(
                         select {
                             value: "{trading_currency_code}",
                             oninput: move |event| trading_currency_code.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             for currency in &currency_codes {
                                 option { value: "{currency}", "{currency}" }
                             }
@@ -1565,16 +1729,39 @@ fn InstrumentCreateModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        disabled: is_saving(),
-                        onclick: move |_| on_close.call(()),
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
                         "取消"
                     }
                     button {
                         r#type: "button",
-                        class: "primary-button",
-                        disabled: is_saving(),
+                        class: "ghost-button",
+                        disabled: interaction_locked,
                         onclick: move |_| {
-                            if is_saving() {
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            symbol.set(reset_form.symbol);
+                            name.set(reset_form.name);
+                            trading_currency_code.set(reset_form.trading_currency_code);
+                        },
+                        "還原"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if interaction_locked {
                                 return;
                             }
 
@@ -1588,16 +1775,44 @@ fn InstrumentCreateModal(
                             let created_currency_code = trading_currency_code();
                             let mut is_saving = is_saving;
                             let mut error_message = error_message;
+                            let mut confirm_close = confirm_close;
 
                             spawn(async move {
                                 match run_instrument_create(input).await {
-                                    Ok(instrument_id) => on_created.call((instrument_id, created_currency_code)),
+                                    Ok(instrument_id) => {
+                                        confirm_close.set(false);
+                                        on_created.call((instrument_id, created_currency_code));
+                                    }
                                     Err(error) => error_message.set(error.to_string()),
                                 }
                                 is_saving.set(false);
                             });
                         },
                         if is_saving() { "儲存中..." } else { "儲存商品" }
+                    }
+                }
+                if confirm_close() {
+                    div { class: "delete-confirmation",
+                        p { "尚未儲存變更，確定要關閉嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| confirm_close.set(false),
+                                "繼續編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| {
+                                    confirm_close.set(false);
+                                    on_close.call(());
+                                },
+                                "確認關閉"
+                            }
+                        }
                     }
                 }
             }
@@ -2440,13 +2655,30 @@ fn AccountAssetEditModal(
         .format("%Y-%m-%d")
         .to_string();
 
-    let mut snapshot_date = use_signal(|| {
-        if asset.snapshot_date == "-" {
+    let initial_form = AccountAssetEditForm {
+        snapshot_date: if asset.snapshot_date == "-" {
             today
         } else {
             asset.snapshot_date.clone()
-        }
-    });
+        },
+        quantity: if is_foreign {
+            asset.quantity_text.clone().unwrap_or_default()
+        } else {
+            String::new()
+        },
+        current_value_override: if is_foreign {
+            String::new()
+        } else {
+            asset
+                .current_value_override_text
+                .clone()
+                .unwrap_or_default()
+        },
+        invested_amount: asset.invested_amount_text.clone().unwrap_or_default(),
+        note: asset.note.clone(),
+    };
+    let initial_form_snapshot = use_signal(|| initial_form.clone());
+    let mut snapshot_date = use_signal(|| initial_form.snapshot_date.clone());
     let mut quantity = use_signal(|| {
         if is_foreign {
             asset.quantity_text.clone().unwrap_or_default()
@@ -2468,8 +2700,17 @@ fn AccountAssetEditModal(
     let mut note = use_signal(|| asset.note.clone());
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
+    let mut confirm_close = use_signal(|| false);
     let currency_code_for_rate = asset.currency_code.clone();
     let display_currency_code = asset.currency_code.clone();
+    let interaction_locked = is_saving();
+    let is_dirty = AccountAssetEditForm {
+        snapshot_date: snapshot_date(),
+        quantity: quantity(),
+        current_value_override: current_value_override(),
+        invested_amount: invested_amount(),
+        note: note(),
+    } != initial_form_snapshot();
 
     let exchange_rate = use_resource(move || {
         let _ = data_version();
@@ -2489,8 +2730,17 @@ fn AccountAssetEditModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
-                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
+                        disabled: interaction_locked,
                         "關閉"
                     }
                 }
@@ -2517,7 +2767,7 @@ fn AccountAssetEditModal(
                             value: "{snapshot_date}",
                             required: true,
                             oninput: move |event| snapshot_date.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                         }
                     }
                     if is_foreign {
@@ -2526,7 +2776,7 @@ fn AccountAssetEditModal(
                             input {
                                 value: "{quantity}",
                                 oninput: move |event| quantity.set(event.value()),
-                                disabled: is_saving(),
+                                disabled: interaction_locked,
                                 placeholder: "0",
                             }
                         }
@@ -2536,7 +2786,7 @@ fn AccountAssetEditModal(
                             input {
                                 value: "{current_value_override}",
                                 oninput: move |event| current_value_override.set(event.value()),
-                                disabled: is_saving(),
+                                disabled: interaction_locked,
                                 placeholder: "0",
                             }
                         }
@@ -2546,7 +2796,7 @@ fn AccountAssetEditModal(
                         input {
                             value: "{invested_amount}",
                             oninput: move |event| invested_amount.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "選填",
                         }
                     }
@@ -2593,7 +2843,7 @@ fn AccountAssetEditModal(
                         input {
                             value: "{note}",
                             oninput: move |event| note.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "選填",
                         }
                     }
@@ -2602,14 +2852,39 @@ fn AccountAssetEditModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
-                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
+                        disabled: interaction_locked,
                         "取消"
                     }
                     button {
                         r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            snapshot_date.set(reset_form.snapshot_date);
+                            quantity.set(reset_form.quantity);
+                            current_value_override.set(reset_form.current_value_override);
+                            invested_amount.set(reset_form.invested_amount);
+                            note.set(reset_form.note);
+                        },
+                        "還原"
+                    }
+                    button {
+                        r#type: "button",
                         class: "primary-button",
-                        disabled: is_saving(),
+                        disabled: interaction_locked,
                         onclick: move |_| {
                             is_saving.set(true);
                             error_message.set(String::new());
@@ -2636,6 +2911,7 @@ fn AccountAssetEditModal(
                                         Ok(_snapshot_id) => {
                                             data_version.with_mut(|v| *v += 1);
                                             is_saving.set(false);
+                                            confirm_close.set(false);
                                             on_saved.call(format!("{} {} 已更新", asset_type_label(&asset.asset_type), asset.account_name));
                                         }
                                         Err(error) => {
@@ -2647,6 +2923,30 @@ fn AccountAssetEditModal(
                             }
                         },
                         if is_saving() { "儲存中..." } else { "儲存" }
+                    }
+                }
+                if confirm_close() {
+                    div { class: "delete-confirmation",
+                        p { "尚未儲存變更，確定要關閉嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| confirm_close.set(false),
+                                "繼續編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| {
+                                    confirm_close.set(false);
+                                    on_close.call(());
+                                },
+                                "確認關閉"
+                            }
+                        }
                     }
                 }
             }
@@ -2712,6 +3012,15 @@ fn HoldingEditModal(
     on_saved: EventHandler<String>,
 ) -> Element {
     let mut data_version = use_context::<Signal<u64>>();
+    let initial_form = HoldingEditForm {
+        as_of_date: Some(row.snapshot_date.clone())
+            .filter(|date| date != "-")
+            .unwrap_or_default(),
+        quantity_text: editable_number(row.quantity),
+        average_cost_text: editable_number(row.average_cost),
+        note: row.note.clone(),
+    };
+    let initial_form_snapshot = use_signal(|| initial_form.clone());
     let mut as_of_date = use_signal(|| {
         Some(row.snapshot_date.clone())
             .filter(|date| date != "-")
@@ -2723,6 +3032,14 @@ fn HoldingEditModal(
     let mut note = use_signal(|| row.note.clone());
     let mut saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
+    let mut confirm_close = use_signal(|| false);
+    let interaction_locked = saving();
+    let is_dirty = HoldingEditForm {
+        as_of_date: as_of_date(),
+        quantity_text: quantity_text(),
+        average_cost_text: average_cost_text(),
+        note: note(),
+    } != initial_form_snapshot();
 
     rsx! {
         div { class: "modal-backdrop",
@@ -2735,8 +3052,17 @@ fn HoldingEditModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
-                        disabled: saving(),
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
+                        disabled: interaction_locked,
                         "關閉"
                     }
                 }
@@ -2770,7 +3096,7 @@ fn HoldingEditModal(
                             r#type: "date",
                             value: "{as_of_date}",
                             oninput: move |event| as_of_date.set(event.value()),
-                            disabled: saving(),
+                            disabled: interaction_locked,
                         }
                     }
                     label {
@@ -2778,7 +3104,7 @@ fn HoldingEditModal(
                         input {
                             value: "{quantity_text}",
                             oninput: move |event| quantity_text.set(event.value()),
-                            disabled: saving(),
+                            disabled: interaction_locked,
                         }
                     }
                     label {
@@ -2786,7 +3112,7 @@ fn HoldingEditModal(
                         input {
                             value: "{average_cost_text}",
                             oninput: move |event| average_cost_text.set(event.value()),
-                            disabled: saving(),
+                            disabled: interaction_locked,
                         }
                     }
                     label { class: "full-width",
@@ -2794,7 +3120,7 @@ fn HoldingEditModal(
                         textarea {
                             value: "{note}",
                             oninput: move |event| note.set(event.value()),
-                            disabled: saving(),
+                            disabled: interaction_locked,
                             rows: "3",
                         }
                     }
@@ -2803,14 +3129,38 @@ fn HoldingEditModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
-                        disabled: saving(),
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
+                        disabled: interaction_locked,
                         "取消"
                     }
                     button {
                         r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            as_of_date.set(reset_form.as_of_date);
+                            quantity_text.set(reset_form.quantity_text);
+                            average_cost_text.set(reset_form.average_cost_text);
+                            note.set(reset_form.note);
+                        },
+                        "還原"
+                    }
+                    button {
+                        r#type: "button",
                         class: "primary-button",
-                        disabled: saving(),
+                        disabled: interaction_locked,
                         onclick: move |_| {
                             saving.set(true);
                             error_message.set(String::new());
@@ -2830,6 +3180,7 @@ fn HoldingEditModal(
                             match result {
                                 Ok(()) => {
                                     data_version.with_mut(|value| *value += 1);
+                                    confirm_close.set(false);
                                     on_saved.call(format!("{} 已更新", row.instrument_name));
                                 }
                                 Err(error) => {
@@ -2838,6 +3189,30 @@ fn HoldingEditModal(
                             }
                         },
                         if saving() { "儲存中..." } else { "儲存" }
+                    }
+                }
+                if confirm_close() {
+                    div { class: "delete-confirmation",
+                        p { "尚未儲存變更，確定要關閉嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| confirm_close.set(false),
+                                "繼續編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| {
+                                    confirm_close.set(false);
+                                    on_close.call(());
+                                },
+                                "確認關閉"
+                            }
+                        }
                     }
                 }
             }
@@ -2860,6 +3235,20 @@ fn HoldingDividendAssumptionModal(
         .dividend_effective_date
         .clone()
         .unwrap_or_else(|| row.snapshot_date.clone());
+    let initial_form = HoldingDividendAssumptionForm {
+        effective_date: row
+            .dividend_effective_date
+            .clone()
+            .filter(|date| date != "-")
+            .unwrap_or_else(|| row.snapshot_date.clone()),
+        payments_per_year: row
+            .payments_per_year
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        latest_dividend_per_unit: editable_number(row.latest_dividend_per_unit),
+        estimated_annual_dividend_per_unit: editable_number(row.estimated_annual_dividend_per_unit),
+    };
+    let initial_form_snapshot = use_signal(|| initial_form.clone());
     let mut effective_date = use_signal(|| {
         row.dividend_effective_date
             .clone()
@@ -2876,6 +3265,14 @@ fn HoldingDividendAssumptionModal(
         use_signal(|| editable_number(row.estimated_annual_dividend_per_unit));
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
+    let mut confirm_close = use_signal(|| false);
+    let interaction_locked = is_saving();
+    let is_dirty = HoldingDividendAssumptionForm {
+        effective_date: effective_date(),
+        payments_per_year: payments_per_year(),
+        latest_dividend_per_unit: latest_dividend_per_unit(),
+        estimated_annual_dividend_per_unit: estimated_annual_dividend_per_unit(),
+    } != initial_form_snapshot();
 
     rsx! {
         div { class: "modal-backdrop",
@@ -2888,8 +3285,17 @@ fn HoldingDividendAssumptionModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
-                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
+                        disabled: interaction_locked,
                         "關閉"
                     }
                 }
@@ -2903,7 +3309,7 @@ fn HoldingDividendAssumptionModal(
                             r#type: "date",
                             value: "{effective_date}",
                             oninput: move |event| effective_date.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                         }
                     }
                     label { class: "form-field",
@@ -2911,7 +3317,7 @@ fn HoldingDividendAssumptionModal(
                         input {
                             value: "{payments_per_year}",
                             oninput: move |event| payments_per_year.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "4",
                         }
                     }
@@ -2920,7 +3326,7 @@ fn HoldingDividendAssumptionModal(
                         input {
                             value: "{latest_dividend_per_unit}",
                             oninput: move |event| latest_dividend_per_unit.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "0",
                         }
                     }
@@ -2929,7 +3335,7 @@ fn HoldingDividendAssumptionModal(
                         input {
                             value: "{estimated_annual_dividend_per_unit}",
                             oninput: move |event| estimated_annual_dividend_per_unit.set(event.value()),
-                            disabled: is_saving(),
+                            disabled: interaction_locked,
                             placeholder: "0",
                         }
                     }
@@ -2938,14 +3344,39 @@ fn HoldingDividendAssumptionModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
-                        onclick: move |_| on_close.call(()),
-                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            if is_dirty {
+                                confirm_close.set(true);
+                                return;
+                            }
+                            on_close.call(());
+                        },
+                        disabled: interaction_locked,
                         "取消"
                     }
                     button {
                         r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            effective_date.set(reset_form.effective_date);
+                            payments_per_year.set(reset_form.payments_per_year);
+                            latest_dividend_per_unit.set(reset_form.latest_dividend_per_unit);
+                            estimated_annual_dividend_per_unit
+                                .set(reset_form.estimated_annual_dividend_per_unit);
+                        },
+                        "還原"
+                    }
+                    button {
+                        r#type: "button",
                         class: "primary-button",
-                        disabled: is_saving(),
+                        disabled: interaction_locked,
                         onclick: move |_| {
                             is_saving.set(true);
                             error_message.set(String::new());
@@ -2979,6 +3410,7 @@ fn HoldingDividendAssumptionModal(
                             match result {
                                 Ok(()) => {
                                     data_version.with_mut(|value| *value += 1);
+                                    confirm_close.set(false);
                                     on_saved.call(format!("{} 配息估計已更新", row.instrument_name));
                                 }
                                 Err(error) => {
@@ -2987,6 +3419,30 @@ fn HoldingDividendAssumptionModal(
                             }
                         },
                         if is_saving() { "儲存中..." } else { "儲存" }
+                    }
+                }
+                if confirm_close() {
+                    div { class: "delete-confirmation",
+                        p { "尚未儲存變更，確定要關閉嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| confirm_close.set(false),
+                                "繼續編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| {
+                                    confirm_close.set(false);
+                                    on_close.call(());
+                                },
+                                "確認關閉"
+                            }
+                        }
                     }
                 }
             }

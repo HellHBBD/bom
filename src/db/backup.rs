@@ -67,7 +67,7 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::backup_before_migration;
+    use super::{backup_before_migration, backup_for_today};
 
     #[test]
     fn creates_pre_migration_backup_without_reusing_stale_file() {
@@ -86,5 +86,22 @@ mod tests {
         assert_ne!(first_backup, second_backup);
         assert!(first_backup.exists());
         assert!(second_backup.exists());
+    }
+
+    #[test]
+    fn reuses_same_daily_backup_path() {
+        let temp_dir = tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("data.sqlite");
+        let connection = Connection::open(&database_path).expect("open db");
+        connection
+            .execute_batch("CREATE TABLE marker (id INTEGER PRIMARY KEY);")
+            .expect("create table");
+        drop(connection);
+
+        let first_backup = backup_for_today(&database_path).expect("first daily backup");
+        let second_backup = backup_for_today(&database_path).expect("second daily backup");
+
+        assert_eq!(first_backup, second_backup);
+        assert!(first_backup.exists());
     }
 }

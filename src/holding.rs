@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::open_writable_database;
+use crate::db::open_manual_write_database;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
 
@@ -147,19 +147,19 @@ pub fn validate_dividend_assumption_input(
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_current_holding_update(input: CurrentHoldingUpdateInput) -> AppResult<()> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     save_current_holding_update_with_connection(&mut connection, input)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_current_holding_state(input: CurrentHoldingStateInput) -> AppResult<()> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     save_current_holding_state_with_connection(&mut connection, input)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_dividend_assumption(input: DividendAssumptionInput) -> AppResult<()> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     save_dividend_assumption_with_connection(&mut connection, input)
 }
 
@@ -665,7 +665,8 @@ fn upsert_instrument_price(
             FROM instrument_price
             WHERE instrument_id = ?1
               AND price_date = ?2
-            ORDER BY CASE WHEN origin = 'MANUAL' THEN 0 ELSE 1 END, price_id DESC
+              AND origin = 'MANUAL'
+            ORDER BY price_id DESC
             LIMIT 1
             "#,
             params![update.instrument_id, update.as_of_date],
@@ -728,7 +729,8 @@ fn upsert_dividend_assumption(
             WHERE account_id = ?1
               AND instrument_id = ?2
               AND effective_date = ?3
-            ORDER BY CASE WHEN origin = 'MANUAL' THEN 0 ELSE 1 END, assumption_id DESC
+              AND origin = 'MANUAL'
+            ORDER BY assumption_id DESC
             LIMIT 1
             "#,
             params![account_id, instrument_id, effective_date],
@@ -1309,6 +1311,96 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    fn first_manual_holding_update_preserves_existing_import_price_and_assumption_rows() {
+        let temp_dir = tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("data.sqlite");
+        fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
+
+        let mut connection = Connection::open(&database_path).expect("open temp db");
+        migrate(&mut connection).expect("migrate temp db");
+
+        let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
+            .query_row(
+                r#"
+                SELECT account_id, instrument_id, COALESCE(market_price_currency_code, trading_currency_code)
+                FROM v_holding_metrics
+                ORDER BY market_value DESC, holding_snapshot_id DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("seed holding row");
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO instrument_price (
+                    instrument_id, price_date, price_text, currency_code, origin, source_cell
+                ) VALUES (?1, '2099-01-03', '88', ?2, 'EXCEL_IMPORT', 'A1')
+                "#,
+                params![instrument_id, currency_code],
+            )
+            .expect("seed import price");
+        connection
+            .execute(
+                r#"
+                INSERT INTO dividend_assumption (
+                    account_id, instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin, source_row
+                ) VALUES (?1, ?2, '2099-01-03', '1.1', ?3, 'EXCEL_IMPORT', 1)
+                "#,
+                params![account_id, instrument_id, currency_code],
+            )
+            .expect("seed import assumption");
+
+        save_current_holding_update_with_connection(
+            &mut connection,
+            CurrentHoldingUpdateInput {
+                account_id,
+                instrument_id,
+                currency_code: currency_code.clone(),
+                as_of_date: "2099-01-03".to_string(),
+                quantity_text: "10".to_string(),
+                average_cost_text: "20".to_string(),
+                market_price_text: "30".to_string(),
+                payments_per_year_text: "4".to_string(),
+                latest_dividend_per_unit_text: "0.5".to_string(),
+                estimated_annual_dividend_per_unit_text: "2.0".to_string(),
+            },
+        )
+        .expect("save manual holding update");
+
+        let (import_price_count, manual_price_count): (i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM instrument_price WHERE instrument_id = ?1 AND price_date = '2099-01-03' AND origin = 'EXCEL_IMPORT'),
+                    (SELECT COUNT(*) FROM instrument_price WHERE instrument_id = ?1 AND price_date = '2099-01-03' AND origin = 'MANUAL')
+                "#,
+                params![instrument_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count price rows");
+        assert_eq!(import_price_count, 1);
+        assert_eq!(manual_price_count, 1);
+
+        let (import_assumption_count, manual_assumption_count): (i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-01-03' AND origin = 'EXCEL_IMPORT'),
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-01-03' AND origin = 'MANUAL')
+                "#,
+                params![account_id, instrument_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count assumption rows");
+        assert_eq!(import_assumption_count, 1);
+        assert_eq!(manual_assumption_count, 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
     fn saves_holding_state_without_touching_price_or_dividend_rows() {
         let temp_dir = tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("data.sqlite");
@@ -1421,6 +1513,69 @@ mod tests {
             .expect("updated same-day state row");
         assert_eq!(updated_quantity, "500");
         assert_eq!(updated_note, None);
+        assert_eq!(manual_count, 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn first_manual_dividend_assumption_preserves_existing_import_row() {
+        let temp_dir = tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("data.sqlite");
+        fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
+
+        let mut connection = Connection::open(&database_path).expect("open temp db");
+        migrate(&mut connection).expect("migrate temp db");
+
+        let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
+            .query_row(
+                r#"
+                SELECT account_id, instrument_id, trading_currency_code
+                FROM v_holding_metrics
+                ORDER BY market_value DESC, holding_snapshot_id DESC
+                LIMIT 1
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("seed holding row");
+
+        connection
+            .execute(
+                r#"
+                INSERT INTO dividend_assumption (
+                    account_id, instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin, source_row
+                ) VALUES (?1, ?2, '2099-02-02', '1.1', ?3, 'EXCEL_IMPORT', 1)
+                "#,
+                params![account_id, instrument_id, currency_code],
+            )
+            .expect("seed import assumption");
+
+        save_dividend_assumption_with_connection(
+            &mut connection,
+            DividendAssumptionInput {
+                account_id,
+                instrument_id,
+                effective_date: "2099-02-02".to_string(),
+                payments_per_year_text: "4".to_string(),
+                latest_dividend_per_unit_text: "0.3".to_string(),
+                estimated_annual_dividend_per_unit_text: "1.2".to_string(),
+                currency_code: currency_code.clone(),
+            },
+        )
+        .expect("save manual assumption");
+
+        let (import_count, manual_count): (i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-02-02' AND origin = 'EXCEL_IMPORT'),
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-02-02' AND origin = 'MANUAL')
+                "#,
+                params![account_id, instrument_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count assumption rows");
+        assert_eq!(import_count, 1);
         assert_eq!(manual_count, 1);
     }
 

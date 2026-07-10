@@ -2,7 +2,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::open_writable_database;
+use crate::db::open_manual_write_database;
 use crate::error::{AppError, AppResult};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,7 +36,7 @@ pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn create_manual_account(input: AccountCreateInput) -> AppResult<i64> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     create_manual_account_with_connection(&mut connection, input)
 }
 
@@ -49,7 +49,7 @@ pub fn create_manual_account(_input: AccountCreateInput) -> AppResult<i64> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn create_manual_instrument(input: InstrumentCreateInput) -> AppResult<i64> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     create_manual_instrument_with_connection(&mut connection, input)
 }
 
@@ -107,9 +107,10 @@ fn create_manual_account_with_connection(
     input: AccountCreateInput,
 ) -> AppResult<i64> {
     let validated = validate_account_create_input(&input)?;
-    ensure_institution_exists(connection, validated.institution_id)?;
+    let transaction = connection.transaction()?;
+    ensure_institution_exists(&transaction, validated.institution_id)?;
 
-    connection.execute(
+    transaction.execute(
         r#"
         INSERT INTO account (display_name, institution_id, account_type)
         VALUES (?1, ?2, 'BROKERAGE')
@@ -117,7 +118,9 @@ fn create_manual_account_with_connection(
         params![validated.display_name, validated.institution_id],
     )?;
 
-    Ok(connection.last_insert_rowid())
+    let account_id = transaction.last_insert_rowid();
+    transaction.commit()?;
+    Ok(account_id)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -126,9 +129,10 @@ fn create_manual_instrument_with_connection(
     input: InstrumentCreateInput,
 ) -> AppResult<i64> {
     let validated = validate_instrument_create_input(&input)?;
-    ensure_currency_exists(connection, &validated.trading_currency_code)?;
+    let transaction = connection.transaction()?;
+    ensure_currency_exists(&transaction, &validated.trading_currency_code)?;
 
-    connection.execute(
+    transaction.execute(
         r#"
         INSERT INTO instrument (
             symbol,
@@ -146,12 +150,14 @@ fn create_manual_instrument_with_connection(
         ],
     )?;
 
-    Ok(connection.last_insert_rowid())
+    let instrument_id = transaction.last_insert_rowid();
+    transaction.commit()?;
+    Ok(instrument_id)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_institution_options_native() -> rusqlite::Result<Vec<InstitutionOption>> {
-    let connection = crate::db::open_writable_database()
+    let connection = crate::db::open_database()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let mut statement = connection.prepare(
         r#"

@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::open_writable_database;
+use crate::db::open_manual_write_database;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
 
@@ -63,7 +63,7 @@ pub fn validate_batch_prices(input: &BatchPriceInput) -> AppResult<BatchPriceInp
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn upsert_manual_prices_batch(input: BatchPriceInput) -> AppResult<usize> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     upsert_manual_prices_batch_with_connection(&mut connection, input)
 }
 

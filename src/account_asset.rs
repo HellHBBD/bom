@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::open_writable_database;
+use crate::db::open_manual_write_database;
 use crate::decimal::normalize_decimal_text;
 use crate::error::{AppError, AppResult};
 
@@ -112,7 +112,7 @@ fn parse_optional_decimal(field: &'static str, value: &str) -> AppResult<Option<
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn upsert_manual_account_asset(input: ValidatedAccountAssetInput) -> AppResult<i64> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     upsert_manual_account_asset_with_connection(&mut connection, &input)
 }
 

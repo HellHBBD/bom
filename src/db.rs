@@ -9,7 +9,10 @@ pub mod path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqlResult};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::{backup::backup_before_migration, migration::migrate};
+use crate::db::{
+    backup::{backup_before_migration, backup_for_today},
+    migration::migrate,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -659,7 +662,7 @@ fn ensure_migrated_database() -> AppResult<std::path::PathBuf> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn open_database() -> SqlResult<Connection> {
+pub(crate) fn open_database() -> SqlResult<Connection> {
     let path = ensure_migrated_database().map_err(app_error_to_sql_error)?;
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
@@ -668,6 +671,15 @@ fn open_database() -> SqlResult<Connection> {
 #[allow(dead_code)]
 pub fn open_writable_database() -> AppResult<Connection> {
     let path = ensure_migrated_database()?;
+    let connection = Connection::open(path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(connection)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_manual_write_database() -> AppResult<Connection> {
+    let path = ensure_migrated_database()?;
+    backup_for_today(&path)?;
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)

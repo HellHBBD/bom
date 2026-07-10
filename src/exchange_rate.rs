@@ -2,7 +2,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::open_writable_database;
+use crate::db::open_manual_write_database;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
 
@@ -36,7 +36,7 @@ pub fn validate_exchange_rate_input(input: &ExchangeRateInput) -> AppResult<Exch
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn upsert_manual_exchange_rate(input: ExchangeRateInput) -> AppResult<()> {
-    let mut connection = open_writable_database()?;
+    let mut connection = open_manual_write_database()?;
     upsert_manual_exchange_rate_with_connection(&mut connection, input)
 }
 
@@ -141,10 +141,11 @@ fn upsert_manual_exchange_rate_with_connection(
     input: ExchangeRateInput,
 ) -> AppResult<()> {
     let validated = validate_exchange_rate_input_inner(&input)?;
+    let transaction = connection.transaction()?;
 
-    ensure_currency_exists(connection, &validated.base_currency_code)?;
+    ensure_currency_exists(&transaction, &validated.base_currency_code)?;
 
-    let existing_id: Option<i64> = connection
+    let existing_id: Option<i64> = transaction
         .query_row(
             r#"
             SELECT exchange_rate_id
@@ -162,7 +163,7 @@ fn upsert_manual_exchange_rate_with_connection(
         .optional()?;
 
     if let Some(exchange_rate_id) = existing_id {
-        connection.execute(
+        transaction.execute(
             r#"
             UPDATE exchange_rate
             SET rate_text = ?1,
@@ -175,7 +176,7 @@ fn upsert_manual_exchange_rate_with_connection(
             params![validated.rate_text, validated.note, exchange_rate_id],
         )?;
     } else {
-        connection.execute(
+        transaction.execute(
             r#"
             INSERT INTO exchange_rate (
                 rate_date,
@@ -195,6 +196,7 @@ fn upsert_manual_exchange_rate_with_connection(
         )?;
     }
 
+    transaction.commit()?;
     Ok(())
 }
 
