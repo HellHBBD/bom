@@ -196,6 +196,10 @@ jobs:
           Write-Host "Dioxus CLI location: $($dxExecutable.FullName)"
           & $dxExecutable.FullName --version
 
+      - name: Show dx bundle help
+        shell: pwsh
+        run: dx bundle --help
+
       - name: Bundle Windows desktop app
         shell: pwsh
         run: |
@@ -208,7 +212,7 @@ jobs:
               --desktop `
               --release `
               --features bundle `
-              --package-types exe `
+              --package-types nsis `
               --json-output `
               --verbose 2>&1
           )
@@ -258,7 +262,9 @@ jobs:
             Select-Object -First 1
 
           if (-not $exePath) {
-            throw "No Windows EXE was found in BundleOutput."
+            Write-Host "Bundle output did not contain an EXE:"
+            $bundlePaths | ForEach-Object { Write-Host " - $_" }
+            throw "No Windows NSIS EXE was found in BundleOutput."
           }
 
           $resolvedExe = Resolve-Path $exePath
@@ -281,7 +287,7 @@ jobs:
           "$releaseHash  $fileName" | Set-Content -Path "$destination.sha256" -Encoding ascii
 
           Write-Host ""
-          Write-Host "Windows bundle created:"
+          Write-Host "Windows NSIS installer created:"
           Write-Host "  $destination"
           Write-Host ""
           Write-Host "SHA-256:"
