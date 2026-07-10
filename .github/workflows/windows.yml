@@ -177,7 +177,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $bundleOutputDir = "dist\bundle-output"
+
+          New-Item -ItemType Directory -Force -Path $bundleOutputDir | Out-Null
 
           $output = @(
             & dx bundle `
@@ -185,7 +187,7 @@ jobs:
               --release `
               --features bundle `
               --package-types nsis `
-              --json-output `
+              --out-dir $bundleOutputDir `
               --verbose 2>&1
           )
 
@@ -200,53 +202,40 @@ jobs:
             throw "dx bundle failed with exit code $exitCode."
           }
 
-          $resultLine = $output |
-            ForEach-Object { $_.ToString() } |
-            Where-Object { $_ -match '"BundleOutput"' } |
-            Select-Object -Last 1
+          Write-Host ""
+          Write-Host "Bundle output directory:"
+          Write-Host "  $bundleOutputDir"
 
-          if (-not $resultLine) {
-            throw "BundleOutput was not found in dx JSON output."
+          Get-ChildItem -Path $bundleOutputDir -Recurse -File |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize |
+            Out-Host
+
+          $exeFiles = @(
+            Get-ChildItem -Path $bundleOutputDir -Recurse -Filter "*.exe" -File
+          )
+
+          if ($exeFiles.Count -eq 0) {
+            throw "No Windows NSIS EXE was found under $bundleOutputDir."
           }
 
-          $envelope = $resultLine | ConvertFrom-Json
-
-          if ($envelope.json -is [string]) {
-            $bundleResult = $envelope.json | ConvertFrom-Json
-          }
-          else {
-            $bundleResult = $envelope
-          }
-
-          $bundlePaths = @($bundleResult.BundleOutput.bundles)
-
-          if ($bundlePaths.Count -eq 0) {
-            throw "dx did not report any bundle output."
-          }
-
-          Write-Host "Reported bundle paths:"
-          foreach ($path in $bundlePaths) {
-            Write-Host " - $path"
-          }
-
-          $exePath = $bundlePaths |
-            Where-Object { [System.IO.Path]::GetExtension($_) -ieq ".exe" } |
+          $bundleExe = $exeFiles |
+            Where-Object { $_.Name -match "setup" } |
             Select-Object -First 1
 
-          if (-not $exePath) {
-            Write-Host "Bundle output did not contain an EXE:"
-            $bundlePaths | ForEach-Object { Write-Host " - $_" }
-            throw "No Windows NSIS EXE was found in BundleOutput."
+          if (-not $bundleExe) {
+            $bundleExe = $exeFiles |
+              Sort-Object Length -Descending |
+              Select-Object -First 1
           }
 
-          $resolvedExe = Resolve-Path $exePath
           $shortSha = $env:GITHUB_SHA.Substring(0, 7)
           $buildLabel = "test-$env:GITHUB_RUN_NUMBER-$shortSha"
           $safeBuildLabel = $buildLabel -replace '[^A-Za-z0-9._-]', '_'
           $fileName = "$env:APP_NAME-$safeBuildLabel-windows-x86_64-setup.exe"
           $destination = Join-Path "dist" $fileName
 
-          Copy-Item -Path $resolvedExe.Path -Destination $destination -Force
+          Copy-Item -Path $bundleExe.FullName -Destination $destination -Force
 
           $releaseHash = (Get-FileHash -Path $destination -Algorithm SHA256).Hash.ToLowerInvariant()
           "$releaseHash  $fileName" | Set-Content -Path "$destination.sha256" -Encoding ascii
@@ -403,7 +392,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $bundleOutputDir = "dist\bundle-output"
+
+          New-Item -ItemType Directory -Force -Path $bundleOutputDir | Out-Null
 
           $output = @(
             & dx bundle `
@@ -411,7 +402,7 @@ jobs:
               --release `
               --features bundle `
               --package-types nsis `
-              --json-output `
+              --out-dir $bundleOutputDir `
               --verbose 2>&1
           )
 
@@ -426,46 +417,33 @@ jobs:
             throw "dx bundle failed with exit code $exitCode."
           }
 
-          $resultLine = $output |
-            ForEach-Object { $_.ToString() } |
-            Where-Object { $_ -match '"BundleOutput"' } |
-            Select-Object -Last 1
+          Write-Host ""
+          Write-Host "Bundle output directory:"
+          Write-Host "  $bundleOutputDir"
 
-          if (-not $resultLine) {
-            throw "BundleOutput was not found in dx JSON output."
+          Get-ChildItem -Path $bundleOutputDir -Recurse -File |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize |
+            Out-Host
+
+          $exeFiles = @(
+            Get-ChildItem -Path $bundleOutputDir -Recurse -Filter "*.exe" -File
+          )
+
+          if ($exeFiles.Count -eq 0) {
+            throw "No Windows NSIS EXE was found under $bundleOutputDir."
           }
 
-          $envelope = $resultLine | ConvertFrom-Json
-
-          if ($envelope.json -is [string]) {
-            $bundleResult = $envelope.json | ConvertFrom-Json
-          }
-          else {
-            $bundleResult = $envelope
-          }
-
-          $bundlePaths = @($bundleResult.BundleOutput.bundles)
-
-          if ($bundlePaths.Count -eq 0) {
-            throw "dx did not report any bundle output."
-          }
-
-          Write-Host "Reported bundle paths:"
-          foreach ($path in $bundlePaths) {
-            Write-Host " - $path"
-          }
-
-          $exePath = $bundlePaths |
-            Where-Object { [System.IO.Path]::GetExtension($_) -ieq ".exe" } |
+          $bundleExe = $exeFiles |
+            Where-Object { $_.Name -match "setup" } |
             Select-Object -First 1
 
-          if (-not $exePath) {
-            Write-Host "Bundle output did not contain an EXE:"
-            $bundlePaths | ForEach-Object { Write-Host " - $_" }
-            throw "No Windows NSIS EXE was found in BundleOutput."
+          if (-not $bundleExe) {
+            $bundleExe = $exeFiles |
+              Sort-Object Length -Descending |
+              Select-Object -First 1
           }
 
-          $resolvedExe = Resolve-Path $exePath
           $shortSha = $env:GITHUB_SHA.Substring(0, 7)
 
           if ($env:GITHUB_REF_TYPE -eq "tag") {
@@ -479,7 +457,7 @@ jobs:
           $fileName = "$env:APP_NAME-$safeBuildLabel-windows-x86_64-setup.exe"
           $destination = Join-Path "dist" $fileName
 
-          Copy-Item -Path $resolvedExe.Path -Destination $destination -Force
+          Copy-Item -Path $bundleExe.FullName -Destination $destination -Force
 
           $releaseHash = (Get-FileHash -Path $destination -Algorithm SHA256).Hash.ToLowerInvariant()
           "$releaseHash  $fileName" | Set-Content -Path "$destination.sha256" -Encoding ascii
