@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", feature = "bundle"),
+    windows_subsystem = "windows"
+)]
+
 use dioxus::prelude::*;
 
 mod account_asset;

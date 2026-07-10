@@ -1,4 +1,10 @@
 [application]
+name = "BOM"
+
+[bundle]
+identifier = "local.hellhbbd.bom"
+publisher = "HellHBBD"
+resources = ["assets/data.sqlite"]
 
 [web.app]
 
