@@ -1,0 +1,308 @@
+#[cfg(not(target_arch = "wasm32"))]
+use rusqlite::{params, Connection, OptionalExtension};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::db::open_writable_database;
+use crate::error::{AppError, AppResult};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstitutionOption {
+    pub institution_id: i64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountCreateInput {
+    pub institution_id: i64,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstrumentCreateInput {
+    pub symbol: String,
+    pub name: String,
+    pub trading_currency_code: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
+    load_institution_options_native().map_err(|error| error.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
+    Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_manual_account(input: AccountCreateInput) -> AppResult<i64> {
+    let mut connection = open_writable_database()?;
+    create_manual_account_with_connection(&mut connection, input)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn create_manual_account(_input: AccountCreateInput) -> AppResult<i64> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 帳戶新增".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_manual_instrument(input: InstrumentCreateInput) -> AppResult<i64> {
+    let mut connection = open_writable_database()?;
+    create_manual_instrument_with_connection(&mut connection, input)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn create_manual_instrument(_input: InstrumentCreateInput) -> AppResult<i64> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 商品新增".to_string(),
+    ))
+}
+
+fn validate_account_create_input(input: &AccountCreateInput) -> AppResult<AccountCreateInput> {
+    if input.institution_id <= 0 {
+        return Err(AppError::Validation("請選擇金融機構".to_string()));
+    }
+
+    let display_name = input.display_name.trim().to_string();
+    if display_name.is_empty() {
+        return Err(AppError::Validation("請輸入帳戶名稱".to_string()));
+    }
+
+    Ok(AccountCreateInput {
+        institution_id: input.institution_id,
+        display_name,
+    })
+}
+
+fn validate_instrument_create_input(
+    input: &InstrumentCreateInput,
+) -> AppResult<InstrumentCreateInput> {
+    let symbol = input.symbol.trim().to_string();
+    if symbol.is_empty() {
+        return Err(AppError::Validation("請輸入商品代號".to_string()));
+    }
+
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::Validation("請輸入商品名稱".to_string()));
+    }
+
+    let trading_currency_code = input.trading_currency_code.trim().to_string();
+    if trading_currency_code.is_empty() {
+        return Err(AppError::Validation("請選擇交易幣別".to_string()));
+    }
+
+    Ok(InstrumentCreateInput {
+        symbol,
+        name,
+        trading_currency_code,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_manual_account_with_connection(
+    connection: &mut Connection,
+    input: AccountCreateInput,
+) -> AppResult<i64> {
+    let validated = validate_account_create_input(&input)?;
+    ensure_institution_exists(connection, validated.institution_id)?;
+
+    connection.execute(
+        r#"
+        INSERT INTO account (display_name, institution_id, account_type)
+        VALUES (?1, ?2, 'BROKERAGE')
+        "#,
+        params![validated.display_name, validated.institution_id],
+    )?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn create_manual_instrument_with_connection(
+    connection: &mut Connection,
+    input: InstrumentCreateInput,
+) -> AppResult<i64> {
+    let validated = validate_instrument_create_input(&input)?;
+    ensure_currency_exists(connection, &validated.trading_currency_code)?;
+
+    connection.execute(
+        r#"
+        INSERT INTO instrument (
+            symbol,
+            name,
+            instrument_type,
+            asset_class,
+            region_type,
+            trading_currency_code
+        ) VALUES (?1, ?2, 'ETF', 'EQUITY', 'DOMESTIC', ?3)
+        "#,
+        params![
+            validated.symbol,
+            validated.name,
+            validated.trading_currency_code,
+        ],
+    )?;
+
+    Ok(connection.last_insert_rowid())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_institution_options_native() -> rusqlite::Result<Vec<InstitutionOption>> {
+    let connection = crate::db::open_writable_database()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT institution_id, COALESCE(name, '未命名機構') AS name
+        FROM institution
+        ORDER BY name ASC
+        "#,
+    )?;
+
+    let rows = statement.query_map([], |row| {
+        Ok(InstitutionOption {
+            institution_id: row.get(0)?,
+            name: row.get(1)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_institution_exists(connection: &Connection, institution_id: i64) -> AppResult<()> {
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT institution_id FROM institution WHERE institution_id = ?1 LIMIT 1",
+            [institution_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "找不到金融機構：{institution_id}"
+        )))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_currency_exists(connection: &Connection, currency_code: &str) -> AppResult<()> {
+    let exists: Option<String> = connection
+        .query_row(
+            "SELECT currency_code FROM currency WHERE currency_code = ?1 LIMIT 1",
+            [currency_code],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!("找不到幣別：{currency_code}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    use rusqlite::Connection;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn seed_db(connection: &mut Connection) {
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE institution (
+                    institution_id INTEGER PRIMARY KEY,
+                    name TEXT
+                );
+
+                CREATE TABLE account (
+                    account_id INTEGER PRIMARY KEY,
+                    display_name TEXT,
+                    institution_id INTEGER,
+                    account_type TEXT
+                );
+
+                CREATE TABLE instrument (
+                    instrument_id INTEGER PRIMARY KEY,
+                    symbol TEXT,
+                    name TEXT,
+                    instrument_type TEXT,
+                    asset_class TEXT,
+                    region_type TEXT,
+                    trading_currency_code TEXT
+                );
+
+                CREATE TABLE currency (
+                    currency_code TEXT PRIMARY KEY
+                );
+
+                INSERT INTO institution (institution_id, name) VALUES (1, 'Demo Bank');
+                INSERT INTO currency (currency_code) VALUES ('NTD');
+                "#,
+            )
+            .expect("seed db");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn create_manual_account_inserts_row() {
+        let mut connection = Connection::open_in_memory().expect("open db");
+        seed_db(&mut connection);
+
+        let account_id = create_manual_account_with_connection(
+            &mut connection,
+            AccountCreateInput {
+                institution_id: 1,
+                display_name: "新帳戶".to_string(),
+            },
+        )
+        .expect("create account");
+
+        let display_name: String = connection
+            .query_row(
+                "SELECT display_name FROM account WHERE account_id = ?1",
+                [account_id],
+                |row| row.get(0),
+            )
+            .expect("read account");
+
+        assert_eq!(display_name, "新帳戶");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn create_manual_instrument_inserts_row() {
+        let mut connection = Connection::open_in_memory().expect("open db");
+        seed_db(&mut connection);
+
+        let instrument_id = create_manual_instrument_with_connection(
+            &mut connection,
+            InstrumentCreateInput {
+                symbol: "ABC".to_string(),
+                name: "測試商品".to_string(),
+                trading_currency_code: "NTD".to_string(),
+            },
+        )
+        .expect("create instrument");
+
+        let (symbol, currency_code): (String, String) = connection
+            .query_row(
+                "SELECT symbol, trading_currency_code FROM instrument WHERE instrument_id = ?1",
+                [instrument_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read instrument");
+
+        assert_eq!(symbol, "ABC");
+        assert_eq!(currency_code, "NTD");
+    }
+}

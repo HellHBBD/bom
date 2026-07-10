@@ -18,6 +18,8 @@ pub fn AppLayout() -> Element {
                     NavLink { route: Route::DashboardPage {}, label: "總覽" }
                     NavLink { route: Route::AccountsPage {}, label: "帳戶資產" }
                     NavLink { route: Route::HoldingsPage {}, label: "持股明細" }
+                    NavLink { route: Route::QuickPriceUpdatePage {}, label: "快速市價更新" }
+                    NavLink { route: Route::ExchangeRatePage {}, label: "匯率維護" }
                     NavLink { route: Route::DividendIncomePage {}, label: "股息收入" }
                     NavLink { route: Route::DividendsLegacyPage {}, label: "Excel 歷史股息" }
                 }

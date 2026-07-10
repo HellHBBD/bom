@@ -1,10 +1,12 @@
 use dioxus::prelude::*;
 
 use crate::pages::{
-    AccountsPage, DashboardPage, DividendIncomePage, DividendsLegacyPage, HoldingsPage,
+    AccountsPage, DashboardPage, DividendIncomePage, DividendsLegacyPage, ExchangeRatePage,
+    HoldingsPage, QuickPriceUpdatePage,
 };
 
 #[derive(Clone, Routable, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Route {
     #[layout(crate::layout::AppLayout)]
     #[route("/")]
@@ -13,6 +15,10 @@ pub enum Route {
     AccountsPage {},
     #[route("/holdings")]
     HoldingsPage {},
+    #[route("/market/prices")]
+    QuickPriceUpdatePage {},
+    #[route("/market/exchange-rates")]
+    ExchangeRatePage {},
     #[route("/dividends")]
     DividendIncomePage {},
     #[route("/dividends/legacy")]

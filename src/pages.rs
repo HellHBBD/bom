@@ -1,18 +1,46 @@
-use dioxus::prelude::*;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use dioxus::prelude::*;
+use rust_decimal::{prelude::FromPrimitive, prelude::ToPrimitive, Decimal};
+
+use crate::account_asset::upsert_manual_account_asset;
+use crate::account_asset::{
+    asset_type_label, is_foreign_currency_asset, validate_account_asset_input, AccountAssetInput,
+};
 use crate::db::{
-    load_account_assets, load_dashboard_summary, load_dividend_receipts, load_holding_metrics,
-    load_legacy_dividends,
+    load_account_assets, load_applicable_exchange_rate, load_dashboard_summary,
+    load_dividend_receipt_form_options, load_dividend_receipts, load_holding_metrics,
+    load_legacy_dividends, load_recent_exchange_rates,
 };
+use crate::dividend_receipt::{
+    delete_manual_dividend_receipt, update_manual_dividend_receipt, DividendReceiptDeleteInput,
+    DividendReceiptUpdateInput,
+};
+use crate::dividend_receipt::{insert_manual_dividend_receipt, DividendReceiptInput};
+use crate::exchange_rate::{upsert_manual_exchange_rate, ExchangeRateInput};
 use crate::format::{decimal, money, percent};
-use crate::models::{
-    AccountAsset, DashboardSummary, DividendReceiptRow, HoldingMetric, LegacyDividendData,
-    LegacyDividendMonthlyRow, LegacyDividendSummaryRow,
+use crate::holding::{
+    save_current_holding_state, save_dividend_assumption, CurrentHoldingStateInput,
+    DividendAssumptionInput,
 };
+use crate::master_data::{
+    create_manual_account, create_manual_instrument, load_institution_options, AccountCreateInput,
+    InstitutionOption, InstrumentCreateInput,
+};
+use crate::models::{
+    AccountAsset, DashboardSummary, DividendReceiptAccountOption, DividendReceiptFormOptions,
+    DividendReceiptInstrumentOption, DividendReceiptRow, ExchangeRateRow, HoldingMetric,
+    LegacyDividendData, LegacyDividendMonthlyRow, LegacyDividendSummaryRow,
+};
+use crate::price::{upsert_manual_prices_batch, BatchPriceInput, BatchPriceRowInput};
 
 #[component]
 pub fn DashboardPage() -> Element {
-    let summary = use_resource(move || async move { load_dashboard_summary() });
+    let data_version = use_context::<Signal<u64>>();
+    let summary = use_resource(move || async move {
+        let _ = data_version();
+        load_dashboard_summary()
+    });
 
     rsx! {
         PageHeader {
@@ -30,7 +58,11 @@ pub fn DashboardPage() -> Element {
 
 #[component]
 pub fn AccountsPage() -> Element {
-    let account_assets = use_resource(move || async move { load_account_assets() });
+    let data_version = use_context::<Signal<u64>>();
+    let account_assets = use_resource(move || async move {
+        let _ = data_version();
+        load_account_assets()
+    });
 
     rsx! {
         PageHeader {
@@ -49,7 +81,11 @@ pub fn AccountsPage() -> Element {
 
 #[component]
 pub fn HoldingsPage() -> Element {
-    let holdings = use_resource(move || async move { load_holding_metrics() });
+    let data_version = use_context::<Signal<u64>>();
+    let holdings = use_resource(move || async move {
+        let _ = data_version();
+        load_holding_metrics()
+    });
 
     rsx! {
         PageHeader {
@@ -66,9 +102,239 @@ pub fn HoldingsPage() -> Element {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct QuickPriceUpdateRow {
+    instrument_id: i64,
+    symbol: String,
+    instrument_name: String,
+    currency_code: String,
+    latest_price: Option<f64>,
+    latest_price_date: Option<String>,
+    holding_account_count: usize,
+}
+
+#[component]
+pub fn QuickPriceUpdatePage() -> Element {
+    let data_version = use_context::<Signal<u64>>();
+    let holdings = use_resource(move || async move {
+        let _ = data_version();
+        load_holding_metrics()
+    });
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut price_date = use_signal(|| today);
+    let mut draft_prices = use_signal(HashMap::<i64, String>::new);
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+    let mut success_message = use_signal(String::new);
+
+    rsx! {
+        PageHeader {
+            title: "快速市價更新".to_string(),
+            description: "以商品層級批次更新市場價格；空白列跳過，整批驗證通過後一次寫入。".to_string(),
+        }
+
+        match holdings() {
+            None => rsx! { StatusCard { text: "載入可更新商品中...".to_string() } },
+            Some(Err(error)) => rsx! { StatusCard { text: format!("讀取可更新商品失敗：{error}") } },
+            Some(Ok(rows)) if rows.is_empty() => rsx! { StatusCard { text: "目前沒有可更新市價的持股資料。".to_string() } },
+            Some(Ok(rows)) => {
+                let price_rows = build_quick_price_update_rows(&rows);
+                let draft_values = draft_prices();
+                let save_rows = price_rows.clone();
+                let display_rows = price_rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.clone(),
+                            draft_values
+                                .get(&row.instrument_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                rsx! {
+                    section { class: "card table-card",
+                        if !success_message().is_empty() {
+                            div { class: "status-message success", "{success_message}" }
+                        }
+                        if !error_message().is_empty() {
+                            div { class: "status-message error quick-price-error", "{error_message}" }
+                        }
+                        div { class: "filters quick-price-controls",
+                            label { class: "filter-field",
+                                span { "價格日期" }
+                                input {
+                                    r#type: "date",
+                                    value: "{price_date}",
+                                    oninput: move |event| {
+                                        error_message.set(String::new());
+                                        success_message.set(String::new());
+                                        price_date.set(event.value());
+                                    },
+                                    disabled: is_saving(),
+                                }
+                            }
+                            div { class: "filter-total", "{price_rows.len()} 檔商品可更新市價" }
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: is_saving(),
+                                onclick: move |_| {
+                                    error_message.set(String::new());
+                                    success_message.set(String::new());
+                                    draft_prices.set(HashMap::new());
+                                },
+                                "清空輸入"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "primary-button",
+                                disabled: is_saving(),
+                                onclick: move |_| {
+                                    if is_saving() {
+                                        return;
+                                    }
+
+                                    is_saving.set(true);
+                                    error_message.set(String::new());
+                                    success_message.set(String::new());
+
+                                    let current_price_date = price_date();
+                                    let input = BatchPriceInput {
+                                        price_date: current_price_date,
+                                        rows: save_rows
+                                            .iter()
+                                            .map(|row| BatchPriceRowInput {
+                                                instrument_id: row.instrument_id,
+                                                symbol: row.symbol.clone(),
+                                                instrument_name: row.instrument_name.clone(),
+                                                currency_code: row.currency_code.clone(),
+                                                price: draft_values
+                                                    .get(&row.instrument_id)
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                            })
+                                            .collect(),
+                                    };
+
+                                    let mut is_saving = is_saving;
+                                    let mut error_message = error_message;
+                                    let mut success_message = success_message;
+                                    let mut draft_prices = draft_prices;
+                                    let mut data_version = data_version;
+
+                                    spawn(async move {
+                                        match run_batch_price_save(input).await {
+                                            Ok(saved_count) => {
+                                                draft_prices.set(HashMap::new());
+                                                success_message.set(format!(
+                                                    "已更新 {saved_count} 檔商品市價"
+                                                ));
+                                                data_version.with_mut(|value| *value += 1);
+                                            }
+                                            Err(error) => {
+                                                error_message.set(error.to_string());
+                                            }
+                                        }
+
+                                        is_saving.set(false);
+                                    });
+                                },
+                                if is_saving() { "儲存中..." } else { "儲存有輸入的價格" }
+                            }
+                        }
+                        div { class: "table-wrap",
+                            table { class: "price-update-table",
+                                thead {
+                                    tr {
+                                        th { "商品代號" }
+                                        th { "商品名稱" }
+                                        th { "幣別" }
+                                        th { "目前市價" }
+                                        th { "價格日期" }
+                                        th { "持有帳戶數" }
+                                        th { "新市價" }
+                                    }
+                                }
+                                tbody {
+                                    for (row, draft_value) in display_rows {
+                                        QuickPriceUpdateRowView {
+                                            row,
+                                            draft_value,
+                                            is_saving: is_saving(),
+                                            on_price_input: move |(instrument_id, value)| {
+                                                error_message.set(String::new());
+                                                success_message.set(String::new());
+                                                draft_prices.with_mut(|prices| {
+                                                    prices.insert(instrument_id, value);
+                                                });
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn QuickPriceUpdateRowView(
+    row: QuickPriceUpdateRow,
+    draft_value: String,
+    is_saving: bool,
+    on_price_input: EventHandler<(i64, String)>,
+) -> Element {
+    let instrument_id = row.instrument_id;
+    let latest_price_date = row.latest_price_date.as_deref().unwrap_or("-");
+
+    rsx! {
+        tr {
+            td { class: "mono", "{row.symbol}" }
+            td { class: "name-cell", "{row.instrument_name}" }
+            td { class: "mono", "{row.currency_code}" }
+            td { class: "number", "{decimal(row.latest_price, 4)}" }
+            td { class: "mono", "{latest_price_date}" }
+            td { class: "number", "{row.holding_account_count}" }
+            td {
+                input {
+                    class: "table-input mono",
+                    value: "{draft_value}",
+                    placeholder: "0",
+                    disabled: is_saving,
+                    oninput: move |event| on_price_input.call((instrument_id, event.value())),
+                }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn DividendIncomePage() -> Element {
-    let receipts = use_resource(move || async move { load_dividend_receipts() });
+    let mut data_version = use_context::<Signal<u64>>();
+    let receipts = use_resource(move || async move {
+        let _ = data_version();
+        load_dividend_receipts()
+    });
+    let receipt_options = use_resource(move || async move {
+        let _ = data_version();
+        load_dividend_receipt_form_options()
+    });
+    let institution_options = use_resource(move || async move {
+        let _ = data_version();
+        load_institution_options()
+    });
+    let mut is_creating = use_signal(|| false);
+    let mut editing_receipt = use_signal(|| None::<DividendReceiptRow>);
+    let mut status_message = use_signal(String::new);
 
     rsx! {
         PageHeader {
@@ -76,10 +342,22 @@ pub fn DividendIncomePage() -> Element {
             description: "第一階段僅查看新制逐筆股息；舊 Excel 彙總請至 Excel 歷史股息頁。".to_string(),
         }
 
+        if !status_message().is_empty() {
+            div { class: "status-message success", "{status_message}" }
+        }
+
         div { class: "stack",
             section { class: "section-block",
                 h3 { "新制逐筆股息" }
-                Link { class: "inline-link", to: crate::routes::Route::DividendsLegacyPage {}, "查看 Excel 歷史股息彙總" }
+                div { class: "section-actions",
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        onclick: move |_| is_creating.set(true),
+                        "＋新增股息"
+                    }
+                    Link { class: "inline-link", to: crate::routes::Route::DividendsLegacyPage {}, "查看 Excel 歷史股息彙總" }
+                }
                 match receipts() {
                     None => rsx! { StatusCard { text: "正在載入資料…".to_string() } },
                     Some(Err(error)) => rsx! { StatusCard { text: format!("無法讀取逐筆股息資料：{error}") } },
@@ -89,7 +367,273 @@ pub fn DividendIncomePage() -> Element {
                             p { "這不是錯誤。第一階段不新增資料；Excel 匯入的歷史彙總保留為唯讀歷史參考。" }
                         }
                     },
-                    Some(Ok(rows)) => rsx! { DividendReceiptTable { rows } },
+                    Some(Ok(rows)) => rsx! {
+                        DividendReceiptTable {
+                            rows,
+                            on_edit: move |row| editing_receipt.set(Some(row)),
+                        }
+                    },
+                }
+            }
+        }
+
+        if is_creating() {
+            match receipt_options() {
+                None => rsx! { StatusCard { text: "載入新增股息選項中...".to_string() } },
+                Some(Err(error)) => rsx! { StatusCard { text: format!("讀取新增股息選項失敗：{error}") } },
+                Some(Ok(options)) => rsx! {
+                    DividendReceiptUpsertModal {
+                        options,
+                        institutions: institution_options()
+                            .and_then(|result| result.ok())
+                            .unwrap_or_default(),
+                        receipt: None,
+                        allow_delete: false,
+                        on_close: move |_| is_creating.set(false),
+                        on_saved: move |message| {
+                            status_message.set(message);
+                            is_creating.set(false);
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                        on_deleted: move |_| {},
+                        on_account_created: move |account_id_value| {
+                            status_message.set(format!("已新增帳戶 #{account_id_value}"));
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                        on_instrument_created: move |(instrument_id_value, _currency_code_value): (i64, String)| {
+                            status_message.set(format!("已新增商品 #{instrument_id_value}"));
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                    }
+                },
+            }
+        }
+
+        if let Some(receipt) = editing_receipt() {
+            match receipt_options() {
+                None => rsx! { StatusCard { text: "載入編輯股息選項中...".to_string() } },
+                Some(Err(error)) => rsx! { StatusCard { text: format!("讀取編輯股息選項失敗：{error}") } },
+                Some(Ok(options)) => rsx! {
+                    DividendReceiptUpsertModal {
+                        options,
+                        institutions: institution_options()
+                            .and_then(|result| result.ok())
+                            .unwrap_or_default(),
+                        receipt: Some(receipt),
+                        allow_delete: true,
+                        on_close: move |_| editing_receipt.set(None),
+                        on_saved: move |message| {
+                            status_message.set(message);
+                            editing_receipt.set(None);
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                        on_deleted: move |message| {
+                            status_message.set(message);
+                            editing_receipt.set(None);
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                        on_account_created: move |account_id_value| {
+                            status_message.set(format!("已新增帳戶 #{account_id_value}"));
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                        on_instrument_created: move |(instrument_id_value, _currency_code_value): (i64, String)| {
+                            status_message.set(format!("已新增商品 #{instrument_id_value}"));
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+pub fn ExchangeRatePage() -> Element {
+    let data_version = use_context::<Signal<u64>>();
+    let rates = use_resource(move || async move {
+        let _ = data_version();
+        load_recent_exchange_rates(20)
+    });
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut base_currency_code = use_signal(|| "USD".to_string());
+    let mut rate_date = use_signal(|| today);
+    let mut rate = use_signal(String::new);
+    let mut note = use_signal(String::new);
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+    let mut success_message = use_signal(String::new);
+
+    rsx! {
+        PageHeader {
+            title: "匯率維護".to_string(),
+            description: "維護 {base_currency}/NTD 匯率，讓外幣估值與缺匯率警告可被修復。".replace("{base_currency}", &base_currency_code()),
+        }
+
+        section { class: "card",
+            if !success_message().is_empty() {
+                div { class: "status-message success", "{success_message}" }
+            }
+            if !error_message().is_empty() {
+                div { class: "status-message error quick-price-error", "{error_message}" }
+            }
+            div { class: "form-grid two-column",
+                label { class: "form-field",
+                    span { "來源幣別" }
+                    input {
+                        value: "{base_currency_code}",
+                        oninput: move |event| {
+                            error_message.set(String::new());
+                            success_message.set(String::new());
+                            base_currency_code.set(event.value().to_uppercase());
+                        },
+                        disabled: is_saving(),
+                        placeholder: "USD",
+                    }
+                }
+                div { class: "form-field",
+                    span { "目標幣別" }
+                    div { class: "readonly-field", "NTD" }
+                }
+                label { class: "form-field",
+                    span { "匯率日期" }
+                    input {
+                        r#type: "date",
+                        value: "{rate_date}",
+                        oninput: move |event| {
+                            error_message.set(String::new());
+                            success_message.set(String::new());
+                            rate_date.set(event.value());
+                        },
+                        disabled: is_saving(),
+                    }
+                }
+                label { class: "form-field",
+                    span { "匯率" }
+                    input {
+                        value: "{rate}",
+                        oninput: move |event| {
+                            error_message.set(String::new());
+                            success_message.set(String::new());
+                            rate.set(event.value());
+                        },
+                        disabled: is_saving(),
+                        placeholder: "31.25",
+                    }
+                }
+                label { class: "form-field full-width",
+                    span { "備註" }
+                    textarea {
+                        value: "{note}",
+                        oninput: move |event| {
+                            error_message.set(String::new());
+                            success_message.set(String::new());
+                            note.set(event.value());
+                        },
+                        disabled: is_saving(),
+                        rows: "3",
+                        placeholder: "選填",
+                    }
+                }
+            }
+            div { class: "modal-actions",
+                button {
+                    r#type: "button",
+                    class: "ghost-button",
+                    disabled: is_saving(),
+                    onclick: move |_| {
+                        error_message.set(String::new());
+                        success_message.set(String::new());
+                        rate.set(String::new());
+                        note.set(String::new());
+                    },
+                    "清空"
+                }
+                button {
+                    r#type: "button",
+                    class: "primary-button",
+                    disabled: is_saving(),
+                    onclick: move |_| {
+                        if is_saving() {
+                            return;
+                        }
+
+                        is_saving.set(true);
+                        error_message.set(String::new());
+                        success_message.set(String::new());
+
+                        let input = ExchangeRateInput {
+                            base_currency_code: base_currency_code(),
+                            rate_date: rate_date(),
+                            rate: rate(),
+                            note: note(),
+                        };
+
+                        let mut is_saving = is_saving;
+                        let mut error_message = error_message;
+                        let mut success_message = success_message;
+                        let mut data_version = data_version;
+
+                        spawn(async move {
+                            match run_exchange_rate_save(input).await {
+                                Ok(()) => {
+                                    success_message.set("匯率已儲存".to_string());
+                                    data_version.with_mut(|value| *value += 1);
+                                }
+                                Err(error) => error_message.set(error.to_string()),
+                            }
+
+                            is_saving.set(false);
+                        });
+                    },
+                    if is_saving() { "儲存中..." } else { "儲存匯率" }
+                }
+            }
+        }
+
+        match rates() {
+            None => rsx! { StatusCard { text: "載入最近匯率中...".to_string() } },
+            Some(Err(error)) => rsx! { StatusCard { text: format!("讀取最近匯率失敗：{error}") } },
+            Some(Ok(rows)) if rows.is_empty() => rsx! { StatusCard { text: "目前沒有匯率資料。".to_string() } },
+            Some(Ok(rows)) => rsx! { ExchangeRateTable { rows } },
+        }
+    }
+}
+
+#[component]
+fn ExchangeRateTable(rows: Vec<ExchangeRateRow>) -> Element {
+    rsx! {
+        section { class: "card table-card",
+            div { class: "table-summary",
+                strong { "最近匯率" }
+                span { "{rows.len()} 筆" }
+            }
+            div { class: "table-wrap",
+                table { class: "account-assets-table",
+                    thead {
+                        tr {
+                            th { "日期" }
+                            th { "來源幣別" }
+                            th { "目標幣別" }
+                            th { "匯率" }
+                            th { "來源" }
+                            th { "備註" }
+                        }
+                    }
+                    tbody {
+                        for row in rows {
+                            tr {
+                                td { class: "mono", "{row.rate_date}" }
+                                td { class: "mono", "{row.base_currency_code}" }
+                                td { class: "mono", "{row.quote_currency_code}" }
+                                td { class: "number", "{row.rate_text}" }
+                                td { "{row.origin}" }
+                                td { "{row.note}" }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -275,13 +819,19 @@ fn MetricCard(label: String, value: String, hint: String, accent: String) -> Ele
 }
 
 #[component]
-fn DividendReceiptTable(rows: Vec<DividendReceiptRow>) -> Element {
+fn DividendReceiptTable(
+    rows: Vec<DividendReceiptRow>,
+    on_edit: EventHandler<DividendReceiptRow>,
+) -> Element {
+    let summary = build_dividend_receipt_summary(&rows);
+
     rsx! {
         section { class: "card table-card",
             div { class: "table-summary",
                 strong { "{rows.len()} 筆逐筆股息" }
                 span { "來源 dividend_receipt / v_dividend_receipt_amount" }
             }
+            DividendReceiptSummaryPanel { summary }
             div { class: "table-wrap",
                 table { class: "dividend-receipt-table",
                     thead {
@@ -290,6 +840,7 @@ fn DividendReceiptTable(rows: Vec<DividendReceiptRow>) -> Element {
                             th { "入帳帳戶" }
                             th { "代號" }
                             th { "商品" }
+                            th { "來源" }
                             th { "入帳日期" }
                             th { "稅前金額" }
                             th { "稅額" }
@@ -297,28 +848,884 @@ fn DividendReceiptTable(rows: Vec<DividendReceiptRow>) -> Element {
                             th { "實收金額" }
                             th { "幣別" }
                             th { "備註" }
+                            th { "操作" }
                         }
                     }
                     tbody {
                         for row in rows {
-                            tr {
-                                td { "{row.owner_name}" }
-                                td { "{row.account_name}" }
-                                td { class: "mono", "{row.symbol}" }
-                                td { class: "name-cell", "{row.instrument_name}" }
-                                td { class: "mono", "{row.received_on}" }
-                                td { class: "number", "{money(row.gross_amount)}" }
-                                td { class: "number", "{money(row.tax_amount)}" }
-                                td { class: "number", "{money(row.fee_amount)}" }
-                                td { class: "number strong", "{money(row.net_amount)}" }
-                                td { class: "mono", "{row.currency_code}" }
-                                td { "{row.note}" }
-                            }
+                            DividendReceiptRowView { row, on_edit: move |receipt| on_edit.call(receipt) }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+#[component]
+fn DividendReceiptRowView(
+    row: DividendReceiptRow,
+    on_edit: EventHandler<DividendReceiptRow>,
+) -> Element {
+    let can_edit = row.origin == "MANUAL";
+
+    rsx! {
+        tr {
+            td { "{row.owner_name}" }
+            td { "{row.account_name}" }
+            td { class: "mono", "{row.symbol}" }
+            td { class: "name-cell", "{row.instrument_name}" }
+            td { class: "mono", "{row.origin}" }
+            td { class: "mono", "{row.received_on}" }
+            td { class: "number", "{money(row.gross_amount)}" }
+            td { class: "number", "{money(row.tax_amount)}" }
+            td { class: "number", "{money(row.fee_amount)}" }
+            td { class: "number strong", "{money(row.net_amount)}" }
+            td { class: "mono", "{row.currency_code}" }
+            td { "{row.note}" }
+            td {
+                if can_edit {
+                    button {
+                        r#type: "button",
+                        class: "inline-action",
+                        onclick: move |_| on_edit.call(row.clone()),
+                        "編輯"
+                    }
+                } else {
+                    span { class: "muted", "唯讀" }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DividendReceiptSummary {
+    currency_totals: Vec<(String, Decimal)>,
+    owner_totals: Vec<(String, Decimal)>,
+    instrument_totals: Vec<(String, Decimal)>,
+    year_totals: Vec<(String, Decimal)>,
+    month_totals: Vec<(String, Decimal)>,
+}
+
+#[component]
+fn DividendReceiptSummaryPanel(summary: DividendReceiptSummary) -> Element {
+    rsx! {
+        section { class: "table-summary-grid",
+            DividendReceiptSummaryTable {
+                title: "按幣別".to_string(),
+                rows: summary.currency_totals,
+            }
+            DividendReceiptSummaryTable {
+                title: "按所有權人".to_string(),
+                rows: summary.owner_totals,
+            }
+            DividendReceiptSummaryTable {
+                title: "按商品".to_string(),
+                rows: summary.instrument_totals,
+            }
+            DividendReceiptSummaryTable {
+                title: "按年度".to_string(),
+                rows: summary.year_totals,
+            }
+            DividendReceiptSummaryTable {
+                title: "按月份".to_string(),
+                rows: summary.month_totals,
+            }
+        }
+    }
+}
+
+#[component]
+fn DividendReceiptSummaryTable(title: String, rows: Vec<(String, Decimal)>) -> Element {
+    rsx! {
+        section { class: "card summary-card",
+            strong { "{title}" }
+            if rows.is_empty() {
+                p { class: "muted", "目前沒有資料" }
+            } else {
+                div { class: "summary-list",
+                    for (label, value) in rows {
+                        div {
+                            span { "{label}" }
+                            strong { "{money(Some(decimal_to_money(value)))}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DividendReceiptAccountChoice {
+    account_id: i64,
+    label: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DividendReceiptInstrumentChoice {
+    instrument_id: i64,
+    label: String,
+    currency_code: String,
+}
+
+#[component]
+fn DividendReceiptUpsertModal(
+    options: DividendReceiptFormOptions,
+    institutions: Vec<InstitutionOption>,
+    receipt: Option<DividendReceiptRow>,
+    allow_delete: bool,
+    on_close: EventHandler<()>,
+    on_saved: EventHandler<String>,
+    on_deleted: EventHandler<String>,
+    on_account_created: EventHandler<i64>,
+    on_instrument_created: EventHandler<(i64, String)>,
+) -> Element {
+    let is_editing = receipt.is_some();
+    let receipt_for_account = receipt.clone();
+    let receipt_for_instrument = receipt.clone();
+    let receipt_for_received_on = receipt.clone();
+    let receipt_for_net_amount = receipt.clone();
+    let receipt_for_currency_code = receipt.clone();
+    let receipt_for_note = receipt.clone();
+    let receipt_for_save = receipt.clone();
+    let receipt_for_delete = receipt;
+    let institutions_for_select = institutions.clone();
+
+    let account_choices = options
+        .accounts
+        .iter()
+        .map(|option| DividendReceiptAccountChoice {
+            account_id: option.account_id,
+            label: dividend_receipt_account_label(option),
+        })
+        .collect::<Vec<_>>();
+    let instrument_choices = options
+        .instruments
+        .iter()
+        .map(|option| DividendReceiptInstrumentChoice {
+            instrument_id: option.instrument_id,
+            label: dividend_receipt_instrument_label(option),
+            currency_code: option.currency_code.clone(),
+        })
+        .collect::<Vec<_>>();
+    let account_choices_for_select = account_choices.clone();
+    let instrument_choices_for_select = instrument_choices.clone();
+    let instrument_choices_for_lookup = instrument_choices.clone();
+    let account_choices_for_effect = account_choices.clone();
+    let instrument_choices_for_effect = instrument_choices.clone();
+
+    let mut account_id = use_signal(|| {
+        receipt_for_account
+            .as_ref()
+            .map(|row| row.account_id.to_string())
+            .or_else(|| {
+                account_choices
+                    .first()
+                    .map(|option| option.account_id.to_string())
+            })
+            .unwrap_or_default()
+    });
+    let mut instrument_id = use_signal(|| {
+        receipt_for_instrument
+            .as_ref()
+            .map(|row| row.instrument_id.to_string())
+            .or_else(|| {
+                instrument_choices
+                    .first()
+                    .map(|option| option.instrument_id.to_string())
+            })
+            .unwrap_or_default()
+    });
+    let mut received_on = use_signal(|| {
+        receipt_for_received_on
+            .as_ref()
+            .map(|row| row.received_on.clone())
+            .unwrap_or_default()
+    });
+    let mut net_amount = use_signal(|| {
+        receipt_for_net_amount
+            .as_ref()
+            .and_then(|row| row.net_amount)
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    });
+    let mut currency_code = use_signal(|| {
+        receipt_for_currency_code
+            .as_ref()
+            .map(|row| row.currency_code.clone())
+            .or_else(|| {
+                instrument_choices
+                    .first()
+                    .map(|option| option.currency_code.clone())
+            })
+            .or_else(|| options.currency_codes.first().cloned())
+            .unwrap_or_else(|| "NTD".to_string())
+    });
+    let mut note = use_signal(|| {
+        receipt_for_note
+            .as_ref()
+            .map(|row| row.note.clone())
+            .unwrap_or_default()
+    });
+    let mut is_saving = use_signal(|| false);
+    let mut is_deleting = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+    let mut confirm_delete = use_signal(|| false);
+    let mut creating_account = use_signal(|| false);
+    let mut creating_instrument = use_signal(|| false);
+
+    use_effect(move || {
+        if !is_editing && received_on().is_empty() {
+            received_on.set(
+                chrono::Local::now()
+                    .date_naive()
+                    .format("%Y-%m-%d")
+                    .to_string(),
+            );
+        }
+    });
+
+    use_effect(move || {
+        if account_id().is_empty() {
+            if let Some(first_account) = account_choices_for_effect.first() {
+                account_id.set(first_account.account_id.to_string());
+            }
+        }
+    });
+
+    use_effect(move || {
+        if instrument_id().is_empty() {
+            if let Some(first_instrument) = instrument_choices_for_effect.first() {
+                instrument_id.set(first_instrument.instrument_id.to_string());
+                currency_code.set(first_instrument.currency_code.clone());
+            }
+        }
+    });
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal-card",
+                div { class: "modal-header",
+                    div {
+                        p { class: "eyebrow", "手動新增" }
+                        if is_editing {
+                            h3 { "編輯股息收入" }
+                        } else {
+                            h3 { "新增股息收入" }
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        "關閉"
+                    }
+                }
+                if !error_message().is_empty() {
+                    div { class: "status-message error", "{error_message}" }
+                }
+                div { class: "form-grid two-column",
+                    label { class: "form-field",
+                        span { "入帳帳戶" }
+                        select {
+                            value: "{account_id}",
+                            oninput: move |event| account_id.set(event.value()),
+                            disabled: is_saving(),
+                            for option in account_choices_for_select {
+                                option { value: "{option.account_id}", "{option.label}" }
+                            }
+                        }
+                        button {
+                            r#type: "button",
+                            class: "ghost-button inline-action",
+                            disabled: is_saving(),
+                            onclick: move |_| creating_account.set(true),
+                            "＋新增帳戶"
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "商品" }
+                        select {
+                            value: "{instrument_id}",
+                            oninput: move |event| {
+                                let selected_id = event.value();
+                                instrument_id.set(selected_id.clone());
+                                if let Some(selected) = instrument_choices_for_lookup
+                                    .iter()
+                                    .find(|option| option.instrument_id.to_string() == selected_id)
+                                {
+                                    currency_code.set(selected.currency_code.clone());
+                                }
+                            },
+                            disabled: is_saving(),
+                            for option in instrument_choices_for_select {
+                                option { value: "{option.instrument_id}", "{option.label}" }
+                            }
+                        }
+                        button {
+                            r#type: "button",
+                            class: "ghost-button inline-action",
+                            disabled: is_saving(),
+                            onclick: move |_| creating_instrument.set(true),
+                            "＋新增商品"
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "入帳日期" }
+                        input {
+                            r#type: "date",
+                            value: "{received_on}",
+                            oninput: move |event| received_on.set(event.value()),
+                            disabled: is_saving(),
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "實收金額" }
+                        input {
+                            value: "{net_amount}",
+                            oninput: move |event| net_amount.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "1000.50",
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "幣別" }
+                        select {
+                            value: "{currency_code}",
+                            oninput: move |event| currency_code.set(event.value()),
+                            disabled: is_saving(),
+                            for currency in &options.currency_codes {
+                                option { value: "{currency}", "{currency}" }
+                            }
+                        }
+                    }
+                    label { class: "form-field full-width",
+                        span { "備註" }
+                        textarea {
+                            value: "{note}",
+                            oninput: move |event| note.set(event.value()),
+                            disabled: is_saving(),
+                            rows: "3",
+                            placeholder: "選填",
+                        }
+                    }
+                }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            error_message.set(String::new());
+                            net_amount.set(String::new());
+                            note.set(String::new());
+                        },
+                        "清空"
+                    }
+                    if allow_delete {
+                        button {
+                            r#type: "button",
+                            class: "ghost-button danger",
+                            disabled: is_saving() || is_deleting(),
+                            onclick: move |_| {
+                                error_message.set(String::new());
+                                confirm_delete.set(true);
+                            },
+                            "刪除"
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if is_saving() {
+                                return;
+                            }
+
+                            is_saving.set(true);
+                            error_message.set(String::new());
+
+                            let account_id_value = account_id().parse::<i64>().unwrap_or_default();
+                            let instrument_id_value = instrument_id().parse::<i64>().unwrap_or_default();
+                            let current_received_on = received_on();
+                            let current_net_amount = net_amount();
+                            let current_currency_code = currency_code();
+                            let current_note = note();
+
+                            let mut is_saving = is_saving;
+                            let mut error_message = error_message;
+                            let receipt_id = receipt_for_save.as_ref().map(|row| row.receipt_id);
+
+                            spawn(async move {
+                                let result = if let Some(receipt_id) = receipt_id {
+                                    run_dividend_receipt_update(DividendReceiptUpdateInput {
+                                        receipt_id,
+                                        account_id: account_id_value,
+                                        instrument_id: instrument_id_value,
+                                        received_on: current_received_on,
+                                        net_amount_text: current_net_amount,
+                                        currency_code: current_currency_code,
+                                        note: current_note,
+                                    })
+                                    .await
+                                    .map(|_| "股息收入已更新".to_string())
+                                } else {
+                                    run_dividend_receipt_save(DividendReceiptInput {
+                                        account_id: account_id_value,
+                                        instrument_id: instrument_id_value,
+                                        received_on: current_received_on,
+                                        net_amount_text: current_net_amount,
+                                        currency_code: current_currency_code,
+                                        note: current_note,
+                                    })
+                                    .await
+                                    .map(|_| "股息收入已新增".to_string())
+                                };
+
+                                match result {
+                                    Ok(message) => on_saved.call(message),
+                                    Err(error) => error_message.set(error.to_string()),
+                                }
+
+                                is_saving.set(false);
+                            });
+                        },
+                        if is_saving() {
+                            "儲存中..."
+                        } else if is_editing {
+                            "更新股息"
+                        } else {
+                            "儲存股息"
+                        }
+                    }
+                }
+                if confirm_delete() {
+                    div { class: "delete-confirmation",
+                        p { "確定要刪除這筆手動股息紀錄嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: is_saving() || is_deleting(),
+                                onclick: move |_| confirm_delete.set(false),
+                                "取消"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: is_saving() || is_deleting(),
+                                onclick: move |_| {
+                                    if is_deleting() {
+                                        return;
+                                    }
+
+                                    is_deleting.set(true);
+                                    error_message.set(String::new());
+                                    let receipt_id = receipt_for_delete
+                                        .as_ref()
+                                        .map(|row| row.receipt_id)
+                                        .unwrap_or_default();
+                                    let mut is_deleting = is_deleting;
+                                    let mut error_message = error_message;
+
+                                    spawn(async move {
+                                        match run_dividend_receipt_delete(DividendReceiptDeleteInput { receipt_id }).await {
+                                            Ok(()) => on_deleted.call("股息收入已刪除".to_string()),
+                                            Err(error) => error_message.set(error.to_string()),
+                                        }
+
+                                        is_deleting.set(false);
+                                    });
+                                },
+                                "確認刪除"
+                            }
+                        }
+                    }
+                }
+                if creating_account() {
+                    AccountCreateModal {
+                        institutions: institutions_for_select.clone(),
+                        on_close: move |_| creating_account.set(false),
+                        on_created: move |account_id_value: i64| {
+                            account_id.set(account_id_value.to_string());
+                            on_account_created.call(account_id_value);
+                            creating_account.set(false);
+                        },
+                    }
+                }
+                if creating_instrument() {
+                    InstrumentCreateModal {
+                        currency_codes: options.currency_codes.clone(),
+                        on_close: move |_| creating_instrument.set(false),
+                        on_created: move |(instrument_id_value, currency_code_value): (i64, String)| {
+                            instrument_id.set(instrument_id_value.to_string());
+                            currency_code.set(currency_code_value.clone());
+                            on_instrument_created.call((instrument_id_value, currency_code_value));
+                            creating_instrument.set(false);
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn AccountCreateModal(
+    institutions: Vec<InstitutionOption>,
+    on_close: EventHandler<()>,
+    on_created: EventHandler<i64>,
+) -> Element {
+    let mut display_name = use_signal(String::new);
+    let institutions_for_memo = institutions.clone();
+    let institutions_for_effect = institutions.clone();
+    let institution_count = use_memo(move || institutions_for_memo.len());
+    let mut institution_id = use_signal(|| {
+        institutions
+            .first()
+            .map(|institution| institution.institution_id.to_string())
+            .unwrap_or_default()
+    });
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+
+    use_effect(move || {
+        let _ = institution_count();
+        if institution_id().is_empty() {
+            if let Some(first) = institutions_for_effect.first() {
+                institution_id.set(first.institution_id.to_string());
+            }
+        }
+    });
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal-card",
+                div { class: "modal-header",
+                    div {
+                        p { class: "eyebrow", "最小主檔" }
+                        h3 { "新增帳戶" }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        "關閉"
+                    }
+                }
+                if !error_message().is_empty() {
+                    div { class: "status-message error", "{error_message}" }
+                }
+                div { class: "form-grid two-column",
+                    label { class: "form-field full-width",
+                        span { "帳戶名稱" }
+                        input {
+                            value: "{display_name}",
+                            oninput: move |event| display_name.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "新帳戶",
+                        }
+                    }
+                    label { class: "form-field full-width",
+                        span { "金融機構" }
+                        select {
+                            value: "{institution_id}",
+                            oninput: move |event| institution_id.set(event.value()),
+                            disabled: is_saving(),
+                            for institution in &institutions {
+                                option { value: "{institution.institution_id}", "{institution.name}" }
+                            }
+                        }
+                    }
+                }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: is_saving(),
+                        onclick: move |_| on_close.call(()),
+                        "取消"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if is_saving() {
+                                return;
+                            }
+
+                            is_saving.set(true);
+                            error_message.set(String::new());
+                            let input = AccountCreateInput {
+                                institution_id: institution_id().parse::<i64>().unwrap_or_default(),
+                                display_name: display_name(),
+                            };
+                            let mut is_saving = is_saving;
+                            let mut error_message = error_message;
+
+                            spawn(async move {
+                                match run_account_create(input).await {
+                                    Ok(account_id) => on_created.call(account_id),
+                                    Err(error) => error_message.set(error.to_string()),
+                                }
+                                is_saving.set(false);
+                            });
+                        },
+                        if is_saving() { "儲存中..." } else { "儲存帳戶" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn InstrumentCreateModal(
+    currency_codes: Vec<String>,
+    on_close: EventHandler<()>,
+    on_created: EventHandler<(i64, String)>,
+) -> Element {
+    let mut symbol = use_signal(String::new);
+    let mut name = use_signal(String::new);
+    let currency_codes_for_memo = currency_codes.clone();
+    let currency_codes_for_effect = currency_codes.clone();
+    let currency_count = use_memo(move || currency_codes_for_memo.len());
+    let mut trading_currency_code = use_signal(|| {
+        currency_codes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "NTD".to_string())
+    });
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+
+    use_effect(move || {
+        let _ = currency_count();
+        if trading_currency_code().is_empty() {
+            if let Some(first) = currency_codes_for_effect.first() {
+                trading_currency_code.set(first.clone());
+            }
+        }
+    });
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal-card",
+                div { class: "modal-header",
+                    div {
+                        p { class: "eyebrow", "最小主檔" }
+                        h3 { "新增商品" }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        "關閉"
+                    }
+                }
+                if !error_message().is_empty() {
+                    div { class: "status-message error", "{error_message}" }
+                }
+                div { class: "form-grid two-column",
+                    label { class: "form-field",
+                        span { "商品代號" }
+                        input {
+                            value: "{symbol}",
+                            oninput: move |event| symbol.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "ABC",
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "商品名稱" }
+                        input {
+                            value: "{name}",
+                            oninput: move |event| name.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "新商品",
+                        }
+                    }
+                    label { class: "form-field full-width",
+                        span { "交易幣別" }
+                        select {
+                            value: "{trading_currency_code}",
+                            oninput: move |event| trading_currency_code.set(event.value()),
+                            disabled: is_saving(),
+                            for currency in &currency_codes {
+                                option { value: "{currency}", "{currency}" }
+                            }
+                        }
+                    }
+                }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: is_saving(),
+                        onclick: move |_| on_close.call(()),
+                        "取消"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if is_saving() {
+                                return;
+                            }
+
+                            is_saving.set(true);
+                            error_message.set(String::new());
+                            let input = InstrumentCreateInput {
+                                symbol: symbol(),
+                                name: name(),
+                                trading_currency_code: trading_currency_code(),
+                            };
+                            let created_currency_code = trading_currency_code();
+                            let mut is_saving = is_saving;
+                            let mut error_message = error_message;
+
+                            spawn(async move {
+                                match run_instrument_create(input).await {
+                                    Ok(instrument_id) => on_created.call((instrument_id, created_currency_code)),
+                                    Err(error) => error_message.set(error.to_string()),
+                                }
+                                is_saving.set(false);
+                            });
+                        },
+                        if is_saving() { "儲存中..." } else { "儲存商品" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dividend_receipt_account_label(option: &DividendReceiptAccountOption) -> String {
+    format!(
+        "{} / {}",
+        option.owner_name.replace(',', "、"),
+        option.account_name
+    )
+}
+
+fn dividend_receipt_instrument_label(option: &DividendReceiptInstrumentOption) -> String {
+    format!(
+        "{} {} ({})",
+        option.symbol, option.instrument_name, option.currency_code
+    )
+}
+
+fn build_dividend_receipt_summary(rows: &[DividendReceiptRow]) -> DividendReceiptSummary {
+    let mut currency_totals = BTreeMap::<String, Decimal>::new();
+    let mut owner_totals = BTreeMap::<String, Decimal>::new();
+    let mut instrument_totals = BTreeMap::<String, Decimal>::new();
+    let mut year_totals = BTreeMap::<String, Decimal>::new();
+    let mut month_totals = BTreeMap::<String, Decimal>::new();
+
+    for row in rows {
+        let Some(net_amount) = row.net_amount else {
+            continue;
+        };
+
+        let net_amount_decimal = Decimal::from_f64(net_amount).unwrap_or(Decimal::ZERO);
+
+        *currency_totals
+            .entry(row.currency_code.clone())
+            .or_default() += net_amount_decimal;
+        *owner_totals.entry(row.owner_name.clone()).or_default() += net_amount_decimal;
+        *instrument_totals
+            .entry(format!("{} {}", row.symbol, row.instrument_name))
+            .or_default() += net_amount_decimal;
+
+        if let Some(year) = row.received_on.get(0..4) {
+            if year.chars().all(|ch| ch.is_ascii_digit()) {
+                *year_totals.entry(year.to_string()).or_default() += net_amount_decimal;
+            }
+        }
+
+        if let Some(month) = row.received_on.get(0..7) {
+            if month.len() == 7 && month.as_bytes().get(4) == Some(&b'-') {
+                *month_totals.entry(month.to_string()).or_default() += net_amount_decimal;
+            }
+        }
+    }
+
+    DividendReceiptSummary {
+        currency_totals: currency_totals.into_iter().collect(),
+        owner_totals: owner_totals.into_iter().collect(),
+        instrument_totals: instrument_totals.into_iter().collect(),
+        year_totals: year_totals.into_iter().collect(),
+        month_totals: month_totals.into_iter().collect(),
+    }
+}
+
+fn decimal_to_money(value: Decimal) -> f64 {
+    value.to_f64().unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod dividend_income_page_tests {
+    use super::*;
+
+    #[test]
+    fn build_dividend_receipt_summary_uses_exact_decimal_totals() {
+        let rows = vec![
+            DividendReceiptRow {
+                receipt_id: 1,
+                account_id: 1,
+                instrument_id: 1,
+                origin: "MANUAL".to_string(),
+                owner_name: "Alex".to_string(),
+                account_name: "Account 1".to_string(),
+                symbol: "AAA".to_string(),
+                instrument_name: "Alpha".to_string(),
+                received_on: "2026-07-09".to_string(),
+                gross_amount: None,
+                tax_amount: None,
+                fee_amount: None,
+                net_amount: Some(0.1),
+                currency_code: "NTD".to_string(),
+                note: String::new(),
+            },
+            DividendReceiptRow {
+                receipt_id: 2,
+                account_id: 1,
+                instrument_id: 1,
+                origin: "MANUAL".to_string(),
+                owner_name: "Alex".to_string(),
+                account_name: "Account 1".to_string(),
+                symbol: "AAA".to_string(),
+                instrument_name: "Alpha".to_string(),
+                received_on: "2026-07-10".to_string(),
+                gross_amount: None,
+                tax_amount: None,
+                fee_amount: None,
+                net_amount: Some(0.2),
+                currency_code: "NTD".to_string(),
+                note: String::new(),
+            },
+        ];
+
+        let summary = build_dividend_receipt_summary(&rows);
+
+        assert_eq!(summary.currency_totals[0].1, Decimal::new(3, 1));
+        assert_eq!(summary.month_totals[0].1, Decimal::new(3, 1));
+    }
+
+    #[test]
+    fn dividend_receipt_account_label_keeps_all_owners_readable() {
+        let label = dividend_receipt_account_label(&DividendReceiptAccountOption {
+            account_id: 1,
+            owner_name: "Alex,Beth".to_string(),
+            account_name: "Account 1".to_string(),
+        });
+
+        assert_eq!(label, "Alex、Beth / Account 1");
     }
 }
 
@@ -529,6 +1936,82 @@ fn SelectFilter(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_dividend_receipt_save(
+    input: DividendReceiptInput,
+) -> Result<(), crate::error::AppError> {
+    tokio::task::spawn_blocking(move || insert_manual_dividend_receipt(input))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("股息新增工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_dividend_receipt_save(
+    input: DividendReceiptInput,
+) -> Result<(), crate::error::AppError> {
+    insert_manual_dividend_receipt(input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_dividend_receipt_update(
+    input: DividendReceiptUpdateInput,
+) -> Result<(), crate::error::AppError> {
+    tokio::task::spawn_blocking(move || update_manual_dividend_receipt(input))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("股息更新工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_dividend_receipt_update(
+    input: DividendReceiptUpdateInput,
+) -> Result<(), crate::error::AppError> {
+    update_manual_dividend_receipt(input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_dividend_receipt_delete(
+    input: DividendReceiptDeleteInput,
+) -> Result<(), crate::error::AppError> {
+    tokio::task::spawn_blocking(move || delete_manual_dividend_receipt(input))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("股息刪除工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_dividend_receipt_delete(
+    input: DividendReceiptDeleteInput,
+) -> Result<(), crate::error::AppError> {
+    delete_manual_dividend_receipt(input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_account_create(input: AccountCreateInput) -> Result<i64, crate::error::AppError> {
+    tokio::task::spawn_blocking(move || create_manual_account(input))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("帳戶新增工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_account_create(input: AccountCreateInput) -> Result<i64, crate::error::AppError> {
+    create_manual_account(input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_instrument_create(
+    input: InstrumentCreateInput,
+) -> Result<i64, crate::error::AppError> {
+    tokio::task::spawn_blocking(move || create_manual_instrument(input))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("商品新增工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_instrument_create(
+    input: InstrumentCreateInput,
+) -> Result<i64, crate::error::AppError> {
+    create_manual_instrument(input)
+}
+
 fn unique_strings<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut values = values
         .filter(|value| !value.is_empty() && *value != "-")
@@ -537,6 +2020,88 @@ fn unique_strings<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_batch_price_save(input: BatchPriceInput) -> Result<usize, crate::error::AppError> {
+    tokio::task::spawn_blocking(move || upsert_manual_prices_batch(input))
+        .await
+        .map_err(|error| {
+            crate::error::AppError::Validation(format!("批次市價儲存工作失敗：{error}"))
+        })?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_batch_price_save(input: BatchPriceInput) -> Result<usize, crate::error::AppError> {
+    upsert_manual_prices_batch(input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_exchange_rate_save(input: ExchangeRateInput) -> Result<(), crate::error::AppError> {
+    tokio::task::spawn_blocking(move || upsert_manual_exchange_rate(input))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("匯率儲存工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_exchange_rate_save(input: ExchangeRateInput) -> Result<(), crate::error::AppError> {
+    upsert_manual_exchange_rate(input)
+}
+
+fn build_quick_price_update_rows(rows: &[HoldingMetric]) -> Vec<QuickPriceUpdateRow> {
+    #[derive(Clone)]
+    struct AggregateRow {
+        row: QuickPriceUpdateRow,
+        account_ids: HashSet<i64>,
+    }
+
+    let mut deduped = BTreeMap::<i64, AggregateRow>::new();
+
+    for row in rows {
+        let entry = deduped
+            .entry(row.instrument_id)
+            .or_insert_with(|| AggregateRow {
+                row: QuickPriceUpdateRow {
+                    instrument_id: row.instrument_id,
+                    symbol: row.symbol.clone(),
+                    instrument_name: row.instrument_name.clone(),
+                    currency_code: row
+                        .market_price_currency_code
+                        .clone()
+                        .unwrap_or_else(|| row.trading_currency_code.clone()),
+                    latest_price: row.market_price,
+                    latest_price_date: row.market_price_date.clone(),
+                    holding_account_count: 0,
+                },
+                account_ids: HashSet::new(),
+            });
+
+        entry.account_ids.insert(row.account_id);
+
+        if row.market_price_date > entry.row.latest_price_date {
+            entry.row.latest_price = row.market_price;
+            entry.row.latest_price_date = row.market_price_date.clone();
+            entry.row.currency_code = row
+                .market_price_currency_code
+                .clone()
+                .unwrap_or_else(|| row.trading_currency_code.clone());
+        }
+    }
+
+    let mut output = deduped
+        .into_values()
+        .map(|mut entry| {
+            entry.row.holding_account_count = entry.account_ids.len();
+            entry.row
+        })
+        .collect::<Vec<_>>();
+
+    output.sort_by(|left, right| {
+        left.symbol
+            .cmp(&right.symbol)
+            .then(left.instrument_name.cmp(&right.instrument_name))
+    });
+    output
 }
 
 fn compare_optional_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
@@ -548,6 +2113,9 @@ fn compare_optional_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ord
 
 #[component]
 fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
+    let mut editing_row = use_signal(|| None::<HoldingMetric>);
+    let mut editing_dividend_row = use_signal(|| None::<HoldingMetric>);
+    let mut status_message = use_signal(String::new);
     let mut owner_filter = use_signal(String::new);
     let mut type_filter = use_signal(String::new);
     let mut asset_class_filter = use_signal(String::new);
@@ -594,6 +2162,9 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
 
     rsx! {
         section { class: "card table-card",
+            if !status_message().is_empty() {
+                div { class: "status-message success", "{status_message}" }
+            }
             div { class: "table-summary",
                 strong { "{filtered_rows.len()} / {rows.len()} 筆持股" }
                 span { "篩選後市值：{money(Some(filtered_total))}" }
@@ -652,14 +2223,45 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                                 th { "預估年配息" }
                                 th { "預估殖利率" }
                                 th { "更新日" }
+                                th { "操作" }
                             }
                         }
                         tbody {
                             for row in filtered_rows {
-                                HoldingRow { row }
+                                HoldingRow {
+                                    row: row.clone(),
+                                    on_edit: move |holding| {
+                                        status_message.set(String::new());
+                                        editing_row.set(Some(holding));
+                                    },
+                                    on_dividend_edit: move |holding| {
+                                        status_message.set(String::new());
+                                        editing_dividend_row.set(Some(holding));
+                                    },
+                                }
                             }
                         }
                     }
+                }
+            }
+            if let Some(row) = editing_row() {
+                HoldingEditModal {
+                    row,
+                    on_close: move |_| editing_row.set(None),
+                    on_saved: move |message| {
+                        status_message.set(message);
+                        editing_row.set(None);
+                    },
+                }
+            }
+            if let Some(row) = editing_dividend_row() {
+                HoldingDividendAssumptionModal {
+                    row,
+                    on_close: move |_| editing_dividend_row.set(None),
+                    on_saved: move |message| {
+                        status_message.set(message);
+                        editing_dividend_row.set(None);
+                    },
                 }
             }
         }
@@ -668,6 +2270,8 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
 
 #[component]
 fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
+    let mut editing_row = use_signal(|| None::<AccountAsset>);
+    let mut status_message = use_signal(String::new);
     let mut owner_filter = use_signal(String::new);
     let mut institution_filter = use_signal(String::new);
     let mut asset_type_filter = use_signal(String::new);
@@ -710,6 +2314,9 @@ fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
 
     rsx! {
         section { class: "card table-card",
+            if !status_message().is_empty() {
+                div { class: "status-message success", "{status_message}" }
+            }
             div { class: "table-summary",
                 strong { "{filtered_rows.len()} / {rows.len()} 筆帳戶資產" }
                 span { "篩選後總額：{money(Some(filtered_total))}" }
@@ -762,22 +2369,39 @@ fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
                                 th { "數量" }
                                 th { "台幣價值" }
                                 th { "更新日" }
+                                th { "操作" }
                             }
                         }
                         tbody {
                             for row in filtered_rows {
-                                AccountAssetRow { row }
+                                AccountAssetRow {
+                                    row: row.clone(),
+                                    on_edit: move |asset| {
+                                        status_message.set(String::new());
+                                        editing_row.set(Some(asset));
+                                    },
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        if let Some(row) = editing_row() {
+            AccountAssetEditModal {
+                asset: row,
+                on_close: move |_| editing_row.set(None),
+                on_saved: move |message| {
+                    status_message.set(message);
+                    editing_row.set(None);
+                },
+            }
+        }
     }
 }
 
 #[component]
-fn AccountAssetRow(row: AccountAsset) -> Element {
+fn AccountAssetRow(row: AccountAsset, on_edit: EventHandler<AccountAsset>) -> Element {
     rsx! {
         tr {
             td { "{row.owner_name}" }
@@ -786,16 +2410,258 @@ fn AccountAssetRow(row: AccountAsset) -> Element {
             td { "{row.account_type}" }
             td { "{row.asset_type}" }
             td { class: "mono", "{row.currency_code}" }
-            td { class: "number", "{money(row.invested_amount)}" }
+            td { class: "number", "{decimal(row.invested_amount, 2)}" }
             td { class: "number", "{decimal(row.quantity, 2)}" }
             td { class: "number strong", "{money(row.current_value_ntd)}" }
             td { class: "mono", "{row.snapshot_date}" }
+            td {
+                button {
+                    r#type: "button",
+                    class: "inline-action",
+                    onclick: move |_| on_edit.call(row.clone()),
+                    "編輯"
+                }
+            }
         }
     }
 }
 
 #[component]
-fn HoldingRow(row: HoldingMetric) -> Element {
+fn AccountAssetEditModal(
+    asset: AccountAsset,
+    on_close: EventHandler<()>,
+    on_saved: EventHandler<String>,
+) -> Element {
+    let mut data_version = use_context::<Signal<u64>>();
+    let is_foreign = is_foreign_currency_asset(&asset.currency_code);
+
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let mut snapshot_date = use_signal(|| {
+        if asset.snapshot_date == "-" {
+            today
+        } else {
+            asset.snapshot_date.clone()
+        }
+    });
+    let mut quantity = use_signal(|| {
+        if is_foreign {
+            asset.quantity_text.clone().unwrap_or_default()
+        } else {
+            String::new()
+        }
+    });
+    let mut current_value_override = use_signal(|| {
+        if is_foreign {
+            String::new()
+        } else {
+            asset
+                .current_value_override_text
+                .clone()
+                .unwrap_or_default()
+        }
+    });
+    let mut invested_amount = use_signal(|| asset.invested_amount_text.clone().unwrap_or_default());
+    let mut note = use_signal(|| asset.note.clone());
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+    let currency_code_for_rate = asset.currency_code.clone();
+    let display_currency_code = asset.currency_code.clone();
+
+    let exchange_rate = use_resource(move || {
+        let _ = data_version();
+        let date = snapshot_date();
+        let currency = currency_code_for_rate.clone();
+        async move { load_applicable_exchange_rate(&currency, &date) }
+    });
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal-card",
+                div { class: "modal-header",
+                    div {
+                        h3 { "編輯帳戶資產" }
+                        p { class: "modal-subtitle", "{asset.account_name} / {asset_type_label(&asset.asset_type)} {asset.currency_code}" }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        disabled: is_saving(),
+                        "關閉"
+                    }
+                }
+                if !error_message().is_empty() {
+                    div { class: "status-message error", "{error_message}" }
+                }
+                div { class: "form-grid two-column",
+                    div { class: "form-field",
+                        span { "帳戶" }
+                        div { class: "readonly-field", "{asset.account_name}" }
+                    }
+                    div { class: "form-field",
+                        span { "資產類型" }
+                        div { class: "readonly-field", "{asset_type_label(&asset.asset_type)}" }
+                    }
+                    div { class: "form-field",
+                        span { "幣別" }
+                        div { class: "readonly-field", "{asset.currency_code}" }
+                    }
+                    label { class: "form-field",
+                        span { "資料日期" }
+                        input {
+                            r#type: "date",
+                            value: "{snapshot_date}",
+                            required: true,
+                            oninput: move |event| snapshot_date.set(event.value()),
+                            disabled: is_saving(),
+                        }
+                    }
+                    if is_foreign {
+                        label { class: "form-field",
+                            span { "外幣數量" }
+                            input {
+                                value: "{quantity}",
+                                oninput: move |event| quantity.set(event.value()),
+                                disabled: is_saving(),
+                                placeholder: "0",
+                            }
+                        }
+                    } else {
+                        label { class: "form-field",
+                            span { "目前餘額" }
+                            input {
+                                value: "{current_value_override}",
+                                oninput: move |event| current_value_override.set(event.value()),
+                                disabled: is_saving(),
+                                placeholder: "0",
+                            }
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "投入金額" }
+                        input {
+                            value: "{invested_amount}",
+                            oninput: move |event| invested_amount.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "選填",
+                        }
+                    }
+                    if is_foreign {
+                        div { class: "exchange-preview",
+                            match exchange_rate() {
+                                None => rsx! { span { class: "form-warning", "查詢匯率中..." } },
+                                Some(Err(_)) => rsx! {
+                                    span { class: "form-warning",
+                                        "找不到 {display_currency_code}/NTD 適用匯率，外幣數量仍可儲存但台幣價值暫時無法計算。"
+                                    }
+                                },
+                                Some(Ok(None)) => rsx! {
+                                    span { class: "form-warning",
+                                        "找不到 {display_currency_code}/NTD 適用匯率，外幣數量仍可儲存但台幣價值暫時無法計算。"
+                                    }
+                                },
+                                Some(Ok(Some(preview))) => {
+                                    let parsed_quantity = quantity()
+                                        .trim()
+                                        .parse::<rust_decimal::Decimal>()
+                                        .ok();
+                                    let parsed_rate = preview.rate_text
+                                        .parse::<rust_decimal::Decimal>()
+                                        .ok();
+                                    let ntd_display = parsed_quantity
+                                        .zip(parsed_rate)
+                                        .map(|(q, r)| crate::format::money(Some(
+                                            (q * r).to_string().parse::<f64>().unwrap_or(0.0)
+                                        )))
+                                        .unwrap_or_else(|| "-".to_string());
+
+                                    rsx! {
+                                        span { "適用匯率：{preview.rate_text}" }
+                                        span { "匯率日期：{preview.rate_date}" }
+                                        span { strong { "換算台幣：{ntd_display}" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "備註" }
+                        input {
+                            value: "{note}",
+                            oninput: move |event| note.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "選填",
+                        }
+                    }
+                }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        disabled: is_saving(),
+                        "取消"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            is_saving.set(true);
+                            error_message.set(String::new());
+
+                            let input = AccountAssetInput {
+                                source_snapshot_id: Some(asset.snapshot_id),
+                                account_id: asset.account_id,
+                                snapshot_date: snapshot_date(),
+                                asset_type: asset.asset_type.clone(),
+                                currency_code: asset.currency_code.clone(),
+                                quantity: quantity(),
+                                invested_amount: invested_amount(),
+                                current_value_override: current_value_override(),
+                                note: note(),
+                            };
+
+                            match validate_account_asset_input(&input) {
+                                Err(error) => {
+                                    error_message.set(error.to_string());
+                                    is_saving.set(false);
+                                }
+                                Ok(validated) => {
+                                    match upsert_manual_account_asset(validated) {
+                                        Ok(_snapshot_id) => {
+                                            data_version.with_mut(|v| *v += 1);
+                                            is_saving.set(false);
+                                            on_saved.call(format!("{} {} 已更新", asset_type_label(&asset.asset_type), asset.account_name));
+                                        }
+                                        Err(error) => {
+                                            error_message.set(format!("儲存失敗：{error}"));
+                                            is_saving.set(false);
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        if is_saving() { "儲存中..." } else { "儲存" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn HoldingRow(
+    row: HoldingMetric,
+    on_edit: EventHandler<HoldingMetric>,
+    on_dividend_edit: EventHandler<HoldingMetric>,
+) -> Element {
+    let edit_row = row.clone();
+    let dividend_row = row.clone();
     let profit_class = match row.unrealized_profit {
         Some(value) if value > 0.0 => "number positive",
         Some(value) if value < 0.0 => "number negative",
@@ -821,6 +2687,318 @@ fn HoldingRow(row: HoldingMetric) -> Element {
             td { class: "number", "{money(row.estimated_annual_dividend)}" }
             td { class: "number", "{percent(row.estimated_yield_on_cost)}" }
             td { class: "mono", "{row.snapshot_date}" }
+            td {
+                button {
+                    r#type: "button",
+                    class: "inline-action",
+                    onclick: move |_| on_edit.call(edit_row.clone()),
+                    "更新目前資料"
+                }
+                button {
+                    r#type: "button",
+                    class: "inline-action",
+                    onclick: move |_| on_dividend_edit.call(dividend_row.clone()),
+                    "編輯配息估計"
+                }
+            }
         }
     }
+}
+
+#[component]
+fn HoldingEditModal(
+    row: HoldingMetric,
+    on_close: EventHandler<()>,
+    on_saved: EventHandler<String>,
+) -> Element {
+    let mut data_version = use_context::<Signal<u64>>();
+    let mut as_of_date = use_signal(|| {
+        Some(row.snapshot_date.clone())
+            .filter(|date| date != "-")
+            .unwrap_or_default()
+    });
+    let mut quantity_text = use_signal(|| editable_number(row.quantity));
+    let mut average_cost_text = use_signal(|| editable_number(row.average_cost));
+    let cost_currency_code = row.cost_currency_code.clone();
+    let mut note = use_signal(|| row.note.clone());
+    let mut saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal-card holding-edit-modal",
+                div { class: "modal-header",
+                    div {
+                        h3 { "更新持股狀態" }
+                        p { class: "modal-subtitle", "{row.account_name} / {row.symbol} {row.instrument_name}" }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        disabled: saving(),
+                        "關閉"
+                    }
+                }
+                if !error_message().is_empty() {
+                    div { class: "status-message error", "{error_message}" }
+                }
+                div { class: "form-grid two-column",
+                    label {
+                        span { "所有權人" }
+                        div { class: "readonly-field", "{row.owner_name}" }
+                    }
+                    label {
+                        span { "證券帳戶" }
+                        div { class: "readonly-field", "{row.account_name}" }
+                    }
+                    label {
+                        span { "商品代號" }
+                        div { class: "readonly-field", "{row.symbol}" }
+                    }
+                    label {
+                        span { "商品名稱" }
+                        div { class: "readonly-field", "{row.instrument_name}" }
+                    }
+                    label {
+                        span { "成本幣別" }
+                        div { class: "readonly-field", "{cost_currency_code}" }
+                    }
+                    label {
+                        span { "資料日期" }
+                        input {
+                            r#type: "date",
+                            value: "{as_of_date}",
+                            oninput: move |event| as_of_date.set(event.value()),
+                            disabled: saving(),
+                        }
+                    }
+                    label {
+                        span { "持有數量" }
+                        input {
+                            value: "{quantity_text}",
+                            oninput: move |event| quantity_text.set(event.value()),
+                            disabled: saving(),
+                        }
+                    }
+                    label {
+                        span { "平均成本" }
+                        input {
+                            value: "{average_cost_text}",
+                            oninput: move |event| average_cost_text.set(event.value()),
+                            disabled: saving(),
+                        }
+                    }
+                    label { class: "full-width",
+                        span { "備註" }
+                        textarea {
+                            value: "{note}",
+                            oninput: move |event| note.set(event.value()),
+                            disabled: saving(),
+                            rows: "3",
+                        }
+                    }
+                }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        disabled: saving(),
+                        "取消"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: saving(),
+                        onclick: move |_| {
+                            saving.set(true);
+                            error_message.set(String::new());
+
+                            let result = save_current_holding_state(CurrentHoldingStateInput {
+                                account_id: row.account_id,
+                                instrument_id: row.instrument_id,
+                                as_of_date: as_of_date(),
+                                quantity_text: quantity_text(),
+                                average_cost_text: average_cost_text(),
+                                currency_code: cost_currency_code.clone(),
+                                note: note(),
+                            });
+
+                            saving.set(false);
+
+                            match result {
+                                Ok(()) => {
+                                    data_version.with_mut(|value| *value += 1);
+                                    on_saved.call(format!("{} 已更新", row.instrument_name));
+                                }
+                                Err(error) => {
+                                    error_message.set(error.to_string());
+                                }
+                            }
+                        },
+                        if saving() { "儲存中..." } else { "儲存" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn HoldingDividendAssumptionModal(
+    row: HoldingMetric,
+    on_close: EventHandler<()>,
+    on_saved: EventHandler<String>,
+) -> Element {
+    let mut data_version = use_context::<Signal<u64>>();
+    let dividend_currency_code = row
+        .dividend_currency_code
+        .clone()
+        .unwrap_or_else(|| row.cost_currency_code.clone());
+    let original_effective_date = row
+        .dividend_effective_date
+        .clone()
+        .unwrap_or_else(|| row.snapshot_date.clone());
+    let mut effective_date = use_signal(|| {
+        row.dividend_effective_date
+            .clone()
+            .filter(|date| date != "-")
+            .unwrap_or_else(|| row.snapshot_date.clone())
+    });
+    let mut payments_per_year = use_signal(|| {
+        row.payments_per_year
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    });
+    let mut latest_dividend_per_unit = use_signal(|| editable_number(row.latest_dividend_per_unit));
+    let mut estimated_annual_dividend_per_unit =
+        use_signal(|| editable_number(row.estimated_annual_dividend_per_unit));
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal-card",
+                div { class: "modal-header",
+                    div {
+                        h3 { "編輯配息估計" }
+                        p { class: "modal-subtitle", "{row.account_name} / {row.symbol} {row.instrument_name}" }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        disabled: is_saving(),
+                        "關閉"
+                    }
+                }
+                if !error_message().is_empty() {
+                    div { class: "status-message error", "{error_message}" }
+                }
+                div { class: "form-grid two-column",
+                    label { class: "form-field",
+                        span { "生效日期" }
+                        input {
+                            r#type: "date",
+                            value: "{effective_date}",
+                            oninput: move |event| effective_date.set(event.value()),
+                            disabled: is_saving(),
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "配息頻率" }
+                        input {
+                            value: "{payments_per_year}",
+                            oninput: move |event| payments_per_year.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "4",
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "最新每單位配息" }
+                        input {
+                            value: "{latest_dividend_per_unit}",
+                            oninput: move |event| latest_dividend_per_unit.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "0",
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "預估每單位年配息" }
+                        input {
+                            value: "{estimated_annual_dividend_per_unit}",
+                            oninput: move |event| estimated_annual_dividend_per_unit.set(event.value()),
+                            disabled: is_saving(),
+                            placeholder: "0",
+                        }
+                    }
+                }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| on_close.call(()),
+                        disabled: is_saving(),
+                        "取消"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            is_saving.set(true);
+                            error_message.set(String::new());
+
+                            let has_values = !payments_per_year().trim().is_empty()
+                                || !latest_dividend_per_unit().trim().is_empty()
+                                || !estimated_annual_dividend_per_unit().trim().is_empty();
+                            if row.dividend_effective_date.is_none() && !has_values {
+                                error_message.set("請至少輸入一項配息估計資料".to_string());
+                                is_saving.set(false);
+                                return;
+                            }
+                            if !has_values && effective_date() != original_effective_date {
+                                error_message.set("請至少輸入一項配息估計資料".to_string());
+                                is_saving.set(false);
+                                return;
+                            }
+
+                            let result = save_dividend_assumption(DividendAssumptionInput {
+                                account_id: row.account_id,
+                                instrument_id: row.instrument_id,
+                                effective_date: effective_date(),
+                                payments_per_year_text: payments_per_year(),
+                                latest_dividend_per_unit_text: latest_dividend_per_unit(),
+                                estimated_annual_dividend_per_unit_text: estimated_annual_dividend_per_unit(),
+                                currency_code: dividend_currency_code.clone(),
+                            });
+
+                            is_saving.set(false);
+
+                            match result {
+                                Ok(()) => {
+                                    data_version.with_mut(|value| *value += 1);
+                                    on_saved.call(format!("{} 配息估計已更新", row.instrument_name));
+                                }
+                                Err(error) => {
+                                    error_message.set(format!("儲存失敗：{error}"));
+                                }
+                            }
+                        },
+                        if is_saving() { "儲存中..." } else { "儲存" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn editable_number(value: Option<f64>) -> String {
+    value
+        .map(|number| {
+            let text = format!("{number:.6}");
+            text.trim_end_matches('0').trim_end_matches('.').to_string()
+        })
+        .unwrap_or_default()
 }

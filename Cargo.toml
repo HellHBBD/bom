@@ -8,9 +8,17 @@ edition = "2021"
 
 [dependencies]
 dioxus = { version = "0.7.1", features = ["router"] }
+rust_decimal = "1"
+thiserror = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+directories = "6"
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = ["desktop"]

@@ -1,5 +1,8 @@
 #[derive(Clone, Debug, PartialEq)]
 pub struct HoldingMetric {
+    pub holding_snapshot_id: i64,
+    pub account_id: i64,
+    pub instrument_id: i64,
     pub owner_name: String,
     pub account_name: String,
     pub symbol: String,
@@ -7,30 +10,64 @@ pub struct HoldingMetric {
     pub instrument_type: String,
     pub asset_class: String,
     pub region_type: String,
+    pub trading_currency_code: String,
+    pub cost_currency_code: String,
     pub snapshot_date: String,
     pub quantity: Option<f64>,
     pub average_cost: Option<f64>,
+    pub note: String,
+    pub market_price_date: Option<String>,
+    pub market_price_currency_code: Option<String>,
     pub market_price: Option<f64>,
     pub total_cost: Option<f64>,
     pub market_value: Option<f64>,
     pub unrealized_profit: Option<f64>,
     pub unrealized_return_rate: Option<f64>,
+    pub dividend_effective_date: Option<String>,
+    pub dividend_currency_code: Option<String>,
+    pub estimated_annual_dividend_per_unit: Option<f64>,
+    pub payments_per_year: Option<i64>,
+    pub latest_dividend_per_unit: Option<f64>,
     pub estimated_annual_dividend: Option<f64>,
     pub estimated_yield_on_cost: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountAsset {
+    pub snapshot_id: i64,
+    pub account_id: i64,
+    pub origin: String,
     pub owner_name: String,
     pub institution_name: String,
     pub account_name: String,
     pub account_type: String,
     pub asset_type: String,
     pub currency_code: String,
-    pub invested_amount: Option<f64>,
+    pub quantity_text: Option<String>,
+    pub invested_amount_text: Option<String>,
+    pub current_value_override_text: Option<String>,
+    pub note: String,
     pub quantity: Option<f64>,
+    pub invested_amount: Option<f64>,
     pub current_value_ntd: Option<f64>,
     pub snapshot_date: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExchangeRatePreview {
+    pub rate_text: String,
+    pub rate_date: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExchangeRateRow {
+    pub exchange_rate_id: i64,
+    pub rate_date: String,
+    pub base_currency_code: String,
+    pub quote_currency_code: String,
+    pub rate_text: String,
+    pub origin: String,
+    pub note: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +95,10 @@ pub struct OwnerAssetTotal {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DividendReceiptRow {
+    pub receipt_id: i64,
+    pub account_id: i64,
+    pub instrument_id: i64,
+    pub origin: String,
     pub owner_name: String,
     pub account_name: String,
     pub symbol: String,
@@ -69,6 +110,28 @@ pub struct DividendReceiptRow {
     pub net_amount: Option<f64>,
     pub currency_code: String,
     pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DividendReceiptAccountOption {
+    pub account_id: i64,
+    pub owner_name: String,
+    pub account_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DividendReceiptInstrumentOption {
+    pub instrument_id: i64,
+    pub symbol: String,
+    pub instrument_name: String,
+    pub currency_code: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DividendReceiptFormOptions {
+    pub accounts: Vec<DividendReceiptAccountOption>,
+    pub instruments: Vec<DividendReceiptInstrumentOption>,
+    pub currency_codes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
