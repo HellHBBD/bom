@@ -2783,6 +2783,78 @@ fn compare_optional_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ord
         .unwrap_or(std::cmp::Ordering::Equal)
 }
 
+const HOLDING_COLUMNS: &[(&str, &str)] = &[
+    ("owner", "所有權人"),
+    ("account", "證券帳戶"),
+    ("symbol", "代號"),
+    ("instrument", "商品名稱"),
+    ("instrument_type", "類型"),
+    ("asset_class", "資產類別"),
+    ("region", "區域"),
+    ("quantity", "數量"),
+    ("average_cost", "平均成本"),
+    ("market_price", "市價"),
+    ("total_cost", "總成本"),
+    ("market_value", "市值"),
+    ("profit", "未實現損益"),
+    ("return_rate", "損益率"),
+    ("estimated_dividend", "預估年配息"),
+    ("estimated_yield", "預估殖利率"),
+    ("updated_at", "更新日"),
+];
+
+fn default_visible_holding_columns() -> HashSet<String> {
+    HOLDING_COLUMNS
+        .iter()
+        .map(|(column_id, _)| (*column_id).to_string())
+        .collect()
+}
+
+fn is_holding_column_visible(visible_columns: &HashSet<String>, column_id: &str) -> bool {
+    visible_columns.contains(column_id)
+}
+
+fn set_holding_column_visibility(
+    visible_columns: &mut HashSet<String>,
+    column_id: String,
+    is_visible: bool,
+) {
+    if is_visible {
+        visible_columns.insert(column_id);
+    } else {
+        visible_columns.remove(&column_id);
+    }
+}
+
+#[cfg(test)]
+mod holding_column_tests {
+    use super::*;
+
+    #[test]
+    fn default_columns_include_all_selectable_holding_data() {
+        let visible_columns = default_visible_holding_columns();
+
+        assert_eq!(visible_columns.len(), HOLDING_COLUMNS.len());
+        assert!(is_holding_column_visible(&visible_columns, "owner"));
+        assert!(is_holding_column_visible(
+            &visible_columns,
+            "estimated_yield"
+        ));
+        assert!(!is_holding_column_visible(&visible_columns, "actions"));
+    }
+
+    #[test]
+    fn updates_selected_column_visibility() {
+        let mut visible_columns = default_visible_holding_columns();
+
+        set_holding_column_visibility(&mut visible_columns, "market_price".to_string(), false);
+        assert!(!is_holding_column_visible(&visible_columns, "market_price"));
+
+        set_holding_column_visibility(&mut visible_columns, "market_price".to_string(), true);
+        assert!(is_holding_column_visible(&visible_columns, "market_price"));
+    }
+}
+
 #[component]
 fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
     let mut editing_row = use_signal(|| None::<HoldingMetric>);
@@ -2794,6 +2866,8 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
     let mut region_filter = use_signal(String::new);
     let mut search = use_signal(String::new);
     let mut sort_by = use_signal(|| "market_value".to_string());
+    let mut visible_columns = use_signal(default_visible_holding_columns);
+    let mut is_column_picker_open = use_signal(|| false);
 
     let owner_options = unique_strings(rows.iter().map(|row| row.owner_name.as_str()));
     let type_options = unique_strings(rows.iter().map(|row| row.instrument_type.as_str()));
@@ -2806,6 +2880,17 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
     let region_value = region_filter();
     let search_value = search().to_lowercase();
     let sort_value = sort_by();
+    let visible_columns_value = visible_columns();
+    let column_picker_options = HOLDING_COLUMNS
+        .iter()
+        .map(|(column_id, label)| {
+            (
+                (*column_id).to_string(),
+                *label,
+                is_holding_column_visible(&visible_columns_value, column_id),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut filtered_rows = rows
         .iter()
         .filter(|row| owner_value.is_empty() || row.owner_name == owner_value)
@@ -2870,6 +2955,37 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                     },
                     "清除篩選"
                 }
+                button {
+                    r#type: "button",
+                    class: "ghost-button",
+                    aria_expanded: is_column_picker_open(),
+                    aria_controls: "holding-column-picker",
+                    onclick: move |_| is_column_picker_open.toggle(),
+                    "顯示欄位"
+                }
+            }
+            div {
+                id: "holding-column-picker",
+                class: "column-picker",
+                hidden: !is_column_picker_open(),
+                for (column_id, label, is_visible) in column_picker_options {
+                    label { class: "column-toggle",
+                        input {
+                            r#type: "checkbox",
+                            checked: is_visible,
+                            onchange: move |event| {
+                                visible_columns.with_mut(|columns| {
+                                    set_holding_column_visibility(
+                                        columns,
+                                        column_id.clone(),
+                                        event.checked(),
+                                    );
+                                });
+                            },
+                        }
+                        span { "{label}" }
+                    }
+                }
             }
             if filtered_rows.is_empty() {
                 div { class: "empty-state", h3 { "目前沒有符合條件的持股資料" } }
@@ -2878,23 +2994,23 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                     table { class: "holdings-table",
                         thead {
                             tr {
-                                th { "所有權人" }
-                                th { "證券帳戶" }
-                                th { "代號" }
-                                th { "商品名稱" }
-                                th { "類型" }
-                                th { "資產類別" }
-                                th { "區域" }
-                                th { "數量" }
-                                th { "平均成本" }
-                                th { "市價" }
-                                th { "總成本" }
-                                th { "市值" }
-                                th { "未實現損益" }
-                                th { "損益率" }
-                                th { "預估年配息" }
-                                th { "預估殖利率" }
-                                th { "更新日" }
+                                if is_holding_column_visible(&visible_columns_value, "owner") { th { "所有權人" } }
+                                if is_holding_column_visible(&visible_columns_value, "account") { th { "證券帳戶" } }
+                                if is_holding_column_visible(&visible_columns_value, "symbol") { th { "代號" } }
+                                if is_holding_column_visible(&visible_columns_value, "instrument") { th { "商品名稱" } }
+                                if is_holding_column_visible(&visible_columns_value, "instrument_type") { th { "類型" } }
+                                if is_holding_column_visible(&visible_columns_value, "asset_class") { th { "資產類別" } }
+                                if is_holding_column_visible(&visible_columns_value, "region") { th { "區域" } }
+                                if is_holding_column_visible(&visible_columns_value, "quantity") { th { "數量" } }
+                                if is_holding_column_visible(&visible_columns_value, "average_cost") { th { "平均成本" } }
+                                if is_holding_column_visible(&visible_columns_value, "market_price") { th { "市價" } }
+                                if is_holding_column_visible(&visible_columns_value, "total_cost") { th { "總成本" } }
+                                if is_holding_column_visible(&visible_columns_value, "market_value") { th { "市值" } }
+                                if is_holding_column_visible(&visible_columns_value, "profit") { th { "未實現損益" } }
+                                if is_holding_column_visible(&visible_columns_value, "return_rate") { th { "損益率" } }
+                                if is_holding_column_visible(&visible_columns_value, "estimated_dividend") { th { "預估年配息" } }
+                                if is_holding_column_visible(&visible_columns_value, "estimated_yield") { th { "預估殖利率" } }
+                                if is_holding_column_visible(&visible_columns_value, "updated_at") { th { "更新日" } }
                                 th { "操作" }
                             }
                         }
@@ -2902,6 +3018,7 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                             for row in filtered_rows {
                                 HoldingRow {
                                     row: row.clone(),
+                                    visible_columns: visible_columns_value.clone(),
                                     on_edit: move |holding| {
                                         status_message.set(String::new());
                                         editing_row.set(Some(holding));
@@ -3414,6 +3531,7 @@ fn AccountAssetEditModal(
 #[component]
 fn HoldingRow(
     row: HoldingMetric,
+    visible_columns: HashSet<String>,
     on_edit: EventHandler<HoldingMetric>,
     on_dividend_edit: EventHandler<HoldingMetric>,
 ) -> Element {
@@ -3427,23 +3545,23 @@ fn HoldingRow(
 
     rsx! {
         tr {
-            td { "{row.owner_name}" }
-            td { "{row.account_name}" }
-            td { class: "mono", "{row.symbol}" }
-            td { class: "name-cell", "{row.instrument_name}" }
-            td { "{select_option_label(&row.instrument_type)}" }
-            td { "{select_option_label(&row.asset_class)}" }
-            td { "{select_option_label(&row.region_type)}" }
-            td { class: "number", "{decimal(row.quantity, 2)}" }
-            td { class: "number", "{decimal(row.average_cost, 2)}" }
-            td { class: "number", "{decimal(row.market_price, 2)}" }
-            td { class: "number", "{money(row.total_cost)}" }
-            td { class: "number strong", "{money(row.market_value)}" }
-            td { class: profit_class, "{money(row.unrealized_profit)}" }
-            td { class: profit_class, "{percent(row.unrealized_return_rate)}" }
-            td { class: "number", "{money(row.estimated_annual_dividend)}" }
-            td { class: "number", "{percent(row.estimated_yield_on_cost)}" }
-            td { class: "mono", "{row.snapshot_date}" }
+            if is_holding_column_visible(&visible_columns, "owner") { td { "{row.owner_name}" } }
+            if is_holding_column_visible(&visible_columns, "account") { td { "{row.account_name}" } }
+            if is_holding_column_visible(&visible_columns, "symbol") { td { class: "mono", "{row.symbol}" } }
+            if is_holding_column_visible(&visible_columns, "instrument") { td { class: "name-cell", "{row.instrument_name}" } }
+            if is_holding_column_visible(&visible_columns, "instrument_type") { td { "{select_option_label(&row.instrument_type)}" } }
+            if is_holding_column_visible(&visible_columns, "asset_class") { td { "{select_option_label(&row.asset_class)}" } }
+            if is_holding_column_visible(&visible_columns, "region") { td { "{select_option_label(&row.region_type)}" } }
+            if is_holding_column_visible(&visible_columns, "quantity") { td { class: "number", "{decimal(row.quantity, 2)}" } }
+            if is_holding_column_visible(&visible_columns, "average_cost") { td { class: "number", "{decimal(row.average_cost, 2)}" } }
+            if is_holding_column_visible(&visible_columns, "market_price") { td { class: "number", "{decimal(row.market_price, 2)}" } }
+            if is_holding_column_visible(&visible_columns, "total_cost") { td { class: "number", "{money(row.total_cost)}" } }
+            if is_holding_column_visible(&visible_columns, "market_value") { td { class: "number strong", "{money(row.market_value)}" } }
+            if is_holding_column_visible(&visible_columns, "profit") { td { class: profit_class, "{money(row.unrealized_profit)}" } }
+            if is_holding_column_visible(&visible_columns, "return_rate") { td { class: profit_class, "{percent(row.unrealized_return_rate)}" } }
+            if is_holding_column_visible(&visible_columns, "estimated_dividend") { td { class: "number", "{money(row.estimated_annual_dividend)}" } }
+            if is_holding_column_visible(&visible_columns, "estimated_yield") { td { class: "number", "{percent(row.estimated_yield_on_cost)}" } }
+            if is_holding_column_visible(&visible_columns, "updated_at") { td { class: "mono", "{row.snapshot_date}" } }
             td {
                 button {
                     r#type: "button",
