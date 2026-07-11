@@ -125,6 +125,9 @@ pub fn QuickPriceUpdatePage() -> Element {
         .format("%Y-%m-%d")
         .to_string();
     let mut price_date = use_signal(|| today);
+    let mut search = use_signal(String::new);
+    let mut currency_filter = use_signal(String::new);
+    let mut sort_by = use_signal(|| "symbol".to_string());
     let mut draft_prices = use_signal(HashMap::<i64, String>::new);
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
@@ -142,9 +145,16 @@ pub fn QuickPriceUpdatePage() -> Element {
             Some(Ok(rows)) if rows.is_empty() => rsx! { StatusCard { text: "目前沒有可更新市價的持股資料。".to_string() } },
             Some(Ok(rows)) => {
                 let price_rows = build_quick_price_update_rows(&rows);
+                let currency_options = unique_strings(price_rows.iter().map(|row| row.currency_code.as_str()));
                 let draft_values = draft_prices();
                 let save_rows = price_rows.clone();
-                let display_rows = price_rows
+                let visible_rows = filter_quick_price_rows(
+                    &price_rows,
+                    &search(),
+                    &currency_filter(),
+                    &sort_by(),
+                );
+                let display_rows = visible_rows
                     .iter()
                     .map(|row| {
                         (
@@ -166,6 +176,25 @@ pub fn QuickPriceUpdatePage() -> Element {
                             div { class: "status-message error quick-price-error", "{error_message}" }
                         }
                         div { class: "filters quick-price-controls",
+                            input {
+                                placeholder: "搜尋商品名稱或代號",
+                                value: "{search}",
+                                oninput: move |event| search.set(event.value()),
+                            }
+                            SelectFilter {
+                                label: "幣別".to_string(),
+                                value: currency_filter(),
+                                options: currency_options,
+                                translate_options: false,
+                                on_change: move |value| currency_filter.set(value),
+                            }
+                            select {
+                                value: "{sort_by}",
+                                oninput: move |event| sort_by.set(event.value()),
+                                option { value: "symbol", "依商品代號排序" }
+                                option { value: "name", "依商品名稱排序" }
+                                option { value: "price", "依目前市價排序" }
+                            }
                             label { class: "filter-field",
                                 span { "價格日期" }
                                 input {
@@ -179,7 +208,18 @@ pub fn QuickPriceUpdatePage() -> Element {
                                     disabled: is_saving(),
                                 }
                             }
-                            div { class: "filter-total", "{price_rows.len()} 檔商品可更新市價" }
+                            div { class: "filter-total", "{display_rows.len()} / {price_rows.len()} 檔商品可更新市價" }
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: is_saving(),
+                                onclick: move |_| {
+                                    search.set(String::new());
+                                    currency_filter.set(String::new());
+                                    sort_by.set("symbol".to_string());
+                                },
+                                "清除篩選"
+                            }
                             button {
                                 r#type: "button",
                                 class: "ghost-button",
@@ -205,22 +245,11 @@ pub fn QuickPriceUpdatePage() -> Element {
                                     success_message.set(String::new());
 
                                     let current_price_date = price_date();
-                                    let input = BatchPriceInput {
-                                        price_date: current_price_date,
-                                        rows: save_rows
-                                            .iter()
-                                            .map(|row| BatchPriceRowInput {
-                                                instrument_id: row.instrument_id,
-                                                symbol: row.symbol.clone(),
-                                                instrument_name: row.instrument_name.clone(),
-                                                currency_code: row.currency_code.clone(),
-                                                price: draft_values
-                                                    .get(&row.instrument_id)
-                                                    .cloned()
-                                                    .unwrap_or_default(),
-                                            })
-                                            .collect(),
-                                    };
+                                    let input = build_batch_price_input(
+                                        current_price_date,
+                                        &save_rows,
+                                        &draft_values,
+                                    );
 
                                     let mut is_saving = is_saving;
                                     let mut error_message = error_message;
@@ -248,7 +277,12 @@ pub fn QuickPriceUpdatePage() -> Element {
                                 if is_saving() { "儲存中..." } else { "儲存有輸入的價格" }
                             }
                         }
-                        div { class: "table-wrap",
+                        if display_rows.is_empty() {
+                            div { class: "empty-state",
+                                h3 { "目前沒有符合條件的可更新商品" }
+                            }
+                        } else {
+                            div { class: "table-wrap",
                             table { class: "price-update-table",
                                 thead {
                                     tr {
@@ -277,6 +311,7 @@ pub fn QuickPriceUpdatePage() -> Element {
                                         }
                                     }
                                 }
+                            }
                             }
                         }
                     }
@@ -314,6 +349,104 @@ fn QuickPriceUpdateRowView(
                 }
             }
         }
+    }
+}
+
+fn filter_quick_price_rows(
+    rows: &[QuickPriceUpdateRow],
+    search: &str,
+    currency_filter: &str,
+    sort_by: &str,
+) -> Vec<QuickPriceUpdateRow> {
+    let search = search.to_lowercase();
+    let mut filtered_rows = rows
+        .iter()
+        .filter(|row| currency_filter.is_empty() || row.currency_code == currency_filter)
+        .filter(|row| {
+            search.is_empty()
+                || row.symbol.to_lowercase().contains(&search)
+                || row.instrument_name.to_lowercase().contains(&search)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    filtered_rows.sort_by(|left, right| match sort_by {
+        "name" => left.instrument_name.cmp(&right.instrument_name),
+        "price" => compare_optional_desc(left.latest_price, right.latest_price),
+        _ => left.symbol.cmp(&right.symbol),
+    });
+
+    filtered_rows
+}
+
+fn build_batch_price_input(
+    price_date: String,
+    rows: &[QuickPriceUpdateRow],
+    draft_prices: &HashMap<i64, String>,
+) -> BatchPriceInput {
+    BatchPriceInput {
+        price_date,
+        rows: rows
+            .iter()
+            .map(|row| BatchPriceRowInput {
+                instrument_id: row.instrument_id,
+                symbol: row.symbol.clone(),
+                instrument_name: row.instrument_name.clone(),
+                currency_code: row.currency_code.clone(),
+                price: draft_prices
+                    .get(&row.instrument_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod quick_price_filter_tests {
+    use super::*;
+
+    fn row(
+        symbol: &str,
+        name: &str,
+        currency_code: &str,
+        latest_price: Option<f64>,
+    ) -> QuickPriceUpdateRow {
+        QuickPriceUpdateRow {
+            instrument_id: 1,
+            symbol: symbol.to_string(),
+            instrument_name: name.to_string(),
+            currency_code: currency_code.to_string(),
+            latest_price,
+            latest_price_date: None,
+            holding_account_count: 1,
+        }
+    }
+
+    #[test]
+    fn filters_and_sorts_quick_price_rows_without_mutating_inputs() {
+        let rows = vec![
+            row("0050", "元大台灣50", "NTD", Some(190.0)),
+            QuickPriceUpdateRow {
+                instrument_id: 2,
+                ..row("VOO", "Vanguard S&P 500", "USD", Some(500.0))
+            },
+        ];
+
+        let filtered = filter_quick_price_rows(&rows, "vAnGuArD", "USD", "symbol");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].symbol, "VOO");
+        assert_eq!(
+            filter_quick_price_rows(&rows, "", "", "price")[0].symbol,
+            "VOO"
+        );
+
+        let drafts = HashMap::from([(1, "191.5".to_string()), (2, "501.5".to_string())]);
+        let input = build_batch_price_input("2026-07-12".to_string(), &rows, &drafts);
+        assert_eq!(input.rows.len(), 2);
+        assert_eq!(input.rows[0].price, "191.5");
+        assert_eq!(input.rows[1].price, "501.5");
     }
 }
 
@@ -1949,6 +2082,8 @@ fn LegacyDividendTables(data: LegacyDividendData) -> Element {
     let mut owner_filter = use_signal(String::new);
     let mut instrument_filter = use_signal(String::new);
     let mut period_filter = use_signal(String::new);
+    let mut search = use_signal(String::new);
+    let mut sort_by = use_signal(|| "owner".to_string());
 
     let owner_options = unique_strings(
         data.summaries
@@ -1972,31 +2107,43 @@ fn LegacyDividendTables(data: LegacyDividendData) -> Element {
     let owner_value = owner_filter();
     let instrument_value = instrument_filter();
     let period_value = period_filter();
-    let summaries = data
-        .summaries
-        .iter()
-        .filter(|row| owner_value.is_empty() || row.owner_name == owner_value)
-        .filter(|row| instrument_value.is_empty() || row.instrument_name == instrument_value)
-        .filter(|row| period_value.is_empty() || row.period_label == period_value)
-        .cloned()
-        .collect::<Vec<_>>();
-    let monthly = data
-        .monthly
-        .iter()
-        .filter(|row| owner_value.is_empty() || row.owner_name == owner_value)
-        .filter(|row| instrument_value.is_empty() || row.instrument_name == instrument_value)
-        .filter(|row| period_value.is_empty() || row.series_type == period_value)
-        .cloned()
-        .collect::<Vec<_>>();
+    let summaries = filter_legacy_summary_rows(
+        &data.summaries,
+        &owner_value,
+        &instrument_value,
+        &period_value,
+        &search(),
+        &sort_by(),
+    );
+    let monthly = filter_legacy_monthly_rows(
+        &data.monthly,
+        &owner_value,
+        &instrument_value,
+        &period_value,
+        &search(),
+        &sort_by(),
+    );
     let summary_total = summaries.iter().filter_map(|row| row.amount).sum::<f64>();
     let monthly_total = monthly.iter().filter_map(|row| row.amount).sum::<f64>();
 
     rsx! {
         div { class: "stack",
             div { class: "filters card",
-                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, on_change: move |value| owner_filter.set(value) }
-                SelectFilter { label: "商品".to_string(), value: instrument_filter(), options: instrument_options, on_change: move |value| instrument_filter.set(value) }
-                SelectFilter { label: "期間類型".to_string(), value: period_filter(), options: period_options, on_change: move |value| period_filter.set(value) }
+                input {
+                    placeholder: "搜尋商品名稱或代號",
+                    value: "{search}",
+                    oninput: move |event| search.set(event.value()),
+                }
+                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, translate_options: false, on_change: move |value| owner_filter.set(value) }
+                SelectFilter { label: "商品".to_string(), value: instrument_filter(), options: instrument_options, translate_options: false, on_change: move |value| instrument_filter.set(value) }
+                SelectFilter { label: "期間類型".to_string(), value: period_filter(), options: period_options, translate_options: true, on_change: move |value| period_filter.set(value) }
+                select {
+                    value: "{sort_by}",
+                    oninput: move |event| sort_by.set(event.value()),
+                    option { value: "owner", "依所有權人排序" }
+                    option { value: "instrument", "依商品名稱排序" }
+                    option { value: "amount", "依金額排序" }
+                }
                 div { class: "filter-total", "彙總金額：年度／累積 {money(Some(summary_total))}，月份 {money(Some(monthly_total))}" }
                 button {
                     r#type: "button",
@@ -2004,6 +2151,8 @@ fn LegacyDividendTables(data: LegacyDividendData) -> Element {
                         owner_filter.set(String::new());
                         instrument_filter.set(String::new());
                         period_filter.set(String::new());
+                        search.set(String::new());
+                        sort_by.set("owner".to_string());
                     },
                     "清除篩選"
                 }
@@ -2014,15 +2163,221 @@ fn LegacyDividendTables(data: LegacyDividendData) -> Element {
     }
 }
 
+fn filter_legacy_summary_rows(
+    rows: &[LegacyDividendSummaryRow],
+    owner_filter: &str,
+    instrument_filter: &str,
+    period_filter: &str,
+    search: &str,
+    sort_by: &str,
+) -> Vec<LegacyDividendSummaryRow> {
+    let mut filtered_rows = rows
+        .iter()
+        .filter(|row| {
+            legacy_dividend_row_matches(
+                &row.owner_name,
+                &row.symbol,
+                &row.instrument_name,
+                &row.period_label,
+                owner_filter,
+                instrument_filter,
+                period_filter,
+                search,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_legacy_summary_rows(&mut filtered_rows, sort_by);
+    filtered_rows
+}
+
+fn filter_legacy_monthly_rows(
+    rows: &[LegacyDividendMonthlyRow],
+    owner_filter: &str,
+    instrument_filter: &str,
+    period_filter: &str,
+    search: &str,
+    sort_by: &str,
+) -> Vec<LegacyDividendMonthlyRow> {
+    let mut filtered_rows = rows
+        .iter()
+        .filter(|row| {
+            legacy_dividend_row_matches(
+                &row.owner_name,
+                &row.symbol,
+                &row.instrument_name,
+                &row.series_type,
+                owner_filter,
+                instrument_filter,
+                period_filter,
+                search,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_legacy_monthly_rows(&mut filtered_rows, sort_by);
+    filtered_rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn legacy_dividend_row_matches(
+    owner_name: &str,
+    symbol: &str,
+    instrument_name: &str,
+    period_value: &str,
+    owner_filter: &str,
+    instrument_filter: &str,
+    period_filter: &str,
+    search: &str,
+) -> bool {
+    let search = search.to_lowercase();
+    (owner_filter.is_empty() || owner_name == owner_filter)
+        && (instrument_filter.is_empty() || instrument_name == instrument_filter)
+        && (period_filter.is_empty() || period_value == period_filter)
+        && (search.is_empty()
+            || symbol.to_lowercase().contains(&search)
+            || instrument_name.to_lowercase().contains(&search))
+}
+
+fn sort_legacy_summary_rows(rows: &mut [LegacyDividendSummaryRow], sort_by: &str) {
+    rows.sort_by(|left, right| match sort_by {
+        "instrument" => left.instrument_name.cmp(&right.instrument_name),
+        "amount" => compare_optional_desc(left.amount, right.amount),
+        _ => left.owner_name.cmp(&right.owner_name),
+    });
+}
+
+fn sort_legacy_monthly_rows(rows: &mut [LegacyDividendMonthlyRow], sort_by: &str) {
+    rows.sort_by(|left, right| match sort_by {
+        "instrument" => left.instrument_name.cmp(&right.instrument_name),
+        "amount" => compare_optional_desc(left.amount, right.amount),
+        _ => left.owner_name.cmp(&right.owner_name),
+    });
+}
+
+#[cfg(test)]
+mod legacy_dividend_filter_tests {
+    use super::*;
+
+    #[test]
+    fn applies_keyword_search_to_summary_and_monthly_rows() {
+        let mut summaries = vec![LegacyDividendSummaryRow {
+            owner_name: "Bravo".to_string(),
+            symbol: "0050".to_string(),
+            instrument_name: "Zebra Fund".to_string(),
+            period_label: "YEAR_2024".to_string(),
+            amount: Some(100.0),
+            source_cell: "A1".to_string(),
+        }];
+        summaries.push(LegacyDividendSummaryRow {
+            owner_name: "Alpha".to_string(),
+            symbol: "VOO".to_string(),
+            instrument_name: "Apple Fund".to_string(),
+            period_label: "YEAR_2024".to_string(),
+            amount: Some(200.0),
+            source_cell: "A2".to_string(),
+        });
+
+        let mut monthly = vec![LegacyDividendMonthlyRow {
+            owner_name: "Bravo".to_string(),
+            symbol: "0050".to_string(),
+            instrument_name: "Zebra Fund".to_string(),
+            series_type: "ACTUAL_CURRENT_YEAR".to_string(),
+            month_num: 1,
+            amount: Some(100.0),
+            source_cell: "A1".to_string(),
+        }];
+        monthly.push(LegacyDividendMonthlyRow {
+            owner_name: "Alpha".to_string(),
+            symbol: "VOO".to_string(),
+            instrument_name: "Apple Fund".to_string(),
+            series_type: "ACTUAL_CURRENT_YEAR".to_string(),
+            month_num: 1,
+            amount: Some(200.0),
+            source_cell: "A2".to_string(),
+        });
+
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "", "", "", "0050", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "", "", "", "0050", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "", "", "", "aPpLe", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "", "", "", "aPpLe", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "Bravo", "", "", "", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "Bravo", "", "", "", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "", "Zebra Fund", "", "", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "", "Zebra Fund", "", "", "owner").len(),
+            1
+        );
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "", "", "YEAR_2024", "", "owner").len(),
+            2
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "", "", "YEAR_2024", "", "owner").len(),
+            0
+        );
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "", "", "", "", "amount")[0].symbol,
+            "VOO"
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "", "", "", "", "amount")[0].symbol,
+            "VOO"
+        );
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "", "", "", "", "owner")[0].symbol,
+            "VOO"
+        );
+        assert_eq!(
+            filter_legacy_summary_rows(&summaries, "", "", "", "", "instrument")[0].symbol,
+            "VOO"
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "", "", "", "", "owner")[0].symbol,
+            "VOO"
+        );
+        assert_eq!(
+            filter_legacy_monthly_rows(&monthly, "", "", "", "", "instrument")[0].symbol,
+            "VOO"
+        );
+    }
+}
+
 #[component]
 fn LegacySummaryTable(rows: Vec<LegacyDividendSummaryRow>) -> Element {
+    let is_empty = rows.is_empty();
+
     rsx! {
         section { class: "card table-card",
             div { class: "table-summary",
                 strong { "年度／累積資料" }
                 span { "{rows.len()} 筆，來自 dividend_legacy_summary" }
             }
-            div { class: "table-wrap",
+            if is_empty {
+                div { class: "empty-state", h3 { "目前沒有符合條件的年度／累積資料" } }
+            } else {
+                div { class: "table-wrap",
                 table { class: "legacy-summary-table",
                     thead {
                         tr {
@@ -2040,6 +2395,7 @@ fn LegacySummaryTable(rows: Vec<LegacyDividendSummaryRow>) -> Element {
                             LegacySummaryRowView { row }
                         }
                     }
+                }
                 }
             }
         }
@@ -2063,13 +2419,18 @@ fn LegacySummaryRowView(row: LegacyDividendSummaryRow) -> Element {
 
 #[component]
 fn LegacyMonthlyTable(rows: Vec<LegacyDividendMonthlyRow>) -> Element {
+    let is_empty = rows.is_empty();
+
     rsx! {
         section { class: "card table-card",
             div { class: "table-summary",
                 strong { "月份資料" }
                 span { "{rows.len()} 筆，來自 dividend_legacy_monthly" }
             }
-            div { class: "table-wrap",
+            if is_empty {
+                div { class: "empty-state", h3 { "目前沒有符合條件的月份資料" } }
+            } else {
+                div { class: "table-wrap",
                 table { class: "legacy-monthly-table",
                     thead {
                         tr {
@@ -2088,6 +2449,7 @@ fn LegacyMonthlyTable(rows: Vec<LegacyDividendMonthlyRow>) -> Element {
                             LegacyMonthlyRowView { row }
                         }
                     }
+                }
                 }
             }
         }
@@ -2129,13 +2491,108 @@ fn series_type_text(series_type: &str) -> &'static str {
     }
 }
 
+fn select_option_label(value: &str) -> &str {
+    match value {
+        "FUND" => "基金",
+        "STOCK" => "股票",
+        "BOND" => "債券",
+        "EQUITY" => "股票",
+        "DOMESTIC" => "國內",
+        "FOREIGN" => "國外",
+        "BROKERAGE_CASH" => "證券戶現金",
+        "DEMAND_DEPOSIT" => "活期存款",
+        "FOREIGN_DEMAND_DEPOSIT" => "外幣活存",
+        "FOREIGN_TIME_DEPOSIT" => "外幣定存",
+        "SETTLEMENT_CASH" => "交割款",
+        "TIME_DEPOSIT" => "定期存款",
+        "CURRENT_YEAR_TO_DATE" => "今年度累積",
+        "THROUGH_PREVIOUS_YEAR" => "截至上一年度累積",
+        "TOTAL_CUMULATIVE" => "總累積",
+        "YEAR_2023" => "2023 年股息總額",
+        "YEAR_2024" => "2024 年股息總額",
+        "ACTUAL_CURRENT_YEAR" => "當年度實際月份股息",
+        "FORECAST_AVERAGE" => "預估／平均月份配息",
+        _ => value,
+    }
+}
+
+fn select_option_display(value: String, translate: bool) -> (String, String) {
+    let label = if translate {
+        select_option_label(&value).to_string()
+    } else {
+        value.clone()
+    };
+    (value, label)
+}
+
+#[cfg(test)]
+mod select_option_label_tests {
+    use super::{select_option_display, select_option_label};
+
+    #[test]
+    fn translates_internal_filter_codes() {
+        for (value, expected) in [
+            ("FUND", "基金"),
+            ("STOCK", "股票"),
+            ("BOND", "債券"),
+            ("EQUITY", "股票"),
+            ("DOMESTIC", "國內"),
+            ("FOREIGN", "國外"),
+            ("BROKERAGE_CASH", "證券戶現金"),
+            ("DEMAND_DEPOSIT", "活期存款"),
+            ("FOREIGN_DEMAND_DEPOSIT", "外幣活存"),
+            ("FOREIGN_TIME_DEPOSIT", "外幣定存"),
+            ("SETTLEMENT_CASH", "交割款"),
+            ("TIME_DEPOSIT", "定期存款"),
+            ("CURRENT_YEAR_TO_DATE", "今年度累積"),
+            ("THROUGH_PREVIOUS_YEAR", "截至上一年度累積"),
+            ("TOTAL_CUMULATIVE", "總累積"),
+            ("YEAR_2023", "2023 年股息總額"),
+            ("YEAR_2024", "2024 年股息總額"),
+            ("ACTUAL_CURRENT_YEAR", "當年度實際月份股息"),
+            ("FORECAST_AVERAGE", "預估／平均月份配息"),
+        ] {
+            assert_eq!(select_option_label(value), expected);
+        }
+    }
+
+    #[test]
+    fn preserves_standard_financial_codes_and_unknown_values() {
+        assert_eq!(select_option_label("ETF"), "ETF");
+        assert_eq!(select_option_label("USD"), "USD");
+        assert_eq!(select_option_label("自訂選項"), "自訂選項");
+    }
+
+    #[test]
+    fn keeps_raw_option_values_for_filtering() {
+        assert_eq!(
+            select_option_display("FOREIGN_TIME_DEPOSIT".to_string(), true),
+            ("FOREIGN_TIME_DEPOSIT".to_string(), "外幣定存".to_string())
+        );
+    }
+
+    #[test]
+    fn preserves_dynamic_option_labels() {
+        assert_eq!(
+            select_option_display("FUND".to_string(), false),
+            ("FUND".to_string(), "FUND".to_string())
+        );
+    }
+}
+
 #[component]
 fn SelectFilter(
     label: String,
     value: String,
     options: Vec<String>,
+    translate_options: bool,
     on_change: EventHandler<String>,
 ) -> Element {
+    let option_displays = options
+        .into_iter()
+        .map(|option| select_option_display(option, translate_options))
+        .collect::<Vec<_>>();
+
     rsx! {
         label { class: "filter-field",
             span { "{label}" }
@@ -2143,8 +2600,8 @@ fn SelectFilter(
                 value: "{value}",
                 oninput: move |event| on_change.call(event.value()),
                 option { value: "", "全部" }
-                for option_value in options {
-                    option { value: "{option_value}", "{option_value}" }
+                for (option_value, option_label) in option_displays {
+                    option { value: "{option_value}", "{option_label}" }
                 }
             }
         }
@@ -2390,10 +2847,10 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                     value: "{search}",
                     oninput: move |event| search.set(event.value()),
                 }
-                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, on_change: move |value| owner_filter.set(value) }
-                SelectFilter { label: "商品類型".to_string(), value: type_filter(), options: type_options, on_change: move |value| type_filter.set(value) }
-                SelectFilter { label: "資產類別".to_string(), value: asset_class_filter(), options: asset_class_options, on_change: move |value| asset_class_filter.set(value) }
-                SelectFilter { label: "國內／國外".to_string(), value: region_filter(), options: region_options, on_change: move |value| region_filter.set(value) }
+                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, translate_options: false, on_change: move |value| owner_filter.set(value) }
+                SelectFilter { label: "商品類型".to_string(), value: type_filter(), options: type_options, translate_options: true, on_change: move |value| type_filter.set(value) }
+                SelectFilter { label: "資產類別".to_string(), value: asset_class_filter(), options: asset_class_options, translate_options: true, on_change: move |value| asset_class_filter.set(value) }
+                SelectFilter { label: "國內／國外".to_string(), value: region_filter(), options: region_options, translate_options: true, on_change: move |value| region_filter.set(value) }
                 select {
                     value: "{sort_by}",
                     oninput: move |event| sort_by.set(event.value()),
@@ -2542,10 +2999,10 @@ fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
                     value: "{search}",
                     oninput: move |event| search.set(event.value()),
                 }
-                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, on_change: move |value| owner_filter.set(value) }
-                SelectFilter { label: "金融機構".to_string(), value: institution_filter(), options: institution_options, on_change: move |value| institution_filter.set(value) }
-                SelectFilter { label: "資產類型".to_string(), value: asset_type_filter(), options: asset_type_options, on_change: move |value| asset_type_filter.set(value) }
-                SelectFilter { label: "幣別".to_string(), value: currency_filter(), options: currency_options, on_change: move |value| currency_filter.set(value) }
+                SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, translate_options: false, on_change: move |value| owner_filter.set(value) }
+                SelectFilter { label: "金融機構".to_string(), value: institution_filter(), options: institution_options, translate_options: false, on_change: move |value| institution_filter.set(value) }
+                SelectFilter { label: "資產類型".to_string(), value: asset_type_filter(), options: asset_type_options, translate_options: true, on_change: move |value| asset_type_filter.set(value) }
+                SelectFilter { label: "幣別".to_string(), value: currency_filter(), options: currency_options, translate_options: false, on_change: move |value| currency_filter.set(value) }
                 select {
                     value: "{sort_by}",
                     oninput: move |event| sort_by.set(event.value()),
@@ -2623,7 +3080,7 @@ fn AccountAssetRow(row: AccountAsset, on_edit: EventHandler<AccountAsset>) -> El
             td { "{row.institution_name}" }
             td { class: "name-cell", "{row.account_name}" }
             td { "{row.account_type}" }
-            td { "{row.asset_type}" }
+            td { "{select_option_label(&row.asset_type)}" }
             td { class: "mono", "{row.currency_code}" }
             td { class: "number", "{decimal(row.invested_amount, 2)}" }
             td { class: "number", "{decimal(row.quantity, 2)}" }
@@ -2974,9 +3431,9 @@ fn HoldingRow(
             td { "{row.account_name}" }
             td { class: "mono", "{row.symbol}" }
             td { class: "name-cell", "{row.instrument_name}" }
-            td { "{row.instrument_type}" }
-            td { "{row.asset_class}" }
-            td { "{row.region_type}" }
+            td { "{select_option_label(&row.instrument_type)}" }
+            td { "{select_option_label(&row.asset_class)}" }
+            td { "{select_option_label(&row.region_type)}" }
             td { class: "number", "{decimal(row.quantity, 2)}" }
             td { class: "number", "{decimal(row.average_cost, 2)}" }
             td { class: "number", "{decimal(row.market_price, 2)}" }
