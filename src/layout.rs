@@ -71,7 +71,11 @@ pub fn AppLayout() -> Element {
         div { class: "app-shell",
             aside { class: "sidebar",
                 div { class: "brand",
-                    span { class: "brand-mark", "BOM" }
+                    img {
+                        class: "brand-mark",
+                        src: asset!("/assets/icon.svg"),
+                        alt: "BOM 圖示",
+                    }
                     div {
                         h1 { "資產管理" }
                     }

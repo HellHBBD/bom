@@ -107,7 +107,8 @@ jobs:
             "Cargo.toml",
             "Cargo.lock",
             "Dioxus.toml",
-            "assets\data.sqlite"
+            "assets\data.sqlite",
+            "assets\icon.ico"
           )
 
           foreach ($file in $requiredFiles) {
@@ -322,7 +323,8 @@ jobs:
             "Cargo.toml",
             "Cargo.lock",
             "Dioxus.toml",
-            "assets\data.sqlite"
+            "assets\data.sqlite",
+            "assets\icon.ico"
           )
 
           foreach ($file in $requiredFiles) {

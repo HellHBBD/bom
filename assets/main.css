@@ -37,14 +37,9 @@ a {
 }
 
 .brand-mark {
-    display: grid;
     width: 52px;
     height: 52px;
-    place-items: center;
-    border-radius: 18px;
-    background: #38bdf8;
-    color: #082f49;
-    font-weight: 800;
+    flex: 0 0 auto;
 }
 
 .brand h1 {
