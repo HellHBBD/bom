@@ -1,8 +1,10 @@
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
+use rust_decimal::Decimal;
 
+use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
 
-const LATEST_VERSION: i64 = 5;
+const LATEST_VERSION: i64 = 10;
 const MANUAL_WRITES_SQL: &str = include_str!("migrations/001_manual_writes.sql");
 const PRODUCT_LEVEL_MARKET_DATA_SQL: &str =
     include_str!("migrations/002_product_level_market_data.sql");
@@ -13,6 +15,15 @@ const DIVIDEND_ASSUMPTION_ACCOUNT_SCOPE_SQL: &str =
 const DIVIDEND_ASSUMPTION_ACCOUNT_SCOPE_FALLBACK_SQL: &str =
     include_str!("migrations/004_dividend_assumption_account_scope_fallback.sql");
 const UI_PREFERENCE_SQL: &str = include_str!("migrations/005_ui_preference.sql");
+const INSTRUMENT_FEE_RATES_SQL: &str = include_str!("migrations/006_instrument_fee_rates.sql");
+const FEE_AWARE_HOLDING_METRICS_SQL: &str =
+    include_str!("migrations/007_fee_aware_holding_metrics.sql");
+const HOLDING_SNAPSHOT_FEE_RATE_SQL: &str =
+    include_str!("migrations/008_holding_snapshot_fee_rate.sql");
+const VALIDATE_FEE_RATE_TEXT_SQL: &str = include_str!("migrations/009_validate_fee_rate_text.sql");
+const REPAIR_FEE_METRIC_VIEWS_SQL: &str =
+    include_str!("migrations/010_repair_fee_metric_views.sql");
+const LEGACY_BUY_FEE_RATE: Decimal = Decimal::from_parts(1425, 0, 0, false, 6);
 const DIVIDEND_RECEIPT_AMOUNT_VIEW_SQL: &str = r#"
 CREATE VIEW IF NOT EXISTS v_dividend_receipt_amount AS
 SELECT
@@ -209,13 +220,285 @@ pub fn migrate(connection: &mut Connection) -> AppResult<()> {
     if version < 5 {
         transaction.execute_batch(UI_PREFERENCE_SQL)?;
         transaction.pragma_update(None, "user_version", 5_i64)?;
+        version = 5;
+    }
+
+    if version < 6 {
+        let fee_rate_column_count = ["buy_fee_rate", "sell_fee_rate", "sell_transaction_tax_rate"]
+            .iter()
+            .map(|column_name| column_exists(&transaction, "instrument", column_name))
+            .collect::<AppResult<Vec<_>>>()?
+            .into_iter()
+            .filter(|exists| *exists)
+            .count();
+        match fee_rate_column_count {
+            0 => transaction.execute_batch(INSTRUMENT_FEE_RATES_SQL)?,
+            3 => {}
+            _ => {
+                return Err(AppError::Validation(
+                    "資料表 instrument 的費率欄位不完整".to_string(),
+                ));
+            }
+        }
+        validate_fee_rate_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", 6_i64)?;
+        version = 6;
+    }
+
+    if version < 7 {
+        backfill_fee_inclusive_average_costs(&transaction)?;
+        transaction.execute_batch(FEE_AWARE_HOLDING_METRICS_SQL)?;
+        transaction.pragma_update(None, "user_version", 7_i64)?;
+        version = 7;
+    }
+
+    if version < 8 {
+        if !column_exists(&transaction, "holding_snapshot", "applied_buy_fee_rate")? {
+            transaction.execute_batch(HOLDING_SNAPSHOT_FEE_RATE_SQL)?;
+        }
+        transaction.pragma_update(None, "user_version", 8_i64)?;
+        version = 8;
+    }
+
+    if version < 9 {
+        transaction.execute_batch(VALIDATE_FEE_RATE_TEXT_SQL)?;
+        transaction.pragma_update(None, "user_version", 9_i64)?;
+        version = 9;
+    }
+
+    if version < 10 {
+        transaction.execute_batch(REPAIR_FEE_METRIC_VIEWS_SQL)?;
+        transaction.pragma_update(None, "user_version", 10_i64)?;
     }
 
     validate_manual_write_schema(&transaction)?;
     validate_ui_preference_schema(&transaction)?;
+    validate_fee_rate_schema(&transaction)?;
+    validate_holding_snapshot_fee_rate_schema(&transaction)?;
+    validate_fee_rate_text_triggers(&transaction)?;
+    validate_fee_metric_view(&transaction)?;
 
     transaction.commit()?;
 
+    Ok(())
+}
+
+fn validate_fee_rate_text_triggers(connection: &Connection) -> AppResult<()> {
+    for trigger_name in [
+        "validate_instrument_fee_rates_insert",
+        "validate_instrument_fee_rates_update",
+        "validate_holding_snapshot_buy_fee_rate",
+        "validate_holding_snapshot_buy_fee_rate_update",
+    ] {
+        let trigger_sql = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+            [trigger_name],
+            |row| row.get::<_, String>(0),
+        );
+        let valid_trigger = trigger_sql
+            .ok()
+            .is_some_and(|sql| normalize_schema_sql(&sql).contains("GLOB"));
+        if !valid_trigger {
+            return Err(AppError::Validation(format!(
+                "缺少商品費率格式驗證 trigger {trigger_name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fee_metric_view(connection: &Connection) -> AppResult<()> {
+    let view_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'v_holding_metrics'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !normalize_schema_sql(&view_sql).contains("H.APPLIED_BUY_FEE_RATE") {
+        return Err(AppError::Validation(
+            "持股指標 view 未使用快照買入手續費率".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_holding_snapshot_fee_rate_schema(connection: &Connection) -> AppResult<()> {
+    let column = connection
+        .prepare("PRAGMA table_info(holding_snapshot)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|(name, _, _, _)| name == "applied_buy_fee_rate");
+    let Some((_, column_type, not_null, default_value)) = column else {
+        return Err(AppError::Validation(
+            "資料表 holding_snapshot 缺少套用買入手續費率欄位".to_string(),
+        ));
+    };
+    if !column_type.eq_ignore_ascii_case("TEXT")
+        || not_null != 1
+        || default_value
+            .as_deref()
+            .map(|value| value.trim_matches('\'').trim_matches('"'))
+            != Some("0.001425")
+    {
+        return Err(AppError::Validation(
+            "資料表 holding_snapshot 的套用買入手續費率欄位定義不正確".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_fee_rates(
+    buy_fee_rate: Decimal,
+    sell_fee_rate: Decimal,
+    sell_transaction_tax_rate: Decimal,
+) -> AppResult<()> {
+    let zero = Decimal::ZERO;
+    let one = Decimal::ONE;
+    if buy_fee_rate < zero || buy_fee_rate >= one {
+        return Err(AppError::Validation(
+            "買入手續費率必須介於 0 與 1 之間".to_string(),
+        ));
+    }
+    if sell_fee_rate < zero || sell_fee_rate >= one {
+        return Err(AppError::Validation(
+            "賣出手續費率必須介於 0 與 1 之間".to_string(),
+        ));
+    }
+    if sell_transaction_tax_rate < zero || sell_transaction_tax_rate >= one {
+        return Err(AppError::Validation(
+            "賣出交易稅率必須介於 0 與 1 之間".to_string(),
+        ));
+    }
+    if sell_fee_rate + sell_transaction_tax_rate >= one {
+        return Err(AppError::Validation(
+            "賣出手續費率與交易稅率合計必須小於 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fee_rate_schema(connection: &Connection) -> AppResult<()> {
+    let columns = connection
+        .prepare("PRAGMA table_info(instrument)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (column_name, default_value) in [
+        ("buy_fee_rate", "0.001425"),
+        ("sell_fee_rate", "0"),
+        ("sell_transaction_tax_rate", "0"),
+    ] {
+        let valid_column = columns
+            .iter()
+            .any(|(name, column_type, not_null, default)| {
+                name == column_name
+                    && column_type.eq_ignore_ascii_case("TEXT")
+                    && *not_null == 1
+                    && default
+                        .as_deref()
+                        .map(|value| value.trim_matches('\'').trim_matches('"'))
+                        == Some(default_value)
+            });
+        if !valid_column {
+            return Err(AppError::Validation(format!(
+                "資料表 instrument 的費率欄位 {column_name} 定義不正確"
+            )));
+        }
+    }
+    let table_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instrument'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized_schema = normalize_schema_sql(&table_sql);
+    for constraint in [
+        "CHECK(CAST(BUY_FEE_RATEASREAL)>=0ANDCAST(BUY_FEE_RATEASREAL)<1)",
+        "CHECK(CAST(SELL_FEE_RATEASREAL)>=0ANDCAST(SELL_FEE_RATEASREAL)<1)",
+        "CHECK(CAST(SELL_TRANSACTION_TAX_RATEASREAL)>=0ANDCAST(SELL_TRANSACTION_TAX_RATEASREAL)<1ANDCAST(SELL_FEE_RATEASREAL)+CAST(SELL_TRANSACTION_TAX_RATEASREAL)<1)",
+    ] {
+        if !normalized_schema.contains(constraint) {
+            return Err(AppError::Validation(
+                "資料表 instrument 的費率限制不正確".to_string(),
+            ));
+        }
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT instrument_id, buy_fee_rate, sell_fee_rate, sell_transaction_tax_rate FROM instrument",
+    )?;
+    let rates = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for rate in rates {
+        let (instrument_id, buy_fee_rate, sell_fee_rate, sell_transaction_tax_rate) = rate?;
+        let buy_fee_rate = parse_decimal_field("buy_fee_rate", &buy_fee_rate).map_err(|_| {
+            AppError::Validation(format!("商品 {instrument_id} 的買入手續費率格式錯誤"))
+        })?;
+        let sell_fee_rate = parse_decimal_field("sell_fee_rate", &sell_fee_rate).map_err(|_| {
+            AppError::Validation(format!("商品 {instrument_id} 的賣出手續費率格式錯誤"))
+        })?;
+        let sell_transaction_tax_rate =
+            parse_decimal_field("sell_transaction_tax_rate", &sell_transaction_tax_rate).map_err(
+                |_| AppError::Validation(format!("商品 {instrument_id} 的賣出交易稅率格式錯誤")),
+            )?;
+        validate_fee_rates(buy_fee_rate, sell_fee_rate, sell_transaction_tax_rate)?;
+    }
+    Ok(())
+}
+
+fn backfill_fee_inclusive_average_costs(connection: &Connection) -> AppResult<()> {
+    let mut statement = connection.prepare(
+        "SELECT holding_snapshot_id, account_id, instrument_id, snapshot_date, average_cost_text FROM holding_snapshot",
+    )?;
+    let snapshots = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let snapshots = snapshots.collect::<Result<Vec<_>, _>>()?;
+    for (snapshot_id, account_id, instrument_id, snapshot_date, average_cost_text) in snapshots {
+        let context = format!(
+            "持股快照 {snapshot_id}（帳戶 {account_id}、商品 {instrument_id}、日期 {snapshot_date}）"
+        );
+        let average_cost_text = average_cost_text
+            .ok_or_else(|| AppError::Validation(format!("{context} 的平均成本不可為空白")))?;
+        let average_cost = parse_decimal_field("average_cost", &average_cost_text)
+            .map_err(|_| AppError::Validation(format!("{context} 的平均成本格式錯誤")))?;
+        if average_cost.is_sign_negative() {
+            return Err(AppError::Validation(format!(
+                "{context} 的平均成本不可為負數"
+            )));
+        }
+        connection.execute(
+            "UPDATE holding_snapshot SET average_cost_text = ?1 WHERE holding_snapshot_id = ?2",
+            params![
+                normalize_decimal_text(average_cost * (Decimal::ONE + LEGACY_BUY_FEE_RATE)),
+                snapshot_id
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -818,7 +1101,9 @@ pub fn current_version(connection: &Connection) -> AppResult<i64> {
 mod tests {
     use rusqlite::{params, Connection, ErrorCode};
 
-    use super::{column_exists, current_version, migrate, table_exists, AppError};
+    use super::{
+        column_exists, current_version, migrate, table_exists, validate_fee_rates, AppError,
+    };
 
     #[test]
     fn migrates_old_schema_to_latest_version() {
@@ -827,7 +1112,7 @@ mod tests {
 
         migrate(&mut connection).expect("migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
         assert!(table_exists(&connection, "ui_preference").expect("preference table"));
         assert!(column_exists(&connection, "holding_snapshot", "origin").expect("column lookup"));
         assert!(index_exists(&connection, "uq_manual_holding_snapshot"));
@@ -852,7 +1137,156 @@ mod tests {
         migrate(&mut connection).expect("first migration succeeds");
         migrate(&mut connection).expect("second migration succeeds");
 
+        assert_eq!(current_version(&connection).expect("version"), 10);
+    }
+
+    #[test]
+    fn migrates_v5_costs_to_fee_inclusive_decimal_text_once() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_v5_schema(&connection);
+        connection
+            .execute(
+                "INSERT INTO holding_snapshot (account_id, instrument_id, snapshot_date, quantity_text, average_cost_text, cost_currency_code, origin) VALUES (1, 1, '2026-07-12', '10', '20', 'NTD', 'MANUAL')",
+                [],
+            )
+            .expect("seed v5 snapshot");
+
+        migrate(&mut connection).expect("migrate v5 database");
+        let cost_after_first_migration: String = connection
+            .query_row(
+                "SELECT average_cost_text FROM holding_snapshot WHERE snapshot_date = '2026-07-12'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated cost");
+        assert_eq!(cost_after_first_migration, "20.0285");
+        let applied_buy_fee_rate: String = connection
+            .query_row(
+                "SELECT applied_buy_fee_rate FROM holding_snapshot WHERE snapshot_date = '2026-07-12'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read snapshot buy fee rate");
+        assert_eq!(applied_buy_fee_rate, "0.001425");
+        assert_eq!(current_version(&connection).expect("version"), 10);
+
+        migrate(&mut connection).expect("repeat migration");
+        let cost_after_second_migration: String = connection
+            .query_row(
+                "SELECT average_cost_text FROM holding_snapshot WHERE snapshot_date = '2026-07-12'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read idempotent cost");
+        assert_eq!(cost_after_second_migration, "20.0285");
+    }
+
+    #[test]
+    fn malformed_v5_cost_rolls_back_without_advancing_version() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_v5_schema(&connection);
+        connection
+            .execute(
+                "INSERT INTO holding_snapshot (account_id, instrument_id, snapshot_date, quantity_text, average_cost_text, cost_currency_code, origin) VALUES (1, 1, '2026-07-12', '10', 'bad-cost', 'NTD', 'MANUAL')",
+                [],
+            )
+            .expect("seed malformed v5 snapshot");
+
+        let error = migrate(&mut connection).expect_err("malformed cost is rejected");
+
+        assert!(error.to_string().contains("持股快照"));
         assert_eq!(current_version(&connection).expect("version"), 5);
+        let cost: String = connection
+            .query_row(
+                "SELECT average_cost_text FROM holding_snapshot",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read unchanged cost");
+        assert_eq!(cost, "bad-cost");
+    }
+
+    #[test]
+    fn negative_v5_cost_rolls_back_without_advancing_version() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_v5_schema(&connection);
+        connection
+            .execute(
+                "INSERT INTO holding_snapshot (account_id, instrument_id, snapshot_date, quantity_text, average_cost_text, cost_currency_code, origin) VALUES (1, 1, '2026-07-12', '10', '-20', 'NTD', 'MANUAL')",
+                [],
+            )
+            .expect("seed negative v5 snapshot");
+
+        let error = migrate(&mut connection).expect_err("negative cost is rejected");
+
+        assert!(error.to_string().contains("不可為負數"));
+        assert_eq!(current_version(&connection).expect("version"), 5);
+    }
+
+    #[test]
+    fn holding_metrics_apply_combined_sale_rates_to_liquidation_value() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_v5_schema(&connection);
+        migrate(&mut connection).expect("migrate schema");
+        connection
+            .execute(
+                "UPDATE instrument SET sell_fee_rate = '0.001425', sell_transaction_tax_rate = '0.003' WHERE instrument_id = 1",
+                [],
+            )
+            .expect("set sale rates");
+        connection
+            .execute_batch(
+                "INSERT INTO holding_snapshot (account_id, instrument_id, snapshot_date, quantity_text, average_cost_text, cost_currency_code, origin) VALUES (1, 1, '2026-07-12', '10', '100', 'NTD', 'MANUAL'); INSERT INTO instrument_price (instrument_id, price_date, price_text, currency_code, origin) VALUES (1, '2026-07-12', '120', 'NTD', 'MANUAL');",
+            )
+            .expect("seed metrics");
+
+        let (market_value, liquidation_value, profit, return_rate): (f64, f64, f64, f64) = connection
+            .query_row(
+                "SELECT market_value, liquidation_value, unrealized_profit, unrealized_return_rate FROM v_holding_metrics",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read fee-aware metrics");
+        let expected_liquidation = 1200.0 * (1.0 - 0.001425 - 0.003);
+        assert_eq!(market_value, 1200.0);
+        assert!((liquidation_value - expected_liquidation).abs() < 1e-9);
+        assert!((profit - (expected_liquidation - 1000.0)).abs() < 1e-9);
+        assert!((return_rate - ((expected_liquidation - 1000.0) / 1000.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_invalid_fee_rate_combinations() {
+        let error = validate_fee_rates(
+            "0.001425".parse().expect("valid rate"),
+            "0.6".parse().expect("valid rate"),
+            "0.4".parse().expect("valid rate"),
+        )
+        .expect_err("combined sale rates must be below one");
+        assert!(error.to_string().contains("合計必須小於 1"));
+
+        let error = validate_fee_rates(
+            "1".parse().expect("valid decimal"),
+            "0".parse().expect("valid rate"),
+            "0".parse().expect("valid rate"),
+        )
+        .expect_err("buy rate must be below one");
+        assert!(error.to_string().contains("買入手續費率"));
+    }
+
+    #[test]
+    fn database_rejects_malformed_fee_rate_text() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_old_schema(&connection);
+        migrate(&mut connection).expect("migrate schema");
+
+        let error = connection
+            .execute(
+                "UPDATE instrument SET buy_fee_rate = 'invalid' WHERE instrument_id = 1",
+                [],
+            )
+            .expect_err("malformed fee rate is rejected");
+
+        assert!(error.to_string().contains("fee rates"));
     }
 
     #[test]
@@ -866,7 +1300,7 @@ mod tests {
 
         migrate(&mut connection).expect("recovery migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
         assert!(table_exists(&connection, "ui_preference").expect("preference table exists"));
     }
 
@@ -904,7 +1338,7 @@ mod tests {
         let error = migrate(&mut connection).expect_err("invalid v5 preference table is rejected");
 
         assert!(error.to_string().contains("ui_preference"));
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
     }
 
     #[test]
@@ -1000,7 +1434,7 @@ mod tests {
 
         migrate(&mut connection).expect("migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
         assert!(
             column_exists(&connection, "account_asset_snapshot", "origin").expect("column lookup")
         );
@@ -1303,7 +1737,7 @@ mod tests {
 
         migrate(&mut connection).expect("fallback migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
         assert!(
             table_exists(&connection, "dividend_assumption_account_archive")
                 .expect("archive exists")
@@ -1321,7 +1755,7 @@ mod tests {
 
         migrate(&mut connection).expect("fallback migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
         assert!(
             table_exists(&connection, "dividend_assumption_account_archive")
                 .expect("archive exists")
@@ -1436,7 +1870,7 @@ mod tests {
 
         migrate(&mut connection).expect("repair path succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
         assert!(index_exists(&connection, "uq_manual_dividend_assumption"));
     }
 
@@ -1455,7 +1889,7 @@ mod tests {
             )
             .expect("manual row count");
         assert_eq!(manual_count, 1);
-        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert_eq!(current_version(&connection).expect("version"), 10);
     }
 
     #[test]
@@ -1664,6 +2098,24 @@ mod tests {
         connection
             .execute_batch(super::MANUAL_WRITES_SQL)
             .expect("apply stage1 schema");
+    }
+
+    fn create_v5_schema(connection: &Connection) {
+        create_stage1_schema(connection);
+        connection
+            .execute_batch(super::PRODUCT_LEVEL_MARKET_DATA_SQL)
+            .expect("apply stage2 schema");
+        connection
+            .execute_batch(super::EXCHANGE_RATE_MANUAL_ORIGIN_SQL)
+            .expect("apply stage3 schema");
+        super::migrate_v4_dividend_assumption_account_scope(connection)
+            .expect("apply stage4 schema");
+        connection
+            .execute_batch(super::UI_PREFERENCE_SQL)
+            .expect("apply stage5 schema");
+        connection
+            .pragma_update(None, "user_version", 5_i64)
+            .expect("set version 5");
     }
 
     fn create_v2_product_level_schema_without_archive(connection: &Connection) {

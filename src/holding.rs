@@ -4,6 +4,8 @@ use rust_decimal::Decimal;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[cfg(not(target_arch = "wasm32"))]
+use crate::db::migration::validate_fee_rates;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::db::open_manual_write_database;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
@@ -418,7 +420,8 @@ fn save_current_holding_update_with_connection(
         &validated.as_of_date,
     )?;
 
-    upsert_holding_snapshot(&transaction, &validated)?;
+    let buy_fee_rate = instrument_buy_fee_rate(&transaction, validated.instrument_id)?;
+    upsert_holding_snapshot(&transaction, &validated, buy_fee_rate)?;
     upsert_instrument_price(&transaction, &validated)?;
     upsert_dividend_assumption(
         &transaction,
@@ -473,7 +476,8 @@ fn save_current_holding_state_with_connection(
         &validated.as_of_date,
     )?;
 
-    upsert_holding_state_snapshot(&transaction, &validated)?;
+    let buy_fee_rate = instrument_buy_fee_rate(&transaction, validated.instrument_id)?;
+    upsert_holding_state_snapshot(&transaction, &validated, buy_fee_rate)?;
 
     transaction.commit()?;
     Ok(())
@@ -484,11 +488,12 @@ fn save_current_holding_state_with_connection(
 fn upsert_holding_snapshot(
     transaction: &Transaction<'_>,
     update: &ValidatedHoldingUpdate,
+    buy_fee_rate: Decimal,
 ) -> AppResult<()> {
     let existing_id = transaction
         .query_row(
             r#"
-            SELECT holding_snapshot_id
+            SELECT holding_snapshot_id, average_cost_text, applied_buy_fee_rate
             FROM holding_snapshot
             WHERE account_id = ?1
               AND instrument_id = ?2
@@ -498,25 +503,42 @@ fn upsert_holding_snapshot(
             LIMIT 1
             "#,
             params![update.account_id, update.instrument_id, update.as_of_date],
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
 
-    if let Some(holding_snapshot_id) = existing_id {
+    let (fee_inclusive_average_cost, applied_buy_fee_rate) = fee_inclusive_cost_for_save(
+        &update.average_cost_text,
+        buy_fee_rate,
+        existing_id
+            .as_ref()
+            .map(|(_, average_cost_text, applied_buy_fee_rate)| {
+                (average_cost_text.as_str(), applied_buy_fee_rate.as_str())
+            }),
+    )?;
+    if let Some((holding_snapshot_id, _, _)) = existing_id {
         transaction.execute(
             r#"
             UPDATE holding_snapshot
             SET quantity_text = ?1,
                 average_cost_text = ?2,
-                cost_currency_code = ?3,
+                applied_buy_fee_rate = ?3,
+                cost_currency_code = ?4,
                 source_sheet = NULL,
                 source_row = NULL,
                 origin = 'MANUAL'
-            WHERE holding_snapshot_id = ?4
+            WHERE holding_snapshot_id = ?5
             "#,
             params![
                 update.quantity_text,
-                update.average_cost_text,
+                fee_inclusive_average_cost,
+                applied_buy_fee_rate,
                 update.currency_code,
                 holding_snapshot_id,
             ],
@@ -530,16 +552,18 @@ fn upsert_holding_snapshot(
                 snapshot_date,
                 quantity_text,
                 average_cost_text,
+                applied_buy_fee_rate,
                 cost_currency_code,
                 origin
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'MANUAL')
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'MANUAL')
             "#,
             params![
                 update.account_id,
                 update.instrument_id,
                 update.as_of_date,
                 update.quantity_text,
-                update.average_cost_text,
+                fee_inclusive_average_cost,
+                applied_buy_fee_rate,
                 update.currency_code,
             ],
         )?;
@@ -552,11 +576,12 @@ fn upsert_holding_snapshot(
 fn upsert_holding_state_snapshot(
     transaction: &Transaction<'_>,
     update: &ValidatedHoldingState,
+    buy_fee_rate: Decimal,
 ) -> AppResult<()> {
     let existing_id = transaction
         .query_row(
             r#"
-            SELECT holding_snapshot_id
+            SELECT holding_snapshot_id, average_cost_text, applied_buy_fee_rate
             FROM holding_snapshot
             WHERE account_id = ?1
               AND instrument_id = ?2
@@ -566,26 +591,43 @@ fn upsert_holding_state_snapshot(
             LIMIT 1
             "#,
             params![update.account_id, update.instrument_id, update.as_of_date],
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
 
-    if let Some(holding_snapshot_id) = existing_id {
+    let (fee_inclusive_average_cost, applied_buy_fee_rate) = fee_inclusive_cost_for_save(
+        &update.average_cost_text,
+        buy_fee_rate,
+        existing_id
+            .as_ref()
+            .map(|(_, average_cost_text, applied_buy_fee_rate)| {
+                (average_cost_text.as_str(), applied_buy_fee_rate.as_str())
+            }),
+    )?;
+    if let Some((holding_snapshot_id, _, _)) = existing_id {
         transaction.execute(
             r#"
             UPDATE holding_snapshot
             SET quantity_text = ?1,
                 average_cost_text = ?2,
-                cost_currency_code = ?3,
-                note = ?4,
+                applied_buy_fee_rate = ?3,
+                cost_currency_code = ?4,
+                note = ?5,
                 source_sheet = NULL,
                 source_row = NULL,
                 origin = 'MANUAL'
-            WHERE holding_snapshot_id = ?5
+            WHERE holding_snapshot_id = ?6
             "#,
             params![
                 update.quantity_text,
-                update.average_cost_text,
+                fee_inclusive_average_cost,
+                applied_buy_fee_rate,
                 update.currency_code,
                 update.note,
                 holding_snapshot_id,
@@ -600,17 +642,19 @@ fn upsert_holding_state_snapshot(
                 snapshot_date,
                 quantity_text,
                 average_cost_text,
+                applied_buy_fee_rate,
                 cost_currency_code,
                 note,
                 origin
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'MANUAL')
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'MANUAL')
             "#,
             params![
                 update.account_id,
                 update.instrument_id,
                 update.as_of_date,
                 update.quantity_text,
-                update.average_cost_text,
+                fee_inclusive_average_cost,
+                applied_buy_fee_rate,
                 update.currency_code,
                 update.note,
             ],
@@ -618,6 +662,51 @@ fn upsert_holding_state_snapshot(
     }
 
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fee_inclusive_cost_for_save(
+    fee_exclusive_average_cost_text: &str,
+    current_buy_fee_rate: Decimal,
+    existing: Option<(&str, &str)>,
+) -> AppResult<(String, String)> {
+    let fee_exclusive_average_cost =
+        parse_decimal_field("average_cost", fee_exclusive_average_cost_text)?;
+    if let Some((stored_cost_text, stored_fee_rate_text)) = existing {
+        let stored_cost = parse_decimal_field("average_cost", stored_cost_text)?;
+        let stored_fee_rate = parse_decimal_field("applied_buy_fee_rate", stored_fee_rate_text)?;
+        if fee_exclusive_average_cost == stored_cost / (Decimal::ONE + stored_fee_rate) {
+            return Ok((
+                stored_cost_text.to_string(),
+                stored_fee_rate_text.to_string(),
+            ));
+        }
+    }
+    Ok((
+        normalize_decimal_text(fee_exclusive_average_cost * (Decimal::ONE + current_buy_fee_rate)),
+        normalize_decimal_text(current_buy_fee_rate),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn instrument_buy_fee_rate(
+    transaction: &Transaction<'_>,
+    instrument_id: i64,
+) -> AppResult<Decimal> {
+    let (buy_fee_rate, sell_fee_rate, sell_transaction_tax_rate): (String, String, String) = transaction
+        .query_row(
+            "SELECT buy_fee_rate, sell_fee_rate, sell_transaction_tax_rate FROM instrument WHERE instrument_id = ?1",
+            [instrument_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::Validation(format!("找不到商品 {instrument_id} 的費率設定")))?;
+    let buy_fee_rate = parse_decimal_field("buy_fee_rate", &buy_fee_rate)?;
+    let sell_fee_rate = parse_decimal_field("sell_fee_rate", &sell_fee_rate)?;
+    let sell_transaction_tax_rate =
+        parse_decimal_field("sell_transaction_tax_rate", &sell_transaction_tax_rate)?;
+    validate_fee_rates(buy_fee_rate, sell_fee_rate, sell_transaction_tax_rate)?;
+    Ok(buy_fee_rate)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -805,11 +894,11 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(not(target_arch = "wasm32"))]
-    use super::save_current_holding_state_with_connection;
-    #[cfg(not(target_arch = "wasm32"))]
     use super::save_current_holding_update_with_connection;
     #[cfg(not(target_arch = "wasm32"))]
     use super::save_dividend_assumption_with_connection;
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::{fee_inclusive_cost_for_save, save_current_holding_state_with_connection};
     use super::{
         validate_current_holding_state_input, validate_current_holding_update,
         validate_dividend_assumption_input, CurrentHoldingStateInput, CurrentHoldingUpdateInput,
@@ -832,6 +921,21 @@ mod tests {
             latest_dividend_per_unit_text: "0.5".to_string(),
             estimated_annual_dividend_per_unit_text: "2.0".to_string(),
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn preserves_existing_cost_and_fee_when_average_cost_is_unchanged() {
+        let current_buy_fee_rate = "0.002".parse().expect("valid current fee");
+
+        let result = fee_inclusive_cost_for_save(
+            "45.5",
+            current_buy_fee_rate,
+            Some(("45.5648375", "0.001425")),
+        )
+        .expect("preserve existing cost");
+
+        assert_eq!(result, ("45.5648375".to_string(), "0.001425".to_string()));
     }
 
     fn sample_state_input() -> CurrentHoldingStateInput {
@@ -1162,7 +1266,7 @@ mod tests {
             )
             .expect("holding snapshot row");
         assert_eq!(quantity_text, "321");
-        assert_eq!(average_cost_text, "45.5");
+        assert_eq!(average_cost_text, "45.5648375");
 
         let price_row_count: i64 = connection
             .query_row(
@@ -1469,7 +1573,7 @@ mod tests {
             )
             .expect("saved holding state row");
         assert_eq!(quantity_text, "432.1");
-        assert_eq!(average_cost_text, "48.2");
+        assert_eq!(average_cost_text, "48.268685");
         assert_eq!(note.as_deref(), Some("分批建立倉位"));
         assert_eq!(origin, "MANUAL");
 

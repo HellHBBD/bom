@@ -37,8 +37,8 @@ use crate::ui_preference::{
     parse_visible_columns, persist_preference, preference_value, serialize_visible_columns,
     valid_option, valid_sort, UiPreferences, ACCOUNTS_ASSET_TYPE, ACCOUNTS_CURRENCY,
     ACCOUNTS_INSTITUTION, ACCOUNTS_OWNER, ACCOUNTS_SEARCH, ACCOUNTS_SORT, HOLDINGS_ASSET_CLASS,
-    HOLDINGS_OWNER, HOLDINGS_REGION, HOLDINGS_SEARCH, HOLDINGS_SORT, HOLDINGS_TYPE,
-    HOLDINGS_VISIBLE_COLUMNS, LEGACY_DIVIDENDS_INSTRUMENT, LEGACY_DIVIDENDS_OWNER,
+    HOLDINGS_OWNER, HOLDINGS_REGION, HOLDINGS_SEARCH, HOLDINGS_SHOW_CLOSED, HOLDINGS_SORT,
+    HOLDINGS_TYPE, HOLDINGS_VISIBLE_COLUMNS, LEGACY_DIVIDENDS_INSTRUMENT, LEGACY_DIVIDENDS_OWNER,
     LEGACY_DIVIDENDS_PERIOD, LEGACY_DIVIDENDS_SEARCH, LEGACY_DIVIDENDS_SORT, QUICK_PRICE_CURRENCY,
     QUICK_PRICE_DATE, QUICK_PRICE_SEARCH, QUICK_PRICE_SORT,
 };
@@ -2935,10 +2935,11 @@ const HOLDING_COLUMNS: &[(&str, &str)] = &[
     ("asset_class", "資產類別"),
     ("region", "區域"),
     ("quantity", "數量"),
-    ("average_cost", "平均成本"),
+    ("average_cost", "平均成本（含買入手續費）"),
     ("market_price", "市價"),
     ("total_cost", "總成本"),
-    ("market_value", "市值"),
+    ("market_value", "市值（毛額）"),
+    ("liquidation_value", "預估清算淨值"),
     ("profit", "未實現損益"),
     ("return_rate", "損益率"),
     ("estimated_dividend", "預估年配息"),
@@ -2963,6 +2964,53 @@ fn holding_column_ids() -> Vec<&'static str> {
 
 fn is_holding_column_visible(visible_columns: &HashSet<String>, column_id: &str) -> bool {
     visible_columns.contains(column_id)
+}
+
+#[derive(Default)]
+struct HoldingReportTotals {
+    total_cost_by_currency: BTreeMap<String, f64>,
+    market_value_by_currency: BTreeMap<String, f64>,
+    liquidation_value_by_currency: BTreeMap<String, f64>,
+    unrealized_profit_by_currency: BTreeMap<String, f64>,
+}
+
+fn build_holding_report_totals(rows: &[HoldingMetric]) -> HoldingReportTotals {
+    let mut totals = HoldingReportTotals::default();
+    for row in rows {
+        let market_currency_code = row
+            .market_price_currency_code
+            .as_deref()
+            .unwrap_or(&row.trading_currency_code)
+            .to_string();
+        if let Some(total_cost) = row.total_cost {
+            *totals
+                .total_cost_by_currency
+                .entry(row.cost_currency_code.clone())
+                .or_default() += total_cost;
+        }
+        if let Some(market_value) = row.market_value {
+            *totals
+                .market_value_by_currency
+                .entry(market_currency_code.clone())
+                .or_default() += market_value;
+        }
+        if let Some(liquidation_value) = row.liquidation_value {
+            *totals
+                .liquidation_value_by_currency
+                .entry(market_currency_code.clone())
+                .or_default() += liquidation_value;
+        }
+        if row.cost_currency_code == market_currency_code {
+            let Some(unrealized_profit) = row.unrealized_profit else {
+                continue;
+            };
+            *totals
+                .unrealized_profit_by_currency
+                .entry(market_currency_code)
+                .or_default() += unrealized_profit;
+        }
+    }
+    totals
 }
 
 fn set_holding_column_visibility(
@@ -3004,6 +3052,72 @@ mod holding_column_tests {
         set_holding_column_visibility(&mut visible_columns, "market_price".to_string(), true);
         assert!(is_holding_column_visible(&visible_columns, "market_price"));
     }
+
+    #[test]
+    fn groups_holding_totals_by_market_currency() {
+        let rows = vec![
+            sample_holding_metric("USD", Some(2.0), Some(100.0)),
+            sample_holding_metric("USD", Some(3.0), Some(150.0)),
+            sample_holding_metric("NTD", Some(1.0), Some(50.0)),
+        ];
+
+        let totals = build_holding_report_totals(&rows);
+
+        assert_eq!(totals.market_value_by_currency["USD"], 250.0);
+        assert_eq!(totals.market_value_by_currency["NTD"], 50.0);
+    }
+
+    #[test]
+    fn restores_exact_fee_exclusive_cost_from_snapshot_text() {
+        let row = sample_holding_metric("NTD", Some(1.0), Some(45.5648375));
+
+        assert_eq!(fee_exclusive_average_cost(&row), "45.5");
+    }
+
+    fn sample_holding_metric(
+        currency_code: &str,
+        quantity: Option<f64>,
+        market_value: Option<f64>,
+    ) -> HoldingMetric {
+        HoldingMetric {
+            holding_snapshot_id: 1,
+            account_id: 1,
+            instrument_id: 1,
+            owner_name: "Owner".to_string(),
+            account_name: "Account".to_string(),
+            symbol: "ABC".to_string(),
+            instrument_name: "Example".to_string(),
+            instrument_type: "ETF".to_string(),
+            asset_class: "EQUITY".to_string(),
+            region_type: "DOMESTIC".to_string(),
+            trading_currency_code: currency_code.to_string(),
+            cost_currency_code: currency_code.to_string(),
+            snapshot_date: "2026-07-12".to_string(),
+            quantity,
+            average_cost: Some(45.5648375),
+            average_cost_text: "45.5648375".to_string(),
+            buy_fee_rate: Some(0.001425),
+            applied_buy_fee_rate_text: "0.001425".to_string(),
+            sell_fee_rate: Some(0.001425),
+            sell_transaction_tax_rate: Some(0.003),
+            note: String::new(),
+            market_price_date: Some("2026-07-12".to_string()),
+            market_price_currency_code: Some(currency_code.to_string()),
+            market_price: None,
+            total_cost: market_value,
+            market_value,
+            liquidation_value: market_value,
+            unrealized_profit: market_value,
+            unrealized_return_rate: None,
+            dividend_effective_date: None,
+            dividend_currency_code: None,
+            estimated_annual_dividend_per_unit: None,
+            payments_per_year: None,
+            latest_dividend_per_unit: None,
+            estimated_annual_dividend: None,
+            estimated_yield_on_cost: None,
+        }
+    }
 }
 
 #[component]
@@ -3032,6 +3146,8 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
         )
     });
     let mut is_column_picker_open = use_signal(|| false);
+    let mut show_closed =
+        use_signal(move || preference_value(&preferences(), HOLDINGS_SHOW_CLOSED) == "true");
 
     let owner_options = unique_strings(rows.iter().map(|row| row.owner_name.as_str()));
     let type_options = unique_strings(rows.iter().map(|row| row.instrument_type.as_str()));
@@ -3052,6 +3168,9 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
             HOLDINGS_OWNER,
             valid_option(&owner_filter(), &owner_options_for_persistence, ""),
         )
+    });
+    use_effect(move || {
+        persist_preference(preferences, HOLDINGS_SHOW_CLOSED, show_closed().to_string())
     });
     use_effect(move || {
         persist_preference(
@@ -3144,12 +3263,10 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                 || row.symbol.to_lowercase().contains(&search_value)
                 || row.instrument_name.to_lowercase().contains(&search_value)
         })
+        .filter(|row| show_closed() || row.quantity.unwrap_or(0.0) > 0.0)
         .cloned()
         .collect::<Vec<_>>();
-    let filtered_total = filtered_rows
-        .iter()
-        .filter_map(|row| row.market_value)
-        .sum::<f64>();
+    let filtered_totals = build_holding_report_totals(&filtered_rows);
 
     filtered_rows.sort_by(|left, right| match sort_value.as_str() {
         "profit" => compare_optional_desc(left.unrealized_profit, right.unrealized_profit),
@@ -3166,7 +3283,7 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
             }
             div { class: "table-summary",
                 strong { "{filtered_rows.len()} / {rows.len()} 筆持股" }
-                span { "篩選後市值：{money(Some(filtered_total))}" }
+                span { "已依幣別彙總篩選結果" }
             }
             div { class: "filters",
                 input {
@@ -3185,6 +3302,14 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                     option { value: "profit", "依損益排序" }
                     option { value: "return", "依報酬率排序" }
                 }
+                label { class: "column-toggle",
+                    input {
+                        r#type: "checkbox",
+                        checked: show_closed(),
+                        onchange: move |event| show_closed.set(event.checked()),
+                    }
+                    span { "顯示已清倉商品" }
+                }
                 button {
                     r#type: "button",
                     onclick: move |_| {
@@ -3194,6 +3319,7 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                         region_filter.set(String::new());
                         search.set(String::new());
                         sort_by.set("market_value".to_string());
+                        show_closed.set(false);
                     },
                     "清除篩選"
                 }
@@ -3244,10 +3370,11 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                                 if is_holding_column_visible(&visible_columns_value, "asset_class") { th { "資產類別" } }
                                 if is_holding_column_visible(&visible_columns_value, "region") { th { "區域" } }
                                 if is_holding_column_visible(&visible_columns_value, "quantity") { th { "數量" } }
-                                if is_holding_column_visible(&visible_columns_value, "average_cost") { th { "平均成本" } }
+                                if is_holding_column_visible(&visible_columns_value, "average_cost") { th { "平均成本（含買入手續費）" } }
                                 if is_holding_column_visible(&visible_columns_value, "market_price") { th { "市價" } }
                                 if is_holding_column_visible(&visible_columns_value, "total_cost") { th { "總成本" } }
-                                if is_holding_column_visible(&visible_columns_value, "market_value") { th { "市值" } }
+                                if is_holding_column_visible(&visible_columns_value, "market_value") { th { "市值（毛額）" } }
+                                if is_holding_column_visible(&visible_columns_value, "liquidation_value") { th { "預估清算淨值" } }
                                 if is_holding_column_visible(&visible_columns_value, "profit") { th { "未實現損益" } }
                                 if is_holding_column_visible(&visible_columns_value, "return_rate") { th { "損益率" } }
                                 if is_holding_column_visible(&visible_columns_value, "estimated_dividend") { th { "預估年配息" } }
@@ -3271,6 +3398,33 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                                     },
                                 }
                             }
+                        }
+                    }
+                }
+                div { class: "holding-totals",
+                    strong { "篩選結果合計" }
+                    for (currency_code, total) in filtered_totals.total_cost_by_currency {
+                        div { class: "holding-total-row",
+                            span { class: "mono", "{currency_code}" }
+                            span { "總成本：{money(Some(total))}" }
+                        }
+                    }
+                    for (currency_code, total) in filtered_totals.market_value_by_currency {
+                        div { class: "holding-total-row",
+                            span { class: "mono", "{currency_code}" }
+                            span { "市值（毛額）：{money(Some(total))}" }
+                        }
+                    }
+                    for (currency_code, total) in filtered_totals.liquidation_value_by_currency {
+                        div { class: "holding-total-row",
+                            span { class: "mono", "{currency_code}" }
+                            span { "預估清算淨值：{money(Some(total))}" }
+                        }
+                    }
+                    for (currency_code, total) in filtered_totals.unrealized_profit_by_currency {
+                        div { class: "holding-total-row",
+                            span { class: "mono", "{currency_code}" }
+                            span { "未實現損益：{money(Some(total))}" }
                         }
                     }
                 }
@@ -3904,6 +4058,7 @@ fn HoldingRow(
             if is_holding_column_visible(&visible_columns, "market_price") { td { class: "number", "{decimal(row.market_price, 2)}" } }
             if is_holding_column_visible(&visible_columns, "total_cost") { td { class: "number", "{money(row.total_cost)}" } }
             if is_holding_column_visible(&visible_columns, "market_value") { td { class: "number strong", "{money(row.market_value)}" } }
+            if is_holding_column_visible(&visible_columns, "liquidation_value") { td { class: "number strong", "{money(row.liquidation_value)}" } }
             if is_holding_column_visible(&visible_columns, "profit") { td { class: profit_class, "{money(row.unrealized_profit)}" } }
             if is_holding_column_visible(&visible_columns, "return_rate") { td { class: profit_class, "{percent(row.unrealized_return_rate)}" } }
             if is_holding_column_visible(&visible_columns, "estimated_dividend") { td { class: "number", "{money(row.estimated_annual_dividend)}" } }
@@ -3939,7 +4094,7 @@ fn HoldingEditModal(
             .filter(|date| date != "-")
             .unwrap_or_default(),
         quantity_text: editable_number(row.quantity),
-        average_cost_text: editable_number(row.average_cost),
+        average_cost_text: fee_exclusive_average_cost(&row),
         note: row.note.clone(),
     };
     let initial_form_snapshot = use_signal(|| initial_form.clone());
@@ -3949,7 +4104,7 @@ fn HoldingEditModal(
             .unwrap_or_default()
     });
     let mut quantity_text = use_signal(|| editable_number(row.quantity));
-    let mut average_cost_text = use_signal(|| editable_number(row.average_cost));
+    let mut average_cost_text = use_signal(|| fee_exclusive_average_cost(&row));
     let cost_currency_code = row.cost_currency_code.clone();
     let mut note = use_signal(|| row.note.clone());
     let mut saving = use_signal(|| false);
@@ -4030,7 +4185,7 @@ fn HoldingEditModal(
                         }
                     }
                     label {
-                        span { "平均成本" }
+                        span { "平均成本（未含買入手續費）" }
                         input {
                             value: "{average_cost_text}",
                             oninput: move |event| average_cost_text.set(event.value()),
@@ -4379,4 +4534,17 @@ fn editable_number(value: Option<f64>) -> String {
             text.trim_end_matches('0').trim_end_matches('.').to_string()
         })
         .unwrap_or_default()
+}
+
+fn fee_exclusive_average_cost(row: &HoldingMetric) -> String {
+    let fee_inclusive_cost =
+        crate::decimal::parse_decimal_field("average_cost", &row.average_cost_text);
+    let buy_fee_rate =
+        crate::decimal::parse_decimal_field("buy_fee_rate", &row.applied_buy_fee_rate_text);
+    match (fee_inclusive_cost, buy_fee_rate) {
+        (Ok(cost), Ok(rate)) => {
+            crate::decimal::normalize_decimal_text(cost / (rust_decimal::Decimal::ONE + rate))
+        }
+        _ => String::new(),
+    }
 }
