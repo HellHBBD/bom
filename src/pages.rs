@@ -33,6 +33,15 @@ use crate::models::{
     LegacyDividendData, LegacyDividendMonthlyRow, LegacyDividendSummaryRow,
 };
 use crate::price::{upsert_manual_prices_batch, BatchPriceInput, BatchPriceRowInput};
+use crate::ui_preference::{
+    parse_visible_columns, persist_preference, preference_value, serialize_visible_columns,
+    valid_option, valid_sort, UiPreferences, ACCOUNTS_ASSET_TYPE, ACCOUNTS_CURRENCY,
+    ACCOUNTS_INSTITUTION, ACCOUNTS_OWNER, ACCOUNTS_SEARCH, ACCOUNTS_SORT, HOLDINGS_ASSET_CLASS,
+    HOLDINGS_OWNER, HOLDINGS_REGION, HOLDINGS_SEARCH, HOLDINGS_SORT, HOLDINGS_TYPE,
+    HOLDINGS_VISIBLE_COLUMNS, LEGACY_DIVIDENDS_INSTRUMENT, LEGACY_DIVIDENDS_OWNER,
+    LEGACY_DIVIDENDS_PERIOD, LEGACY_DIVIDENDS_SEARCH, LEGACY_DIVIDENDS_SORT, QUICK_PRICE_CURRENCY,
+    QUICK_PRICE_DATE, QUICK_PRICE_SEARCH, QUICK_PRICE_SORT,
+};
 
 #[component]
 pub fn DashboardPage() -> Element {
@@ -116,6 +125,7 @@ struct QuickPriceUpdateRow {
 #[component]
 pub fn QuickPriceUpdatePage() -> Element {
     let data_version = use_context::<Signal<u64>>();
+    let preferences = use_context::<UiPreferences>();
     let holdings = use_resource(move || async move {
         let _ = data_version();
         load_holding_metrics()
@@ -124,14 +134,66 @@ pub fn QuickPriceUpdatePage() -> Element {
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    let mut price_date = use_signal(|| today);
-    let mut search = use_signal(String::new);
-    let mut currency_filter = use_signal(String::new);
-    let mut sort_by = use_signal(|| "symbol".to_string());
+    let mut price_date = use_signal(move || {
+        let value = preference_value(&preferences(), QUICK_PRICE_DATE);
+        valid_price_date(&value, &today)
+    });
+    let mut search = use_signal(move || preference_value(&preferences(), QUICK_PRICE_SEARCH));
+    let mut currency_filter =
+        use_signal(move || preference_value(&preferences(), QUICK_PRICE_CURRENCY));
+    let mut sort_by = use_signal(move || {
+        valid_sort(
+            &preference_value(&preferences(), QUICK_PRICE_SORT),
+            &["symbol", "name", "price"],
+            "symbol",
+        )
+    });
     let mut draft_prices = use_signal(HashMap::<i64, String>::new);
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
     let mut success_message = use_signal(String::new);
+
+    use_effect(move || {
+        let value = price_date();
+        if chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").is_ok() {
+            persist_preference(preferences, QUICK_PRICE_DATE, value);
+        }
+    });
+    use_effect(move || persist_preference(preferences, QUICK_PRICE_SEARCH, search()));
+    use_effect(move || {
+        let selected = currency_filter();
+        let value = match holdings() {
+            Some(Ok(rows)) => valid_option(
+                &selected,
+                &unique_strings(
+                    build_quick_price_update_rows(&rows)
+                        .iter()
+                        .map(|row| row.currency_code.as_str()),
+                ),
+                "",
+            ),
+            _ => selected,
+        };
+        persist_preference(preferences, QUICK_PRICE_CURRENCY, value)
+    });
+    use_effect(move || persist_preference(preferences, QUICK_PRICE_SORT, sort_by()));
+    use_effect(move || {
+        if let Some(Ok(rows)) = holdings() {
+            let selected = currency_filter();
+            let valid = valid_option(
+                &selected,
+                &unique_strings(
+                    build_quick_price_update_rows(&rows)
+                        .iter()
+                        .map(|row| row.currency_code.as_str()),
+                ),
+                "",
+            );
+            if selected != valid {
+                currency_filter.set(valid);
+            }
+        }
+    });
 
     rsx! {
         PageHeader {
@@ -359,6 +421,13 @@ fn filter_quick_price_rows(
     sort_by: &str,
 ) -> Vec<QuickPriceUpdateRow> {
     let search = search.to_lowercase();
+    let currency_filter = if currency_filter.is_empty()
+        || rows.iter().any(|row| row.currency_code == currency_filter)
+    {
+        currency_filter
+    } else {
+        ""
+    };
     let mut filtered_rows = rows
         .iter()
         .filter(|row| currency_filter.is_empty() || row.currency_code == currency_filter)
@@ -377,6 +446,14 @@ fn filter_quick_price_rows(
     });
 
     filtered_rows
+}
+
+fn valid_price_date(value: &str, default: &str) -> String {
+    if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
+        value.to_string()
+    } else {
+        default.to_string()
+    }
 }
 
 fn build_batch_price_input(
@@ -447,6 +524,12 @@ mod quick_price_filter_tests {
         assert_eq!(input.rows.len(), 2);
         assert_eq!(input.rows[0].price, "191.5");
         assert_eq!(input.rows[1].price, "501.5");
+    }
+
+    #[test]
+    fn invalid_saved_price_date_uses_today() {
+        assert_eq!(valid_price_date("2026-07-12", "2026-07-01"), "2026-07-12");
+        assert_eq!(valid_price_date("invalid", "2026-07-01"), "2026-07-01");
     }
 }
 
@@ -804,7 +887,6 @@ pub fn DividendsLegacyPage() -> Element {
 fn PageHeader(title: String, description: String) -> Element {
     rsx! {
         header { class: "page-header",
-            p { class: "eyebrow", "Read-only MVP" }
             h2 { "{title}" }
             p { class: "page-description", "{description}" }
         }
@@ -2079,11 +2161,21 @@ mod dividend_income_page_tests {
 
 #[component]
 fn LegacyDividendTables(data: LegacyDividendData) -> Element {
-    let mut owner_filter = use_signal(String::new);
-    let mut instrument_filter = use_signal(String::new);
-    let mut period_filter = use_signal(String::new);
-    let mut search = use_signal(String::new);
-    let mut sort_by = use_signal(|| "owner".to_string());
+    let preferences = use_context::<UiPreferences>();
+    let mut owner_filter =
+        use_signal(move || preference_value(&preferences(), LEGACY_DIVIDENDS_OWNER));
+    let mut instrument_filter =
+        use_signal(move || preference_value(&preferences(), LEGACY_DIVIDENDS_INSTRUMENT));
+    let mut period_filter =
+        use_signal(move || preference_value(&preferences(), LEGACY_DIVIDENDS_PERIOD));
+    let mut search = use_signal(move || preference_value(&preferences(), LEGACY_DIVIDENDS_SEARCH));
+    let mut sort_by = use_signal(move || {
+        valid_sort(
+            &preference_value(&preferences(), LEGACY_DIVIDENDS_SORT),
+            &["owner", "instrument", "amount"],
+            "owner",
+        )
+    });
 
     let owner_options = unique_strings(
         data.summaries
@@ -2103,6 +2195,57 @@ fn LegacyDividendTables(data: LegacyDividendData) -> Element {
             .map(|row| row.period_label.as_str())
             .chain(data.monthly.iter().map(|row| row.series_type.as_str())),
     );
+    let owner_options_for_validation = owner_options.clone();
+    let instrument_options_for_validation = instrument_options.clone();
+    let period_options_for_validation = period_options.clone();
+    let owner_options_for_persistence = owner_options.clone();
+    let instrument_options_for_persistence = instrument_options.clone();
+    let period_options_for_persistence = period_options.clone();
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            LEGACY_DIVIDENDS_OWNER,
+            valid_option(&owner_filter(), &owner_options_for_persistence, ""),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            LEGACY_DIVIDENDS_INSTRUMENT,
+            valid_option(
+                &instrument_filter(),
+                &instrument_options_for_persistence,
+                "",
+            ),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            LEGACY_DIVIDENDS_PERIOD,
+            valid_option(&period_filter(), &period_options_for_persistence, ""),
+        )
+    });
+    use_effect(move || persist_preference(preferences, LEGACY_DIVIDENDS_SEARCH, search()));
+    use_effect(move || persist_preference(preferences, LEGACY_DIVIDENDS_SORT, sort_by()));
+    use_effect(move || {
+        let valid = valid_option(&owner_filter(), &owner_options_for_validation, "");
+        if owner_filter() != valid {
+            owner_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(&instrument_filter(), &instrument_options_for_validation, "");
+        if instrument_filter() != valid {
+            instrument_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(&period_filter(), &period_options_for_validation, "");
+        if period_filter() != valid {
+            period_filter.set(valid);
+        }
+    });
 
     let owner_value = owner_filter();
     let instrument_value = instrument_filter();
@@ -2803,10 +2946,18 @@ const HOLDING_COLUMNS: &[(&str, &str)] = &[
     ("updated_at", "更新日"),
 ];
 
+#[cfg(test)]
 fn default_visible_holding_columns() -> HashSet<String> {
     HOLDING_COLUMNS
         .iter()
         .map(|(column_id, _)| (*column_id).to_string())
+        .collect()
+}
+
+fn holding_column_ids() -> Vec<&'static str> {
+    HOLDING_COLUMNS
+        .iter()
+        .map(|(column_id, _)| *column_id)
         .collect()
 }
 
@@ -2860,19 +3011,110 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
     let mut editing_row = use_signal(|| None::<HoldingMetric>);
     let mut editing_dividend_row = use_signal(|| None::<HoldingMetric>);
     let mut status_message = use_signal(String::new);
-    let mut owner_filter = use_signal(String::new);
-    let mut type_filter = use_signal(String::new);
-    let mut asset_class_filter = use_signal(String::new);
-    let mut region_filter = use_signal(String::new);
-    let mut search = use_signal(String::new);
-    let mut sort_by = use_signal(|| "market_value".to_string());
-    let mut visible_columns = use_signal(default_visible_holding_columns);
+    let preferences = use_context::<UiPreferences>();
+    let mut owner_filter = use_signal(move || preference_value(&preferences(), HOLDINGS_OWNER));
+    let mut type_filter = use_signal(move || preference_value(&preferences(), HOLDINGS_TYPE));
+    let mut asset_class_filter =
+        use_signal(move || preference_value(&preferences(), HOLDINGS_ASSET_CLASS));
+    let mut region_filter = use_signal(move || preference_value(&preferences(), HOLDINGS_REGION));
+    let mut search = use_signal(move || preference_value(&preferences(), HOLDINGS_SEARCH));
+    let mut sort_by = use_signal(move || {
+        valid_sort(
+            &preference_value(&preferences(), HOLDINGS_SORT),
+            &["market_value", "profit", "return"],
+            "market_value",
+        )
+    });
+    let mut visible_columns = use_signal(move || {
+        parse_visible_columns(
+            &preference_value(&preferences(), HOLDINGS_VISIBLE_COLUMNS),
+            &holding_column_ids(),
+        )
+    });
     let mut is_column_picker_open = use_signal(|| false);
 
     let owner_options = unique_strings(rows.iter().map(|row| row.owner_name.as_str()));
     let type_options = unique_strings(rows.iter().map(|row| row.instrument_type.as_str()));
     let asset_class_options = unique_strings(rows.iter().map(|row| row.asset_class.as_str()));
     let region_options = unique_strings(rows.iter().map(|row| row.region_type.as_str()));
+    let owner_options_for_validation = owner_options.clone();
+    let type_options_for_validation = type_options.clone();
+    let asset_class_options_for_validation = asset_class_options.clone();
+    let region_options_for_validation = region_options.clone();
+    let owner_options_for_persistence = owner_options.clone();
+    let type_options_for_persistence = type_options.clone();
+    let asset_class_options_for_persistence = asset_class_options.clone();
+    let region_options_for_persistence = region_options.clone();
+
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            HOLDINGS_OWNER,
+            valid_option(&owner_filter(), &owner_options_for_persistence, ""),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            HOLDINGS_TYPE,
+            valid_option(&type_filter(), &type_options_for_persistence, ""),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            HOLDINGS_ASSET_CLASS,
+            valid_option(
+                &asset_class_filter(),
+                &asset_class_options_for_persistence,
+                "",
+            ),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            HOLDINGS_REGION,
+            valid_option(&region_filter(), &region_options_for_persistence, ""),
+        )
+    });
+    use_effect(move || persist_preference(preferences, HOLDINGS_SEARCH, search()));
+    use_effect(move || persist_preference(preferences, HOLDINGS_SORT, sort_by()));
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            HOLDINGS_VISIBLE_COLUMNS,
+            serialize_visible_columns(&visible_columns(), &holding_column_ids()),
+        )
+    });
+    use_effect(move || {
+        let valid = valid_option(&owner_filter(), &owner_options_for_validation, "");
+        if owner_filter() != valid {
+            owner_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(&type_filter(), &type_options_for_validation, "");
+        if type_filter() != valid {
+            type_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(
+            &asset_class_filter(),
+            &asset_class_options_for_validation,
+            "",
+        );
+        if asset_class_filter() != valid {
+            asset_class_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(&region_filter(), &region_options_for_validation, "");
+        if region_filter() != valid {
+            region_filter.set(valid);
+        }
+    });
 
     let owner_value = owner_filter();
     let type_value = type_filter();
@@ -3061,17 +3303,102 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
 fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
     let mut editing_row = use_signal(|| None::<AccountAsset>);
     let mut status_message = use_signal(String::new);
-    let mut owner_filter = use_signal(String::new);
-    let mut institution_filter = use_signal(String::new);
-    let mut asset_type_filter = use_signal(String::new);
-    let mut currency_filter = use_signal(String::new);
-    let mut search = use_signal(String::new);
-    let mut sort_by = use_signal(|| "value".to_string());
+    let preferences = use_context::<UiPreferences>();
+    let mut owner_filter = use_signal(move || preference_value(&preferences(), ACCOUNTS_OWNER));
+    let mut institution_filter =
+        use_signal(move || preference_value(&preferences(), ACCOUNTS_INSTITUTION));
+    let mut asset_type_filter =
+        use_signal(move || preference_value(&preferences(), ACCOUNTS_ASSET_TYPE));
+    let mut currency_filter =
+        use_signal(move || preference_value(&preferences(), ACCOUNTS_CURRENCY));
+    let mut search = use_signal(move || preference_value(&preferences(), ACCOUNTS_SEARCH));
+    let mut sort_by = use_signal(move || {
+        valid_sort(
+            &preference_value(&preferences(), ACCOUNTS_SORT),
+            &["value", "owner", "institution", "asset_type"],
+            "value",
+        )
+    });
 
     let owner_options = unique_strings(rows.iter().map(|row| row.owner_name.as_str()));
     let institution_options = unique_strings(rows.iter().map(|row| row.institution_name.as_str()));
     let asset_type_options = unique_strings(rows.iter().map(|row| row.asset_type.as_str()));
     let currency_options = unique_strings(rows.iter().map(|row| row.currency_code.as_str()));
+    let owner_options_for_validation = owner_options.clone();
+    let institution_options_for_validation = institution_options.clone();
+    let asset_type_options_for_validation = asset_type_options.clone();
+    let currency_options_for_validation = currency_options.clone();
+    let owner_options_for_persistence = owner_options.clone();
+    let institution_options_for_persistence = institution_options.clone();
+    let asset_type_options_for_persistence = asset_type_options.clone();
+    let currency_options_for_persistence = currency_options.clone();
+
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            ACCOUNTS_OWNER,
+            valid_option(&owner_filter(), &owner_options_for_persistence, ""),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            ACCOUNTS_INSTITUTION,
+            valid_option(
+                &institution_filter(),
+                &institution_options_for_persistence,
+                "",
+            ),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            ACCOUNTS_ASSET_TYPE,
+            valid_option(
+                &asset_type_filter(),
+                &asset_type_options_for_persistence,
+                "",
+            ),
+        )
+    });
+    use_effect(move || {
+        persist_preference(
+            preferences,
+            ACCOUNTS_CURRENCY,
+            valid_option(&currency_filter(), &currency_options_for_persistence, ""),
+        )
+    });
+    use_effect(move || persist_preference(preferences, ACCOUNTS_SEARCH, search()));
+    use_effect(move || persist_preference(preferences, ACCOUNTS_SORT, sort_by()));
+    use_effect(move || {
+        let valid = valid_option(&owner_filter(), &owner_options_for_validation, "");
+        if owner_filter() != valid {
+            owner_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(
+            &institution_filter(),
+            &institution_options_for_validation,
+            "",
+        );
+        if institution_filter() != valid {
+            institution_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(&asset_type_filter(), &asset_type_options_for_validation, "");
+        if asset_type_filter() != valid {
+            asset_type_filter.set(valid);
+        }
+    });
+    use_effect(move || {
+        let valid = valid_option(&currency_filter(), &currency_options_for_validation, "");
+        if currency_filter() != valid {
+            currency_filter.set(valid);
+        }
+    });
 
     let owner_value = owner_filter();
     let institution_value = institution_filter();
@@ -3196,7 +3523,7 @@ fn AccountAssetRow(row: AccountAsset, on_edit: EventHandler<AccountAsset>) -> El
             td { "{row.owner_name}" }
             td { "{row.institution_name}" }
             td { class: "name-cell", "{row.account_name}" }
-            td { "{row.account_type}" }
+            td { "{account_type_label(&row.account_type)}" }
             td { "{select_option_label(&row.asset_type)}" }
             td { class: "mono", "{row.currency_code}" }
             td { class: "number", "{decimal(row.invested_amount, 2)}" }
@@ -3212,6 +3539,26 @@ fn AccountAssetRow(row: AccountAsset, on_edit: EventHandler<AccountAsset>) -> El
                 }
             }
         }
+    }
+}
+
+fn account_type_label(account_type: &str) -> &str {
+    match account_type {
+        "BANK" => "銀行帳戶",
+        "BROKERAGE" => "證券帳戶",
+        _ => account_type,
+    }
+}
+
+#[cfg(test)]
+mod account_type_label_tests {
+    use super::account_type_label;
+
+    #[test]
+    fn translates_known_account_types_without_hiding_unknown_values() {
+        assert_eq!(account_type_label("BANK"), "銀行帳戶");
+        assert_eq!(account_type_label("BROKERAGE"), "證券帳戶");
+        assert_eq!(account_type_label("CUSTOM"), "CUSTOM");
     }
 }
 

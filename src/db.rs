@@ -677,6 +677,22 @@ pub fn open_writable_database() -> AppResult<Connection> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn open_ui_preference_database() -> AppResult<Connection> {
+    let path = path::ensure_runtime_database()?;
+    let connection = Connection::open(path)?;
+    if migration::current_version(&connection)? != migration::latest_version() {
+        drop(connection);
+        let path = ensure_migrated_database()?;
+        let connection = Connection::open(path)?;
+        migration::validate_ui_preference_schema(&connection)?;
+        return Ok(connection);
+    }
+    migration::validate_ui_preference_schema(&connection)?;
+    connection.busy_timeout(std::time::Duration::from_secs(2))?;
+    Ok(connection)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn open_manual_write_database() -> AppResult<Connection> {
     let path = ensure_migrated_database()?;
     backup_for_today(&path)?;

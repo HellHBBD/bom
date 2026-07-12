@@ -147,6 +147,13 @@ a {
     gap: 14px;
 }
 
+.section-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+}
+
 .stack {
     display: grid;
     gap: 22px;

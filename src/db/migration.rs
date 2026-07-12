@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 
 use crate::error::{AppError, AppResult};
 
-const LATEST_VERSION: i64 = 4;
+const LATEST_VERSION: i64 = 5;
 const MANUAL_WRITES_SQL: &str = include_str!("migrations/001_manual_writes.sql");
 const PRODUCT_LEVEL_MARKET_DATA_SQL: &str =
     include_str!("migrations/002_product_level_market_data.sql");
@@ -12,6 +12,7 @@ const DIVIDEND_ASSUMPTION_ACCOUNT_SCOPE_SQL: &str =
     include_str!("migrations/004_dividend_assumption_account_scope.sql");
 const DIVIDEND_ASSUMPTION_ACCOUNT_SCOPE_FALLBACK_SQL: &str =
     include_str!("migrations/004_dividend_assumption_account_scope_fallback.sql");
+const UI_PREFERENCE_SQL: &str = include_str!("migrations/005_ui_preference.sql");
 const DIVIDEND_RECEIPT_AMOUNT_VIEW_SQL: &str = r#"
 CREATE VIEW IF NOT EXISTS v_dividend_receipt_amount AS
 SELECT
@@ -202,13 +203,81 @@ pub fn migrate(connection: &mut Connection) -> AppResult<()> {
     if version < 4 {
         migrate_v4_dividend_assumption_account_scope(&transaction)?;
         transaction.pragma_update(None, "user_version", 4_i64)?;
+        version = 4;
+    }
+
+    if version < 5 {
+        transaction.execute_batch(UI_PREFERENCE_SQL)?;
+        transaction.pragma_update(None, "user_version", 5_i64)?;
     }
 
     validate_manual_write_schema(&transaction)?;
+    validate_ui_preference_schema(&transaction)?;
 
     transaction.commit()?;
 
     Ok(())
+}
+
+pub(crate) fn validate_ui_preference_schema(connection: &Connection) -> AppResult<()> {
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ui_preference'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| {
+            AppError::Validation("資料表 ui_preference 不存在或無法讀取 schema".to_string())
+        })?;
+    let expected_sql = "CREATE TABLE ui_preference (preference_key TEXT PRIMARY KEY NOT NULL, value_text TEXT NOT NULL)";
+    if normalize_schema_sql(&table_sql) != normalize_schema_sql(expected_sql) {
+        return Err(AppError::Validation(
+            "資料表 ui_preference 的欄位定義不符合偏好設定 schema".to_string(),
+        ));
+    }
+
+    let columns = connection
+        .prepare("PRAGMA table_info(ui_preference)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let preference_key_valid = columns.iter().any(|(name, ty, not_null, primary_key)| {
+        name == "preference_key"
+            && ty.eq_ignore_ascii_case("TEXT")
+            && *not_null == 1
+            && *primary_key == 1
+    });
+    let value_text_valid = columns.iter().any(|(name, ty, not_null, _)| {
+        name == "value_text" && ty.eq_ignore_ascii_case("TEXT") && *not_null == 1
+    });
+    let primary_key_column_count = columns
+        .iter()
+        .filter(|(_, _, _, primary_key)| *primary_key > 0)
+        .count();
+    if columns.len() != 2
+        || !preference_key_valid
+        || !value_text_valid
+        || primary_key_column_count != 1
+    {
+        return Err(AppError::Validation(
+            "資料表 ui_preference 的欄位定義不符合偏好設定 schema".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace() && *character != ';')
+        .collect::<String>()
+        .to_ascii_uppercase()
 }
 
 fn migrate_v4_dividend_assumption_account_scope(connection: &Connection) -> AppResult<()> {
@@ -758,7 +827,8 @@ mod tests {
 
         migrate(&mut connection).expect("migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 4);
+        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert!(table_exists(&connection, "ui_preference").expect("preference table"));
         assert!(column_exists(&connection, "holding_snapshot", "origin").expect("column lookup"));
         assert!(index_exists(&connection, "uq_manual_holding_snapshot"));
         assert!(index_exists(&connection, "uq_manual_instrument_price"));
@@ -782,7 +852,59 @@ mod tests {
         migrate(&mut connection).expect("first migration succeeds");
         migrate(&mut connection).expect("second migration succeeds");
 
+        assert_eq!(current_version(&connection).expect("version"), 5);
+    }
+
+    #[test]
+    fn migration_recovers_when_preference_table_exists_before_version_is_set() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_old_schema(&connection);
+        migrate(&mut connection).expect("initial migration succeeds");
+        connection
+            .pragma_update(None, "user_version", 4_i64)
+            .expect("rewind version marker");
+
+        migrate(&mut connection).expect("recovery migration succeeds");
+
+        assert_eq!(current_version(&connection).expect("version"), 5);
+        assert!(table_exists(&connection, "ui_preference").expect("preference table exists"));
+    }
+
+    #[test]
+    fn migration_rejects_invalid_preference_table_before_updating_version() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_old_schema(&connection);
+        migrate(&mut connection).expect("initial migration succeeds");
+        connection
+            .execute_batch(
+                "DROP TABLE ui_preference; CREATE TABLE ui_preference (preference_key TEXT);",
+            )
+            .expect("create invalid preference table");
+        connection
+            .pragma_update(None, "user_version", 4_i64)
+            .expect("rewind version marker");
+
+        let error = migrate(&mut connection).expect_err("invalid preference table is rejected");
+
+        assert!(error.to_string().contains("ui_preference"));
         assert_eq!(current_version(&connection).expect("version"), 4);
+    }
+
+    #[test]
+    fn migration_rejects_invalid_preference_table_at_version_five() {
+        let mut connection = Connection::open_in_memory().expect("open test db");
+        create_old_schema(&connection);
+        migrate(&mut connection).expect("initial migration succeeds");
+        connection
+            .execute_batch(
+                "DROP TABLE ui_preference; CREATE TABLE ui_preference (preference_key TEXT NOT NULL, scope TEXT NOT NULL, value_text TEXT NOT NULL, PRIMARY KEY (preference_key, scope));",
+            )
+            .expect("create invalid preference table");
+
+        let error = migrate(&mut connection).expect_err("invalid v5 preference table is rejected");
+
+        assert!(error.to_string().contains("ui_preference"));
+        assert_eq!(current_version(&connection).expect("version"), 5);
     }
 
     #[test]
@@ -878,7 +1000,7 @@ mod tests {
 
         migrate(&mut connection).expect("migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 4);
+        assert_eq!(current_version(&connection).expect("version"), 5);
         assert!(
             column_exists(&connection, "account_asset_snapshot", "origin").expect("column lookup")
         );
@@ -1181,7 +1303,7 @@ mod tests {
 
         migrate(&mut connection).expect("fallback migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 4);
+        assert_eq!(current_version(&connection).expect("version"), 5);
         assert!(
             table_exists(&connection, "dividend_assumption_account_archive")
                 .expect("archive exists")
@@ -1199,7 +1321,7 @@ mod tests {
 
         migrate(&mut connection).expect("fallback migration succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 4);
+        assert_eq!(current_version(&connection).expect("version"), 5);
         assert!(
             table_exists(&connection, "dividend_assumption_account_archive")
                 .expect("archive exists")
@@ -1314,7 +1436,7 @@ mod tests {
 
         migrate(&mut connection).expect("repair path succeeds");
 
-        assert_eq!(current_version(&connection).expect("version"), 4);
+        assert_eq!(current_version(&connection).expect("version"), 5);
         assert!(index_exists(&connection, "uq_manual_dividend_assumption"));
     }
 
@@ -1333,7 +1455,7 @@ mod tests {
             )
             .expect("manual row count");
         assert_eq!(manual_count, 1);
-        assert_eq!(current_version(&connection).expect("version"), 4);
+        assert_eq!(current_version(&connection).expect("version"), 5);
     }
 
     #[test]

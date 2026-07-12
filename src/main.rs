@@ -19,6 +19,7 @@ mod models;
 mod pages;
 mod price;
 mod routes;
+mod ui_preference;
 
 use routes::Route;
 
