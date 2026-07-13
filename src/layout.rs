@@ -5,12 +5,18 @@ use crate::ui_preference::{
     load_all_preferences, persist_preference, preference_value, LAST_ROUTE,
 };
 
+#[derive(Clone, Debug, PartialEq)]
+enum StartupState {
+    Loading,
+    RestoringRoute(String),
+    Ready,
+}
+
 #[component]
 pub fn AppLayout() -> Element {
     let mut preferences = use_signal(std::collections::HashMap::new);
     use_context_provider(|| preferences);
-    let mut is_loaded = use_signal(|| false);
-    let mut restoring_route = use_signal(|| None::<String>);
+    let mut startup = use_signal(|| StartupState::Loading);
     let preferences_result = use_resource(|| async move {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -24,42 +30,44 @@ pub fn AppLayout() -> Element {
         }
     });
     let navigator = use_navigator();
-    let current_route = use_route::<Route>();
+    let router = router();
+    let current_path = router.full_route_string();
 
     use_effect(move || {
-        if is_loaded() {
+        if startup() != StartupState::Loading {
             return;
         }
         if let Some(Ok(values)) = preferences_result() {
             let route = preference_value(&values, LAST_ROUTE);
             preferences.set(values);
-            is_loaded.set(true);
-            if let Some(route) = route_from_preference(&route) {
-                restoring_route.set(Some(route_path(&route).to_string()));
+            if let Some(route) = saved_route_to_restore(&route, &current_path) {
+                startup.set(StartupState::RestoringRoute(route_path(&route).to_string()));
                 navigator.replace(route);
+            } else {
+                startup.set(StartupState::Ready);
             }
         } else if let Some(Err(error)) = preferences_result() {
             eprintln!("讀取 UI 偏好設定失敗，將使用預設值：{error}");
-            is_loaded.set(true);
+            startup.set(StartupState::Ready);
         }
     });
 
     use_effect(move || {
-        if !is_loaded() {
-            return;
-        }
-
-        let path = route_path(&current_route).to_string();
-        if let Some(restored_path) = restoring_route() {
-            if restored_path == path {
-                restoring_route.set(None);
+        if let StartupState::RestoringRoute(restored_path) = startup() {
+            if restored_path == router.full_route_string() {
+                startup.set(StartupState::Ready);
             }
-            return;
         }
-        persist_preference(preferences, LAST_ROUTE, path);
     });
 
-    if !is_loaded() {
+    use_effect(move || {
+        let current_path = router.full_route_string();
+        if startup() == StartupState::Ready {
+            persist_preference(preferences, LAST_ROUTE, current_path);
+        }
+    });
+
+    if startup() != StartupState::Ready {
         return match preferences_result() {
             None => rsx! { main { class: "content", "載入 UI 偏好設定中..." } },
             Some(Err(_)) => rsx! { main { class: "content", "套用預設 UI 設定中..." } },
@@ -122,6 +130,10 @@ fn route_from_preference(path: &str) -> Option<Route> {
     }
 }
 
+fn saved_route_to_restore(saved_path: &str, current_path: &str) -> Option<Route> {
+    route_from_preference(saved_path).filter(|route| route_path(route) != current_path)
+}
+
 fn route_path(route: &Route) -> &'static str {
     match route {
         Route::DashboardPage {} => "/",
@@ -136,11 +148,23 @@ fn route_path(route: &Route) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::route_from_preference;
+    use super::{route_from_preference, saved_route_to_restore};
 
     #[test]
     fn restores_only_defined_routes() {
         assert!(route_from_preference("/holdings").is_some());
         assert!(route_from_preference("/not-a-route").is_none());
+    }
+
+    #[test]
+    fn restores_a_saved_route_only_when_it_differs_from_the_current_route() {
+        assert_eq!(
+            saved_route_to_restore("/holdings", "/")
+                .as_ref()
+                .map(super::route_path),
+            Some("/holdings")
+        );
+        assert!(saved_route_to_restore("/holdings", "/holdings").is_none());
+        assert!(saved_route_to_restore("/missing", "/").is_none());
     }
 }
