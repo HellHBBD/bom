@@ -23,6 +23,23 @@ mod ui_preference;
 
 use routes::Route;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "desktop"))]
+fn main() {
+    use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+
+    dioxus::LaunchBuilder::new()
+        .with_cfg(
+            Config::new().with_window(
+                WindowBuilder::new()
+                    .with_title("BOM")
+                    .with_inner_size(LogicalSize::new(1440.0, 900.0))
+                    .with_min_inner_size(LogicalSize::new(1024.0, 700.0)),
+            ),
+        )
+        .launch(App);
+}
+
+#[cfg(any(target_arch = "wasm32", not(feature = "desktop")))]
 fn main() {
     dioxus::launch(App);
 }

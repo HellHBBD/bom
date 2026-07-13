@@ -1372,13 +1372,18 @@ fn DividendReceiptUpsertModal(
                             if interaction_locked {
                                 return;
                             }
-                            if is_dirty {
-                                confirm_close.set(true);
-                                return;
-                            }
-                            on_close.call(());
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            confirm_delete.set(false);
+                            let reset_form = initial_form_snapshot();
+                            account_id.set(reset_form.account_id);
+                            instrument_id.set(reset_form.instrument_id);
+                            received_on.set(reset_form.received_on);
+                            net_amount.set(reset_form.net_amount);
+                            currency_code.set(reset_form.currency_code);
+                            note.set(reset_form.note);
                         },
-                        "關閉"
+                        "還原"
                     }
                 }
                 if !error_message().is_empty() {
@@ -1471,24 +1476,6 @@ fn DividendReceiptUpsertModal(
                     }
                 }
                 div { class: "modal-actions",
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            confirm_delete.set(false);
-                            let reset_form = initial_form_snapshot();
-                            account_id.set(reset_form.account_id);
-                            instrument_id.set(reset_form.instrument_id);
-                            received_on.set(reset_form.received_on);
-                            net_amount.set(reset_form.net_amount);
-                            currency_code.set(reset_form.currency_code);
-                            note.set(reset_form.note);
-                        },
-                        "還原"
-                    }
                     button {
                         r#type: "button",
                         class: "ghost-button",
@@ -1726,13 +1713,13 @@ fn AccountCreateModal(
                             if interaction_locked {
                                 return;
                             }
-                            if is_dirty {
-                                confirm_close.set(true);
-                                return;
-                            }
-                            on_close.call(());
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            display_name.set(reset_form.display_name);
+                            institution_id.set(reset_form.institution_id);
                         },
-                        "關閉"
+                        "還原"
                     }
                 }
                 if !error_message().is_empty() {
@@ -1776,19 +1763,6 @@ fn AccountCreateModal(
                             on_close.call(());
                         },
                         "取消"
-                    }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            display_name.set(reset_form.display_name);
-                            institution_id.set(reset_form.institution_id);
-                        },
-                        "還原"
                     }
                     button {
                         r#type: "button",
@@ -1897,13 +1871,14 @@ fn InstrumentCreateModal(
                             if interaction_locked {
                                 return;
                             }
-                            if is_dirty {
-                                confirm_close.set(true);
-                                return;
-                            }
-                            on_close.call(());
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            symbol.set(reset_form.symbol);
+                            name.set(reset_form.name);
+                            trading_currency_code.set(reset_form.trading_currency_code);
                         },
-                        "關閉"
+                        "還原"
                     }
                 }
                 if !error_message().is_empty() {
@@ -1956,20 +1931,6 @@ fn InstrumentCreateModal(
                             on_close.call(());
                         },
                         "取消"
-                    }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            symbol.set(reset_form.symbol);
-                            name.set(reset_form.name);
-                            trading_currency_code.set(reset_form.trading_currency_code);
-                        },
-                        "還原"
                     }
                     button {
                         r#type: "button",
@@ -3809,14 +3770,17 @@ fn AccountAssetEditModal(
                             if interaction_locked {
                                 return;
                             }
-                            if is_dirty {
-                                confirm_close.set(true);
-                                return;
-                            }
-                            on_close.call(());
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            snapshot_date.set(reset_form.snapshot_date);
+                            quantity.set(reset_form.quantity);
+                            current_value_override.set(reset_form.current_value_override);
+                            invested_amount.set(reset_form.invested_amount);
+                            note.set(reset_form.note);
                         },
                         disabled: interaction_locked,
-                        "關閉"
+                        "還原"
                     }
                 }
                 if !error_message().is_empty() {
@@ -3939,22 +3903,6 @@ fn AccountAssetEditModal(
                         },
                         disabled: interaction_locked,
                         "取消"
-                    }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            snapshot_date.set(reset_form.snapshot_date);
-                            quantity.set(reset_form.quantity);
-                            current_value_override.set(reset_form.current_value_override);
-                            invested_amount.set(reset_form.invested_amount);
-                            note.set(reset_form.note);
-                        },
-                        "還原"
                     }
                     button {
                         r#type: "button",
@@ -4133,14 +4081,16 @@ fn HoldingEditModal(
                             if interaction_locked {
                                 return;
                             }
-                            if is_dirty {
-                                confirm_close.set(true);
-                                return;
-                            }
-                            on_close.call(());
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            as_of_date.set(reset_form.as_of_date);
+                            quantity_text.set(reset_form.quantity_text);
+                            average_cost_text.set(reset_form.average_cost_text);
+                            note.set(reset_form.note);
                         },
                         disabled: interaction_locked,
-                        "關閉"
+                        "還原"
                     }
                 }
                 if !error_message().is_empty() {
@@ -4218,21 +4168,6 @@ fn HoldingEditModal(
                         },
                         disabled: interaction_locked,
                         "取消"
-                    }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            as_of_date.set(reset_form.as_of_date);
-                            quantity_text.set(reset_form.quantity_text);
-                            average_cost_text.set(reset_form.average_cost_text);
-                            note.set(reset_form.note);
-                        },
-                        "還原"
                     }
                     button {
                         r#type: "button",
@@ -4366,14 +4301,17 @@ fn HoldingDividendAssumptionModal(
                             if interaction_locked {
                                 return;
                             }
-                            if is_dirty {
-                                confirm_close.set(true);
-                                return;
-                            }
-                            on_close.call(());
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            effective_date.set(reset_form.effective_date);
+                            payments_per_year.set(reset_form.payments_per_year);
+                            latest_dividend_per_unit.set(reset_form.latest_dividend_per_unit);
+                            estimated_annual_dividend_per_unit
+                                .set(reset_form.estimated_annual_dividend_per_unit);
                         },
                         disabled: interaction_locked,
-                        "關閉"
+                        "還原"
                     }
                 }
                 if !error_message().is_empty() {
@@ -4433,22 +4371,6 @@ fn HoldingDividendAssumptionModal(
                         },
                         disabled: interaction_locked,
                         "取消"
-                    }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            effective_date.set(reset_form.effective_date);
-                            payments_per_year.set(reset_form.payments_per_year);
-                            latest_dividend_per_unit.set(reset_form.latest_dividend_per_unit);
-                            estimated_annual_dividend_per_unit
-                                .set(reset_form.estimated_annual_dividend_per_unit);
-                        },
-                        "還原"
                     }
                     button {
                         r#type: "button",
