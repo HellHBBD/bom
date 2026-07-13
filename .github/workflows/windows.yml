@@ -195,9 +195,7 @@ jobs:
           $exitCode = $LASTEXITCODE
 
           $output |
-            ForEach-Object { $_.ToString() } |
-            Tee-Object -FilePath "dist\dx-bundle.log" |
-            ForEach-Object { Write-Host $_ }
+            ForEach-Object { Write-Host $_.ToString() }
 
           if ($exitCode -ne 0) {
             throw "dx bundle failed with exit code $exitCode."
@@ -238,26 +236,18 @@ jobs:
 
           Copy-Item -Path $bundleExe.FullName -Destination $destination -Force
 
-          $releaseHash = (Get-FileHash -Path $destination -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$releaseHash  $fileName" | Set-Content -Path "$destination.sha256" -Encoding ascii
-
           Write-Host ""
           Write-Host "Windows NSIS installer created:"
           Write-Host "  $destination"
-          Write-Host ""
-          Write-Host "SHA-256:"
-          Write-Host "  $releaseHash"
 
-      - name: Upload Windows bundle artifact
+      - name: Upload Windows setup
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-windows-${{ github.ref_name }}-${{ github.run_number }}
-          path: |
-            dist/*.exe
-            dist/*.sha256
-            dist/dx-bundle.log
+          path: dist/*-setup.exe
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
 
   bundle-windows-release:
     name: Bundle Windows EXE (Release)
@@ -411,9 +401,7 @@ jobs:
           $exitCode = $LASTEXITCODE
 
           $output |
-            ForEach-Object { $_.ToString() } |
-            Tee-Object -FilePath "dist\dx-bundle.log" |
-            ForEach-Object { Write-Host $_ }
+            ForEach-Object { Write-Host $_.ToString() }
 
           if ($exitCode -ne 0) {
             throw "dx bundle failed with exit code $exitCode."
@@ -461,26 +449,18 @@ jobs:
 
           Copy-Item -Path $bundleExe.FullName -Destination $destination -Force
 
-          $releaseHash = (Get-FileHash -Path $destination -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$releaseHash  $fileName" | Set-Content -Path "$destination.sha256" -Encoding ascii
-
           Write-Host ""
           Write-Host "Windows NSIS installer created:"
           Write-Host "  $destination"
-          Write-Host ""
-          Write-Host "SHA-256:"
-          Write-Host "  $releaseHash"
 
-      - name: Upload Windows bundle artifact
+      - name: Upload Windows setup
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-windows-${{ github.ref_name }}-${{ github.run_number }}
-          path: |
-            dist/*.exe
-            dist/*.sha256
-            dist/dx-bundle.log
+          path: dist/*-setup.exe
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
 
       - name: Create GitHub Release
         if: github.ref_type == 'tag'
@@ -488,9 +468,7 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ env.APP_NAME }} ${{ github.ref_name }}
-          files: |
-            dist/*.exe
-            dist/*.sha256
+          files: dist/*-setup.exe
           fail_on_unmatched_files: true
           overwrite_files: true
           generate_release_notes: true
