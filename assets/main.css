@@ -337,6 +337,76 @@ a {
     font-size: 12px;
 }
 
+.searchable-select {
+    display: grid;
+    gap: 6px;
+    min-width: 190px;
+}
+
+.searchable-select input {
+    width: 100%;
+}
+
+.searchable-select-current {
+    color: #94a3b8;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.searchable-select-options {
+    display: grid;
+    gap: 4px;
+    max-height: 180px;
+    overflow-y: auto;
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 10px;
+    background: #111827;
+    padding: 5px;
+}
+
+.searchable-select-option {
+    width: 100%;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: #cbd5e1;
+    cursor: pointer;
+    padding: 7px 8px;
+    text-align: left;
+}
+
+.filters .searchable-select-option {
+    min-height: 0;
+    border: 0;
+    background: transparent;
+    padding: 7px 8px;
+}
+
+.searchable-select-option:hover,
+.searchable-select-option:focus-visible {
+    background: rgba(56, 189, 248, 0.14);
+    color: #f8fafc;
+    outline: 0;
+}
+
+.searchable-select-option.selected {
+    background: rgba(56, 189, 248, 0.22);
+    color: #e0f2fe;
+}
+
+.searchable-select-option:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.searchable-select-empty {
+    color: #94a3b8;
+    font-size: 13px;
+    padding: 7px 8px;
+}
+
 .column-picker {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
@@ -651,6 +721,19 @@ tbody tr:hover {
 }
 
 .form-field input {
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    border-radius: 10px;
+    background: #111827;
+    color: #e5edf8;
+    min-height: 40px;
+    padding: 8px 10px;
+}
+
+.form-field .searchable-select {
+    min-width: 0;
+}
+
+.form-field .searchable-select input {
     border: 1px solid rgba(148, 163, 184, 0.28);
     border-radius: 10px;
     background: #111827;

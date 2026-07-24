@@ -1393,15 +1393,17 @@ fn DividendReceiptUpsertModal(
                     div { class: "status-message error", "{error_message}" }
                 }
                 div { class: "form-grid two-column",
-                    label { class: "form-field",
+                    div { class: "form-field",
                         span { "入帳帳戶" }
-                        select {
+                        SearchableSelect {
+                            label: "入帳帳戶".to_string(),
                             value: "{account_id}",
-                            oninput: move |event| account_id.set(event.value()),
+                            options: account_choices_for_select
+                                .iter()
+                                .map(|option| (option.account_id.to_string(), option.label.clone()))
+                                .collect(),
+                            on_change: move |value| account_id.set(value),
                             disabled: interaction_locked,
-                            for option in account_choices_for_select {
-                                option { value: "{option.account_id}", "{option.label}" }
-                            }
                         }
                         button {
                             r#type: "button",
@@ -1411,12 +1413,16 @@ fn DividendReceiptUpsertModal(
                             "＋新增帳戶"
                         }
                     }
-                    label { class: "form-field",
+                    div { class: "form-field",
                         span { "商品" }
-                        select {
+                        SearchableSelect {
+                            label: "商品".to_string(),
                             value: "{instrument_id}",
-                            oninput: move |event| {
-                                let selected_id = event.value();
+                            options: instrument_choices_for_select
+                                .iter()
+                                .map(|option| (option.instrument_id.to_string(), option.label.clone()))
+                                .collect(),
+                            on_change: move |selected_id: String| {
                                 instrument_id.set(selected_id.clone());
                                 if let Some(selected) = instrument_choices_for_lookup
                                     .iter()
@@ -1426,9 +1432,6 @@ fn DividendReceiptUpsertModal(
                                 }
                             },
                             disabled: interaction_locked,
-                            for option in instrument_choices_for_select {
-                                option { value: "{option.instrument_id}", "{option.label}" }
-                            }
                         }
                         button {
                             r#type: "button",
@@ -1738,15 +1741,19 @@ fn AccountCreateModal(
                             placeholder: "新帳戶",
                         }
                     }
-                    label { class: "form-field full-width",
+                    div { class: "form-field full-width",
                         span { "金融機構" }
-                        select {
+                        SearchableSelect {
+                            label: "金融機構".to_string(),
                             value: "{institution_id}",
-                            oninput: move |event| institution_id.set(event.value()),
+                            options: institutions
+                                .iter()
+                                .map(|institution| {
+                                    (institution.institution_id.to_string(), institution.name.clone())
+                                })
+                                .collect(),
+                            on_change: move |value| institution_id.set(value),
                             disabled: interaction_locked,
-                            for institution in &institutions {
-                                option { value: "{institution.institution_id}", "{institution.name}" }
-                            }
                         }
                     }
                 }
@@ -2752,17 +2759,169 @@ fn SelectFilter(
         .collect::<Vec<_>>();
 
     rsx! {
-        label { class: "filter-field",
+        div { class: "filter-field",
             span { "{label}" }
-            select {
-                value: "{value}",
-                oninput: move |event| on_change.call(event.value()),
-                option { value: "", "全部" }
-                for (option_value, option_label) in option_displays {
-                    option { value: "{option_value}", "{option_label}" }
+            if option_displays.len() >= SEARCHABLE_SELECT_MIN_OPTIONS {
+                SearchableSelect {
+                    label,
+                    value,
+                    options: option_displays,
+                    empty_label: Some("全部".to_string()),
+                    on_change,
+                }
+            } else {
+                select {
+                    value: "{value}",
+                    oninput: move |event| on_change.call(event.value()),
+                    option { value: "", "全部" }
+                    for (option_value, option_label) in option_displays {
+                        option { value: "{option_value}", "{option_label}" }
+                    }
                 }
             }
         }
+    }
+}
+
+const SEARCHABLE_SELECT_MIN_OPTIONS: usize = 10;
+
+#[component]
+fn SearchableSelect(
+    label: String,
+    value: String,
+    options: Vec<(String, String)>,
+    #[props(default)] empty_label: Option<String>,
+    #[props(default = false)] disabled: bool,
+    on_change: EventHandler<String>,
+) -> Element {
+    let mut query = use_signal(String::new);
+    let selected_label = searchable_select_label(&value, &options, empty_label.as_deref());
+    let visible_options = searchable_select_options(&query(), &options, empty_label.as_deref());
+    let search_placeholder = format!("搜尋{label}");
+
+    rsx! {
+        div { class: "searchable-select",
+            input {
+                r#type: "search",
+                value: "{query}",
+                placeholder: "{search_placeholder}",
+                aria_label: "搜尋{label}",
+                disabled,
+                oninput: move |event| query.set(event.value()),
+            }
+            div { class: "searchable-select-current", "目前：{selected_label}" }
+            div { class: "searchable-select-options", role: "listbox", aria_label: "{label}",
+                if visible_options.is_empty() {
+                    div { class: "searchable-select-empty", "沒有符合的選項" }
+                } else {
+                    for (option_value, option_label) in visible_options {
+                        button {
+                            key: "{option_value}",
+                            r#type: "button",
+                            class: if option_value == value { "searchable-select-option selected" } else { "searchable-select-option" },
+                            role: "option",
+                            aria_selected: option_value == value,
+                            disabled,
+                            onclick: move |_| {
+                                on_change.call(option_value.clone());
+                                query.set(String::new());
+                            },
+                            "{option_label}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn searchable_select_label(
+    value: &str,
+    options: &[(String, String)],
+    empty_label: Option<&str>,
+) -> String {
+    if value.is_empty() {
+        return empty_label.unwrap_or("未選擇").to_string();
+    }
+
+    options
+        .iter()
+        .find(|(option_value, _)| option_value == value)
+        .map(|(_, option_label)| option_label.clone())
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn searchable_select_options(
+    query: &str,
+    options: &[(String, String)],
+    empty_label: Option<&str>,
+) -> Vec<(String, String)> {
+    let query = query.trim().to_lowercase();
+    let mut visible_options = empty_label
+        .filter(|label| query.is_empty() || label.to_lowercase().contains(&query))
+        .map(|label| vec![(String::new(), label.to_string())])
+        .unwrap_or_default();
+    visible_options.extend(
+        options
+            .iter()
+            .filter(|(value, label)| {
+                query.is_empty()
+                    || value.to_lowercase().contains(&query)
+                    || label.to_lowercase().contains(&query)
+            })
+            .cloned(),
+    );
+    visible_options
+}
+
+#[cfg(test)]
+mod searchable_select_tests {
+    use super::{searchable_select_label, searchable_select_options};
+
+    #[test]
+    fn searches_values_and_labels_without_case_sensitivity() {
+        let options = vec![
+            ("1".to_string(), "余俊霆 / 證券帳戶".to_string()),
+            ("VOO".to_string(), "VOO Vanguard S&P 500 (USD)".to_string()),
+        ];
+
+        assert_eq!(
+            searchable_select_options("vanguard", &options, Some("全部")),
+            vec![("VOO".to_string(), "VOO Vanguard S&P 500 (USD)".to_string())]
+        );
+        assert_eq!(
+            searchable_select_options("voo", &options, Some("全部")),
+            vec![("VOO".to_string(), "VOO Vanguard S&P 500 (USD)".to_string())]
+        );
+    }
+
+    #[test]
+    fn includes_all_option_only_for_empty_search() {
+        let options = vec![("1".to_string(), "元大南屯".to_string())];
+
+        assert_eq!(
+            searchable_select_options("", &options, Some("全部")),
+            vec![
+                (String::new(), "全部".to_string()),
+                ("1".to_string(), "元大南屯".to_string()),
+            ]
+        );
+        assert_eq!(
+            searchable_select_options("元大", &options, Some("全部")),
+            vec![("1".to_string(), "元大南屯".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolves_labels_without_losing_the_underlying_value() {
+        let options = vec![("42".to_string(), "星展-美金定存".to_string())];
+
+        assert_eq!(
+            searchable_select_label("42", &options, None),
+            "星展-美金定存"
+        );
+        assert_eq!(searchable_select_label("", &options, Some("全部")), "全部");
+        assert_eq!(searchable_select_label("99", &options, None), "99");
     }
 }
 
