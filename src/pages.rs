@@ -1208,6 +1208,9 @@ struct AccountCreateModalForm {
 struct InstrumentCreateModalForm {
     symbol: String,
     name: String,
+    instrument_type: String,
+    asset_class: String,
+    region_type: String,
     trading_currency_code: String,
 }
 
@@ -1835,6 +1838,9 @@ fn InstrumentCreateModal(
     let initial_form = InstrumentCreateModalForm {
         symbol: String::new(),
         name: String::new(),
+        instrument_type: "ETF".to_string(),
+        asset_class: "EQUITY".to_string(),
+        region_type: "DOMESTIC".to_string(),
         trading_currency_code: currency_codes
             .first()
             .cloned()
@@ -1843,6 +1849,9 @@ fn InstrumentCreateModal(
     let initial_form_snapshot = use_signal(|| initial_form.clone());
     let mut symbol = use_signal(|| initial_form.symbol.clone());
     let mut name = use_signal(|| initial_form.name.clone());
+    let mut instrument_type = use_signal(|| initial_form.instrument_type.clone());
+    let mut asset_class = use_signal(|| initial_form.asset_class.clone());
+    let mut region_type = use_signal(|| initial_form.region_type.clone());
     let mut trading_currency_code = use_signal(|| initial_form.trading_currency_code.clone());
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
@@ -1852,6 +1861,9 @@ fn InstrumentCreateModal(
     let is_dirty = InstrumentCreateModalForm {
         symbol: symbol(),
         name: name(),
+        instrument_type: instrument_type(),
+        asset_class: asset_class(),
+        region_type: region_type(),
         trading_currency_code: trading_currency_code(),
     } != initial_form_snapshot();
 
@@ -1876,6 +1888,9 @@ fn InstrumentCreateModal(
                             let reset_form = initial_form_snapshot();
                             symbol.set(reset_form.symbol);
                             name.set(reset_form.name);
+                            instrument_type.set(reset_form.instrument_type);
+                            asset_class.set(reset_form.asset_class);
+                            region_type.set(reset_form.region_type);
                             trading_currency_code.set(reset_form.trading_currency_code);
                         },
                         "還原"
@@ -1914,6 +1929,42 @@ fn InstrumentCreateModal(
                             }
                         }
                     }
+                    label { class: "form-field",
+                        span { "商品類型" }
+                        select {
+                            value: "{instrument_type}",
+                            oninput: move |event| instrument_type.set(event.value()),
+                            disabled: interaction_locked,
+                            option { value: "STOCK", "股票" }
+                            option { value: "ETF", "ETF" }
+                            option { value: "BOND", "債券" }
+                            option { value: "FUND", "基金" }
+                            option { value: "OTHER", "其他" }
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "資產類別" }
+                        select {
+                            value: "{asset_class}",
+                            oninput: move |event| asset_class.set(event.value()),
+                            disabled: interaction_locked,
+                            option { value: "EQUITY", "股票" }
+                            option { value: "BOND", "債券" }
+                            option { value: "MIXED", "混合" }
+                            option { value: "CASH_EQUIVALENT", "現金等價" }
+                            option { value: "OTHER", "其他" }
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "區域" }
+                        select {
+                            value: "{region_type}",
+                            oninput: move |event| region_type.set(event.value()),
+                            disabled: interaction_locked,
+                            option { value: "DOMESTIC", "國內" }
+                            option { value: "FOREIGN", "海外" }
+                        }
+                    }
                 }
                 div { class: "modal-actions",
                     button {
@@ -1946,6 +1997,9 @@ fn InstrumentCreateModal(
                             let input = InstrumentCreateInput {
                                 symbol: symbol(),
                                 name: name(),
+                                instrument_type: instrument_type(),
+                                asset_class: asset_class(),
+                                region_type: region_type(),
                                 trading_currency_code: trading_currency_code(),
                             };
                             let created_currency_code = trading_currency_code();
@@ -4072,7 +4126,7 @@ fn HoldingEditModal(
                 div { class: "modal-header",
                     div {
                         h3 { "更新持股狀態" }
-                        p { class: "modal-subtitle", "{row.account_name} / {row.symbol} {row.instrument_name}" }
+                        p { class: "modal-subtitle", "{row.symbol} {row.instrument_name}" }
                     }
                     button {
                         r#type: "button",
@@ -4096,6 +4150,7 @@ fn HoldingEditModal(
                 if !error_message().is_empty() {
                     div { class: "status-message error", "{error_message}" }
                 }
+                p { class: "modal-subtitle", "此設定會套用至所有持有此商品的帳戶。" }
                 div { class: "form-grid two-column",
                     label {
                         span { "所有權人" }
@@ -4395,7 +4450,6 @@ fn HoldingDividendAssumptionModal(
                             }
 
                             let result = save_dividend_assumption(DividendAssumptionInput {
-                                account_id: row.account_id,
                                 instrument_id: row.instrument_id,
                                 effective_date: effective_date(),
                                 payments_per_year_text: payments_per_year(),

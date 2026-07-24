@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
 
-const LATEST_VERSION: i64 = 10;
+const LATEST_VERSION: i64 = 12;
 const MANUAL_WRITES_SQL: &str = include_str!("migrations/001_manual_writes.sql");
 const PRODUCT_LEVEL_MARKET_DATA_SQL: &str =
     include_str!("migrations/002_product_level_market_data.sql");
@@ -23,6 +23,10 @@ const HOLDING_SNAPSHOT_FEE_RATE_SQL: &str =
 const VALIDATE_FEE_RATE_TEXT_SQL: &str = include_str!("migrations/009_validate_fee_rate_text.sql");
 const REPAIR_FEE_METRIC_VIEWS_SQL: &str =
     include_str!("migrations/010_repair_fee_metric_views.sql");
+const INSTRUMENT_SYMBOL_IDENTITY_SQL: &str =
+    include_str!("migrations/011_instrument_symbol_identity.sql");
+const PRODUCT_LEVEL_DIVIDEND_ASSUMPTION_SQL: &str =
+    include_str!("migrations/012_product_level_dividend_assumption.sql");
 const LEGACY_BUY_FEE_RATE: Decimal = Decimal::from_parts(1425, 0, 0, false, 6);
 const DIVIDEND_RECEIPT_AMOUNT_VIEW_SQL: &str = r#"
 CREATE VIEW IF NOT EXISTS v_dividend_receipt_amount AS
@@ -269,6 +273,18 @@ pub fn migrate(connection: &mut Connection) -> AppResult<()> {
     if version < 10 {
         transaction.execute_batch(REPAIR_FEE_METRIC_VIEWS_SQL)?;
         transaction.pragma_update(None, "user_version", 10_i64)?;
+        version = 10;
+    }
+
+    if version < 11 {
+        transaction.execute_batch(INSTRUMENT_SYMBOL_IDENTITY_SQL)?;
+        transaction.pragma_update(None, "user_version", 11_i64)?;
+        version = 11;
+    }
+
+    if version < 12 {
+        transaction.execute_batch(PRODUCT_LEVEL_DIVIDEND_ASSUMPTION_SQL)?;
+        transaction.pragma_update(None, "user_version", 12_i64)?;
     }
 
     validate_manual_write_schema(&transaction)?;
@@ -277,9 +293,30 @@ pub fn migrate(connection: &mut Connection) -> AppResult<()> {
     validate_holding_snapshot_fee_rate_schema(&transaction)?;
     validate_fee_rate_text_triggers(&transaction)?;
     validate_fee_metric_view(&transaction)?;
+    validate_instrument_identity_schema(&transaction)?;
 
     transaction.commit()?;
 
+    Ok(())
+}
+
+fn validate_instrument_identity_schema(connection: &Connection) -> AppResult<()> {
+    let index_sql: String = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_instrument_symbol'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized = normalize_schema_sql(&index_sql);
+    if !(normalized.contains("UNIQUEINDEXUQ_INSTRUMENT_SYMBOLONINSTRUMENT(UPPER(TRIM(SYMBOL)))")
+        || normalized.contains(
+            "UNIQUEINDEXIFNOTEXISTSUQ_INSTRUMENT_SYMBOLONINSTRUMENT(UPPER(TRIM(SYMBOL)))",
+        ))
+        || !normalized.contains("WHERENULLIF(TRIM(SYMBOL),'')ISNOTNULL")
+    {
+        return Err(AppError::Validation(
+            "商品代號唯一索引定義不正確".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -694,20 +731,14 @@ fn validate_manual_write_behavior_inner(connection: &Connection) -> AppResult<()
             connection.execute(
                 r#"
                 INSERT INTO dividend_assumption (
-                    account_id,
                     instrument_id,
                     effective_date,
                     estimated_annual_dividend_per_unit_text,
                     currency_code,
                     origin
-                ) VALUES (?1, ?2, ?3, '1', ?4, 'MANUAL')
+                ) VALUES (?1, ?2, '1', ?3, 'MANUAL')
                 "#,
-                params![
-                    refs.account_id,
-                    refs.instrument_id,
-                    assumption_date,
-                    refs.currency_code
-                ],
+                params![refs.instrument_id, assumption_date, refs.currency_code],
             )
         },
     )?;
@@ -977,7 +1008,7 @@ fn manual_index_specs() -> [ManualIndexSpec; 5] {
         ManualIndexSpec {
             name: "uq_manual_dividend_assumption",
             table: "dividend_assumption",
-            columns: &["account_id", "instrument_id", "effective_date"],
+            columns: &["instrument_id", "effective_date"],
             predicates: &["ORIGIN = 'MANUAL'"],
         },
         ManualIndexSpec {

@@ -37,7 +37,6 @@ pub struct CurrentHoldingStateInput {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DividendAssumptionInput {
-    pub account_id: i64,
     pub instrument_id: i64,
     pub effective_date: String,
     pub payments_per_year_text: String,
@@ -73,7 +72,6 @@ struct ValidatedHoldingState {
 
 #[derive(Clone, Debug, PartialEq)]
 struct ValidatedDividendAssumption {
-    account_id: i64,
     instrument_id: i64,
     effective_date: String,
     payments_per_year: Option<i64>,
@@ -131,7 +129,6 @@ pub fn validate_dividend_assumption_input(
     let validated = validate_dividend_assumption_inner(input)?;
 
     Ok(DividendAssumptionInput {
-        account_id: validated.account_id,
         instrument_id: validated.instrument_id,
         effective_date: validated.effective_date,
         payments_per_year_text: validated
@@ -311,7 +308,6 @@ fn validate_dividend_assumption_inner(
     )?;
 
     Ok(ValidatedDividendAssumption {
-        account_id: input.account_id,
         instrument_id: input.instrument_id,
         effective_date,
         payments_per_year,
@@ -425,7 +421,6 @@ fn save_current_holding_update_with_connection(
     upsert_instrument_price(&transaction, &validated)?;
     upsert_dividend_assumption(
         &transaction,
-        validated.account_id,
         validated.instrument_id,
         &validated.as_of_date,
         &validated.currency_code,
@@ -448,7 +443,6 @@ fn save_dividend_assumption_with_connection(
 
     upsert_dividend_assumption(
         &transaction,
-        validated.account_id,
         validated.instrument_id,
         &validated.effective_date,
         &validated.currency_code,
@@ -802,7 +796,6 @@ fn upsert_instrument_price(
 #[allow(clippy::too_many_arguments)]
 fn upsert_dividend_assumption(
     transaction: &Transaction<'_>,
-    account_id: i64,
     instrument_id: i64,
     effective_date: &str,
     currency_code: &str,
@@ -815,14 +808,13 @@ fn upsert_dividend_assumption(
             r#"
             SELECT assumption_id
             FROM dividend_assumption
-            WHERE account_id = ?1
-              AND instrument_id = ?2
-              AND effective_date = ?3
+            WHERE instrument_id = ?1
+              AND effective_date = ?2
               AND origin = 'MANUAL'
             ORDER BY assumption_id DESC
             LIMIT 1
             "#,
-            params![account_id, instrument_id, effective_date],
+            params![instrument_id, effective_date],
             |row| row.get::<_, i64>(0),
         )
         .optional()?;
@@ -858,7 +850,6 @@ fn upsert_dividend_assumption(
         transaction.execute(
             r#"
             INSERT INTO dividend_assumption (
-                account_id,
                 instrument_id,
                 effective_date,
                 payments_per_year,
@@ -866,10 +857,9 @@ fn upsert_dividend_assumption(
                 estimated_annual_dividend_per_unit_text,
                 currency_code,
                 origin
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'MANUAL')
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'MANUAL')
             "#,
             params![
-                account_id,
                 instrument_id,
                 effective_date,
                 payments_per_year,
@@ -936,6 +926,41 @@ mod tests {
         .expect("preserve existing cost");
 
         assert_eq!(result, ("45.5648375".to_string(), "0.001425".to_string()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn migration_normalizes_symbols_and_shares_dividend_assumptions_by_product() {
+        let temp_dir = tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("data.sqlite");
+        fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
+        let mut connection = Connection::open(&database_path).expect("open temp db");
+
+        migrate(&mut connection).expect("migrate seed database");
+
+        let symbol: String = connection
+            .query_row(
+                "SELECT symbol FROM instrument WHERE instrument_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("corrected symbol");
+        assert_eq!(symbol, "00882");
+
+        let account_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('dividend_assumption') WHERE name = 'account_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect dividend schema");
+        assert_eq!(account_column_count, 0);
+
+        let duplicate_symbol = connection.execute(
+            "INSERT INTO instrument (symbol, name, instrument_type, asset_class, region_type, trading_currency_code) VALUES ('00882', 'duplicate', 'ETF', 'EQUITY', 'DOMESTIC', 'NTD')",
+            [],
+        );
+        assert!(duplicate_symbol.is_err());
     }
 
     fn sample_state_input() -> CurrentHoldingStateInput {
@@ -1023,7 +1048,6 @@ mod tests {
     #[test]
     fn normalizes_valid_dividend_assumption_input() {
         let input = DividendAssumptionInput {
-            account_id: 1,
             instrument_id: 1,
             effective_date: "2099-03-01".to_string(),
             payments_per_year_text: "04".to_string(),
@@ -1044,7 +1068,6 @@ mod tests {
         let input = DividendAssumptionInput {
             effective_date: "2099-13-01".to_string(),
             ..DividendAssumptionInput {
-                account_id: 1,
                 instrument_id: 1,
                 effective_date: "2099-03-01".to_string(),
                 payments_per_year_text: "4".to_string(),
@@ -1083,7 +1106,6 @@ mod tests {
             .expect("seed holding row");
 
         let first_input = DividendAssumptionInput {
-            account_id,
             instrument_id,
             effective_date: "2099-03-01".to_string(),
             payments_per_year_text: "4".to_string(),
@@ -1098,7 +1120,6 @@ mod tests {
             latest_dividend_per_unit_text: "0.6".to_string(),
             estimated_annual_dividend_per_unit_text: "2.4".to_string(),
             ..DividendAssumptionInput {
-                account_id,
                 instrument_id,
                 effective_date: "2099-03-01".to_string(),
                 payments_per_year_text: "4".to_string(),
@@ -1163,7 +1184,6 @@ mod tests {
         save_dividend_assumption_with_connection(
             &mut connection,
             DividendAssumptionInput {
-                account_id,
                 instrument_id,
                 effective_date: "2099-03-01".to_string(),
                 payments_per_year_text: "4".to_string(),
@@ -1176,7 +1196,6 @@ mod tests {
         save_dividend_assumption_with_connection(
             &mut connection,
             DividendAssumptionInput {
-                account_id,
                 instrument_id,
                 effective_date: "2099-03-02".to_string(),
                 payments_per_year_text: "2".to_string(),
@@ -1657,7 +1676,6 @@ mod tests {
         save_dividend_assumption_with_connection(
             &mut connection,
             DividendAssumptionInput {
-                account_id,
                 instrument_id,
                 effective_date: "2099-02-02".to_string(),
                 payments_per_year_text: "4".to_string(),

@@ -21,6 +21,9 @@ pub struct AccountCreateInput {
 pub struct InstrumentCreateInput {
     pub symbol: String,
     pub name: String,
+    pub instrument_type: String,
+    pub asset_class: String,
+    pub region_type: String,
     pub trading_currency_code: String,
 }
 
@@ -79,9 +82,29 @@ fn validate_account_create_input(input: &AccountCreateInput) -> AppResult<Accoun
 fn validate_instrument_create_input(
     input: &InstrumentCreateInput,
 ) -> AppResult<InstrumentCreateInput> {
-    let symbol = input.symbol.trim().to_string();
-    if symbol.is_empty() {
-        return Err(AppError::Validation("請輸入商品代號".to_string()));
+    let symbol = input.symbol.trim().to_ascii_uppercase();
+    let instrument_type = input.instrument_type.trim().to_string();
+    if !matches!(
+        instrument_type.as_str(),
+        "STOCK" | "ETF" | "BOND" | "FUND" | "OTHER"
+    ) {
+        return Err(AppError::Validation("商品類型不正確".to_string()));
+    }
+    if matches!(instrument_type.as_str(), "STOCK" | "ETF") && symbol.is_empty() {
+        return Err(AppError::Validation(
+            "股票與 ETF 必須輸入商品代號".to_string(),
+        ));
+    }
+    let asset_class = input.asset_class.trim().to_string();
+    if !matches!(
+        asset_class.as_str(),
+        "EQUITY" | "BOND" | "MIXED" | "CASH_EQUIVALENT" | "OTHER"
+    ) {
+        return Err(AppError::Validation("資產類別不正確".to_string()));
+    }
+    let region_type = input.region_type.trim().to_string();
+    if !matches!(region_type.as_str(), "DOMESTIC" | "FOREIGN") {
+        return Err(AppError::Validation("區域不正確".to_string()));
     }
 
     let name = input.name.trim().to_string();
@@ -97,6 +120,9 @@ fn validate_instrument_create_input(
     Ok(InstrumentCreateInput {
         symbol,
         name,
+        instrument_type,
+        asset_class,
+        region_type,
         trading_currency_code,
     })
 }
@@ -131,6 +157,21 @@ fn create_manual_instrument_with_connection(
     let validated = validate_instrument_create_input(&input)?;
     let transaction = connection.transaction()?;
     ensure_currency_exists(&transaction, &validated.trading_currency_code)?;
+    if !validated.symbol.is_empty() {
+        let existing: Option<(i64, String)> = transaction
+            .query_row(
+                "SELECT instrument_id, name FROM instrument WHERE UPPER(TRIM(symbol)) = ?1 LIMIT 1",
+                [&validated.symbol],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((instrument_id, name)) = existing {
+            return Err(AppError::Validation(format!(
+                "商品代號 {} 已由商品 #{instrument_id}（{name}）使用",
+                validated.symbol
+            )));
+        }
+    }
 
     transaction.execute(
         r#"
@@ -141,11 +182,14 @@ fn create_manual_instrument_with_connection(
             asset_class,
             region_type,
             trading_currency_code
-        ) VALUES (?1, ?2, 'ETF', 'EQUITY', 'DOMESTIC', ?3)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
         params![
             validated.symbol,
             validated.name,
+            validated.instrument_type,
+            validated.asset_class,
+            validated.region_type,
             validated.trading_currency_code,
         ],
     )?;
@@ -295,6 +339,9 @@ mod tests {
             InstrumentCreateInput {
                 symbol: "ABC".to_string(),
                 name: "測試商品".to_string(),
+                instrument_type: "ETF".to_string(),
+                asset_class: "EQUITY".to_string(),
+                region_type: "DOMESTIC".to_string(),
                 trading_currency_code: "NTD".to_string(),
             },
         )
@@ -310,5 +357,44 @@ mod tests {
 
         assert_eq!(symbol, "ABC");
         assert_eq!(currency_code, "NTD");
+    }
+
+    #[test]
+    fn normalizes_stock_symbol_and_allows_a_fund_without_one() {
+        let stock = validate_instrument_create_input(&InstrumentCreateInput {
+            symbol: " aapl ".to_string(),
+            name: "Apple".to_string(),
+            instrument_type: "STOCK".to_string(),
+            asset_class: "EQUITY".to_string(),
+            region_type: "FOREIGN".to_string(),
+            trading_currency_code: "USD".to_string(),
+        })
+        .expect("valid stock");
+        assert_eq!(stock.symbol, "AAPL");
+
+        let fund = validate_instrument_create_input(&InstrumentCreateInput {
+            symbol: String::new(),
+            name: "測試基金".to_string(),
+            instrument_type: "FUND".to_string(),
+            asset_class: "BOND".to_string(),
+            region_type: "FOREIGN".to_string(),
+            trading_currency_code: "NTD".to_string(),
+        })
+        .expect("fund may omit a symbol");
+        assert!(fund.symbol.is_empty());
+    }
+
+    #[test]
+    fn rejects_stock_without_a_symbol() {
+        let error = validate_instrument_create_input(&InstrumentCreateInput {
+            symbol: String::new(),
+            name: "測試股票".to_string(),
+            instrument_type: "STOCK".to_string(),
+            asset_class: "EQUITY".to_string(),
+            region_type: "DOMESTIC".to_string(),
+            trading_currency_code: "NTD".to_string(),
+        })
+        .expect_err("stock requires a symbol");
+        assert!(matches!(error, AppError::Validation(_)));
     }
 }
