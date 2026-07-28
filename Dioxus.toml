@@ -7,6 +7,9 @@ publisher = "HellHBBD"
 resources = ["assets/data.sqlite"]
 icon = ["assets/icon.ico"]
 
+[bundle.windows]
+webview_install_mode = { DownloadBootstrapper = { silent = true } }
+
 [bundle.windows.nsis]
 installer_icon = "assets/icon.ico"
 
