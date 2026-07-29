@@ -9,6 +9,7 @@ icon = ["assets/icon.ico"]
 
 [bundle.windows]
 icon_path = "assets/icon.ico"
+webview_install_mode = { DownloadBootstrapper = { silent = true } }
 
 [bundle.windows.nsis]
 installer_icon = "assets/icon.ico"
