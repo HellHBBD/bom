@@ -338,62 +338,111 @@ a {
 }
 
 .searchable-select {
-    display: grid;
-    gap: 6px;
+    position: relative;
     min-width: 190px;
 }
 
-.searchable-select input {
-    width: 100%;
+.searchable-select.open {
+    z-index: 11;
 }
 
-.searchable-select-current {
-    color: #94a3b8;
-    font-size: 12px;
+.searchable-select-trigger {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    text-align: left;
+}
+
+.searchable-select-trigger-label,
+.searchable-select-option-label {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
+.searchable-select-trigger-icon {
+    flex: 0 0 auto;
+    color: #94a3b8;
+}
+
+.searchable-select-dismiss-layer {
+    position: fixed;
+    z-index: 10;
+    inset: 0;
+}
+
+.searchable-select-popover {
+    display: grid;
+    gap: 8px;
+    position: absolute;
+    z-index: 11;
+    top: calc(100% + 8px);
+    left: 0;
+    width: max(100%, 240px);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 12px;
+    background: #111827;
+    box-shadow: 0 16px 36px rgba(2, 6, 23, 0.42);
+    padding: 8px;
+}
+
+.searchable-select-popover input {
+    width: 100%;
+}
+
 .searchable-select-options {
     display: grid;
-    gap: 4px;
-    max-height: 180px;
+    gap: 2px;
+    max-height: min(320px, 50vh);
     overflow-y: auto;
-    border: 1px solid rgba(148, 163, 184, 0.2);
-    border-radius: 10px;
-    background: #111827;
-    padding: 5px;
+    padding-right: 2px;
 }
 
 .searchable-select-option {
     width: 100%;
-    border: 0;
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid transparent;
     border-radius: 7px;
     background: transparent;
     color: #cbd5e1;
     cursor: pointer;
-    padding: 7px 8px;
+    padding: 6px 8px;
     text-align: left;
 }
 
 .filters .searchable-select-option {
-    min-height: 0;
-    border: 0;
+    min-height: 36px;
     background: transparent;
-    padding: 7px 8px;
+    padding: 6px 8px;
 }
 
-.searchable-select-option:hover,
-.searchable-select-option:focus-visible {
+.searchable-select-option:hover {
     background: rgba(56, 189, 248, 0.14);
     color: #f8fafc;
-    outline: 0;
+}
+
+.searchable-select-option:focus-visible,
+.searchable-select-trigger:focus-visible {
+    outline: 2px solid #38bdf8;
+    outline-offset: -2px;
 }
 
 .searchable-select-option.selected {
-    background: rgba(56, 189, 248, 0.22);
+    background: rgba(14, 116, 144, 0.45);
     color: #e0f2fe;
+    font-weight: 600;
+}
+
+.searchable-select-option-check {
+    flex: 0 0 16px;
+    color: #7dd3fc;
+    text-align: center;
 }
 
 .searchable-select-option:disabled {
@@ -404,7 +453,52 @@ a {
 .searchable-select-empty {
     color: #94a3b8;
     font-size: 13px;
-    padding: 7px 8px;
+    padding: 9px 8px;
+}
+
+.searchable-select-options {
+    scrollbar-width: thin;
+    scrollbar-color: #7c8495 #162033;
+}
+
+.searchable-select-options::-webkit-scrollbar {
+    width: 10px;
+}
+
+.searchable-select-options::-webkit-scrollbar-track {
+    background: #162033;
+}
+
+.searchable-select-options::-webkit-scrollbar-thumb {
+    border: 2px solid #162033;
+    border-radius: 999px;
+    background: #7c8495;
+}
+
+.account-filters {
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) minmax(120px, 0.45fr) minmax(190px, 0.65fr) minmax(140px, 0.5fr) minmax(90px, 0.3fr) minmax(180px, 0.7fr) auto;
+}
+
+.account-filters .filter-field,
+.account-filters .searchable-select {
+    min-width: 0;
+}
+
+.account-filters input,
+.account-filters select,
+.account-filters .searchable-select {
+    width: 100%;
+}
+
+.account-filters .filter-clear {
+    align-self: end;
+}
+
+@media (max-width: 1200px) {
+    .account-filters {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 
 .column-picker {
@@ -805,5 +899,19 @@ tbody tr:hover {
 
     .form-grid.two-column {
         grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 600px) {
+    .account-filters {
+        grid-template-columns: 1fr;
+    }
+
+    .account-filters .filter-clear {
+        justify-self: start;
+    }
+
+    .searchable-select-popover {
+        width: min(320px, calc(100vw - 32px));
     }
 }

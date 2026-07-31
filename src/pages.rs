@@ -2818,38 +2818,81 @@ fn SearchableSelect(
     on_change: EventHandler<String>,
 ) -> Element {
     let mut query = use_signal(String::new);
+    let mut is_open = use_signal(|| false);
     let selected_label = searchable_select_label(&value, &options, empty_label.as_deref());
     let visible_options = searchable_select_options(&query(), &options, empty_label.as_deref());
     let search_placeholder = format!("搜尋{label}");
 
     rsx! {
-        div { class: "searchable-select",
-            input {
-                r#type: "search",
-                value: "{query}",
-                placeholder: "{search_placeholder}",
-                aria_label: "搜尋{label}",
+        div { class: if is_open() { "searchable-select open" } else { "searchable-select" },
+            button {
+                r#type: "button",
+                class: "searchable-select-trigger",
+                aria_haspopup: "listbox",
+                aria_expanded: is_open(),
                 disabled,
-                oninput: move |event| query.set(event.value()),
+                onclick: move |_| {
+                    if disabled {
+                        return;
+                    }
+                    is_open.toggle();
+                    query.set(String::new());
+                },
+                span { class: "searchable-select-trigger-label", title: "{selected_label}", "{selected_label}" }
+                span { class: "searchable-select-trigger-icon", aria_hidden: "true", "▾" }
             }
-            div { class: "searchable-select-current", "目前：{selected_label}" }
-            div { class: "searchable-select-options", role: "listbox", aria_label: "{label}",
-                if visible_options.is_empty() {
-                    div { class: "searchable-select-empty", "沒有符合的選項" }
-                } else {
-                    for (option_value, option_label) in visible_options {
-                        button {
-                            key: "{option_value}",
-                            r#type: "button",
-                            class: if option_value == value { "searchable-select-option selected" } else { "searchable-select-option" },
-                            role: "option",
-                            aria_selected: option_value == value,
-                            disabled,
-                            onclick: move |_| {
-                                on_change.call(option_value.clone());
-                                query.set(String::new());
-                            },
-                            "{option_label}"
+            if is_open() {
+                div {
+                    class: "searchable-select-dismiss-layer",
+                    aria_hidden: "true",
+                    onclick: move |_| {
+                        is_open.set(false);
+                        query.set(String::new());
+                    },
+                }
+                div {
+                    class: "searchable-select-popover",
+                    role: "dialog",
+                    aria_label: "選擇{label}",
+                    onkeydown: move |event| {
+                        if event.key() == Key::Escape {
+                            event.prevent_default();
+                            is_open.set(false);
+                            query.set(String::new());
+                        }
+                    },
+                    input {
+                        r#type: "search",
+                        value: "{query}",
+                        placeholder: "{search_placeholder}",
+                        aria_label: "搜尋{label}",
+                        disabled,
+                        oninput: move |event| query.set(event.value()),
+                    }
+                    div { class: "searchable-select-options", role: "listbox", aria_label: "{label}",
+                        if visible_options.is_empty() {
+                            div { class: "searchable-select-empty", "沒有符合的選項" }
+                        } else {
+                            for (option_value, option_label) in visible_options {
+                                button {
+                                    key: "{option_value}",
+                                    r#type: "button",
+                                    class: if option_value == value { "searchable-select-option selected" } else { "searchable-select-option" },
+                                    role: "option",
+                                    aria_selected: option_value == value,
+                                    title: "{option_label}",
+                                    disabled,
+                                    onclick: move |_| {
+                                        on_change.call(option_value.clone());
+                                        is_open.set(false);
+                                        query.set(String::new());
+                                    },
+                                    if option_value == value {
+                                        span { class: "searchable-select-option-check", aria_hidden: "true", "✓" }
+                                    }
+                                    span { class: "searchable-select-option-label", "{option_label}" }
+                                }
+                            }
                         }
                     }
                 }
@@ -3791,26 +3834,33 @@ fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
                 strong { "{filtered_rows.len()} / {rows.len()} 筆帳戶資產" }
                 span { "篩選後總額：{money(Some(filtered_total))}" }
             }
-            div { class: "filters",
-                input {
-                    placeholder: "搜尋帳戶名稱",
-                    value: "{search}",
-                    oninput: move |event| search.set(event.value()),
+            div { class: "filters account-filters",
+                label { class: "filter-field account-search-filter",
+                    span { "帳戶名稱" }
+                    input {
+                        placeholder: "搜尋帳戶名稱",
+                        value: "{search}",
+                        oninput: move |event| search.set(event.value()),
+                    }
                 }
                 SelectFilter { label: "所有權人".to_string(), value: owner_filter(), options: owner_options, translate_options: false, on_change: move |value| owner_filter.set(value) }
                 SelectFilter { label: "金融機構".to_string(), value: institution_filter(), options: institution_options, translate_options: false, on_change: move |value| institution_filter.set(value) }
                 SelectFilter { label: "資產類型".to_string(), value: asset_type_filter(), options: asset_type_options, translate_options: true, on_change: move |value| asset_type_filter.set(value) }
                 SelectFilter { label: "幣別".to_string(), value: currency_filter(), options: currency_options, translate_options: false, on_change: move |value| currency_filter.set(value) }
-                select {
-                    value: "{sort_by}",
-                    oninput: move |event| sort_by.set(event.value()),
-                    option { value: "value", "依台幣價值排序" }
-                    option { value: "owner", "依所有權人排序" }
-                    option { value: "institution", "依金融機構排序" }
-                    option { value: "asset_type", "依資產類型排序" }
+                label { class: "filter-field account-sort-filter",
+                    span { "排序" }
+                    select {
+                        value: "{sort_by}",
+                        oninput: move |event| sort_by.set(event.value()),
+                        option { value: "value", "依台幣價值排序" }
+                        option { value: "owner", "依所有權人排序" }
+                        option { value: "institution", "依金融機構排序" }
+                        option { value: "asset_type", "依資產類型排序" }
+                    }
                 }
                 button {
                     r#type: "button",
+                    class: "filter-clear",
                     onclick: move |_| {
                         owner_filter.set(String::new());
                         institution_filter.set(String::new());
