@@ -5,7 +5,6 @@ name = "BOM"
 identifier = "local.hellhbbd.bom"
 publisher = "HellHBBD"
 resources = ["assets/data.sqlite"]
-icon = ["assets/icon.ico"]
 
 [bundle.windows]
 icon_path = "assets/icon.ico"
