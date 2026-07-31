@@ -15,6 +15,7 @@ use crate::db::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::{AppError, AppResult};
+use crate::format::account_name;
 use crate::models::{
     AccountAsset, DashboardSummary, DividendReceiptAccountOption, DividendReceiptFormOptions,
     DividendReceiptInstrumentOption, DividendReceiptRow, ExchangeRatePreview, ExchangeRateRow,
@@ -96,6 +97,7 @@ fn load_dividend_receipts_native() -> SqlResult<Vec<DividendReceiptRow>> {
             COALESCE(r.origin, 'EXCEL_IMPORT') AS origin,
             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(p.display_name, '未指定')), '未指定') AS owner_name,
             COALESCE(a.display_name, '帳戶 #' || r.account_id) AS account_name,
+            a.account_number,
             COALESCE(i.symbol, '-') AS symbol,
             COALESCE(i.name, '未命名商品') AS instrument_name,
             COALESCE(r.received_on, '-') AS received_on,
@@ -122,16 +124,17 @@ fn load_dividend_receipts_native() -> SqlResult<Vec<DividendReceiptRow>> {
             instrument_id: row.get(2)?,
             origin: row.get(3)?,
             owner_name: row.get(4)?,
-            account_name: row.get(5)?,
-            symbol: row.get(6)?,
-            instrument_name: row.get(7)?,
-            received_on: row.get(8)?,
-            gross_amount: parse_number_text(row.get(9)?),
-            tax_amount: parse_number_text(row.get(10)?),
-            fee_amount: parse_number_text(row.get(11)?),
-            net_amount: row.get(12)?,
-            currency_code: row.get(13)?,
-            note: row.get(14)?,
+            account_name: account_name(&row.get::<_, String>(5)?),
+            account_number: row.get(6)?,
+            symbol: row.get(7)?,
+            instrument_name: row.get(8)?,
+            received_on: row.get(9)?,
+            gross_amount: parse_number_text(row.get(10)?),
+            tax_amount: parse_number_text(row.get(11)?),
+            fee_amount: parse_number_text(row.get(12)?),
+            net_amount: row.get(13)?,
+            currency_code: row.get(14)?,
+            note: row.get(15)?,
         })
     })?;
 
@@ -147,11 +150,12 @@ fn load_dividend_receipt_form_options_native() -> SqlResult<DividendReceiptFormO
         SELECT
             a.account_id,
             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(p.display_name, '未指定')), '未指定') AS owner_name,
-            COALESCE(a.display_name, '帳戶 #' || a.account_id) AS account_name
+            COALESCE(a.display_name, '帳戶 #' || a.account_id) AS account_name,
+            a.account_number
         FROM account a
         LEFT JOIN account_owner ao ON ao.account_id = a.account_id
         LEFT JOIN person p ON p.person_id = ao.person_id
-        GROUP BY a.account_id, a.display_name
+        GROUP BY a.account_id, a.display_name, a.account_number
         ORDER BY owner_name ASC, account_name ASC
         "#,
     )?;
@@ -159,7 +163,8 @@ fn load_dividend_receipt_form_options_native() -> SqlResult<DividendReceiptFormO
         Ok(DividendReceiptAccountOption {
             account_id: row.get(0)?,
             owner_name: row.get(1)?,
-            account_name: row.get(2)?,
+            account_name: account_name(&row.get::<_, String>(2)?),
+            account_number: row.get(3)?,
         })
     })?;
 
@@ -426,6 +431,7 @@ fn load_account_assets_native() -> SqlResult<Vec<AccountAsset>> {
             COALESCE(p.display_name, '未指定') AS owner_name,
             COALESCE(i.name, '未指定機構') AS institution_name,
             COALESCE(a.display_name, '帳戶 #' || v.account_id) AS account_name,
+            a.account_number,
             COALESCE(a.account_type, 'UNKNOWN') AS account_type,
             COALESCE(v.asset_type, 'UNKNOWN') AS asset_type,
             COALESCE(v.currency_code, '-') AS currency_code,
@@ -446,8 +452,8 @@ fn load_account_assets_native() -> SqlResult<Vec<AccountAsset>> {
     )?;
 
     let rows = statement.query_map([], |row| {
-        let quantity_text: Option<String> = row.get(9)?;
-        let invested_amount_text: Option<String> = row.get(11)?;
+        let quantity_text: Option<String> = row.get(10)?;
+        let invested_amount_text: Option<String> = row.get(12)?;
 
         Ok(AccountAsset {
             snapshot_id: row.get(0)?,
@@ -455,16 +461,17 @@ fn load_account_assets_native() -> SqlResult<Vec<AccountAsset>> {
             origin: row.get(2)?,
             owner_name: row.get(3)?,
             institution_name: row.get(4)?,
-            account_name: row.get(5)?,
-            account_type: row.get(6)?,
-            asset_type: row.get(7)?,
-            currency_code: row.get(8)?,
+            account_name: account_name(&row.get::<_, String>(5)?),
+            account_number: row.get(6)?,
+            account_type: row.get(7)?,
+            asset_type: row.get(8)?,
+            currency_code: row.get(9)?,
             quantity_text: quantity_text.clone(),
-            current_value_override_text: row.get(10)?,
+            current_value_override_text: row.get(11)?,
             invested_amount_text: invested_amount_text.clone(),
-            current_value_ntd: row.get(12)?,
-            snapshot_date: row.get(13)?,
-            note: row.get(14)?,
+            current_value_ntd: row.get(13)?,
+            snapshot_date: row.get(14)?,
+            note: row.get(15)?,
             quantity: parse_number_text(quantity_text),
             invested_amount: parse_number_text(invested_amount_text),
         })
@@ -578,6 +585,7 @@ fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
             h.instrument_id,
             COALESCE(h.owner_name, '未指定') AS owner_name,
             COALESCE(a.display_name, '帳戶 #' || h.account_id) AS account_name,
+            a.account_number,
             COALESCE(h.symbol, '-') AS symbol,
             COALESCE(h.instrument_name, '未命名商品') AS instrument_name,
             COALESCE(h.instrument_type, 'UNKNOWN') AS instrument_type,
@@ -622,38 +630,39 @@ fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
             account_id: row.get(1)?,
             instrument_id: row.get(2)?,
             owner_name: row.get(3)?,
-            account_name: row.get(4)?,
-            symbol: row.get(5)?,
-            instrument_name: row.get(6)?,
-            instrument_type: row.get(7)?,
-            asset_class: row.get(8)?,
-            region_type: row.get(9)?,
-            trading_currency_code: row.get(10)?,
-            cost_currency_code: row.get(11)?,
-            snapshot_date: row.get(12)?,
-            note: row.get(13)?,
-            quantity: row.get(14)?,
-            average_cost: row.get(15)?,
-            average_cost_text: row.get(16)?,
-            buy_fee_rate: row.get(17)?,
-            applied_buy_fee_rate_text: row.get(18)?,
-            sell_fee_rate: row.get(19)?,
-            sell_transaction_tax_rate: row.get(20)?,
-            market_price_date: row.get(21)?,
-            market_price_currency_code: row.get(22)?,
-            market_price: row.get(23)?,
-            total_cost: row.get(24)?,
-            market_value: row.get(25)?,
-            liquidation_value: row.get(26)?,
-            unrealized_profit: row.get(27)?,
-            unrealized_return_rate: row.get(28)?,
-            dividend_effective_date: row.get(29)?,
-            dividend_currency_code: row.get(30)?,
-            estimated_annual_dividend_per_unit: row.get(31)?,
-            payments_per_year: row.get(32)?,
-            latest_dividend_per_unit: row.get(33)?,
-            estimated_annual_dividend: row.get(34)?,
-            estimated_yield_on_cost: row.get(35)?,
+            account_name: account_name(&row.get::<_, String>(4)?),
+            account_number: row.get(5)?,
+            symbol: row.get(6)?,
+            instrument_name: row.get(7)?,
+            instrument_type: row.get(8)?,
+            asset_class: row.get(9)?,
+            region_type: row.get(10)?,
+            trading_currency_code: row.get(11)?,
+            cost_currency_code: row.get(12)?,
+            snapshot_date: row.get(13)?,
+            note: row.get(14)?,
+            quantity: row.get(15)?,
+            average_cost: row.get(16)?,
+            average_cost_text: row.get(17)?,
+            buy_fee_rate: row.get(18)?,
+            applied_buy_fee_rate_text: row.get(19)?,
+            sell_fee_rate: row.get(20)?,
+            sell_transaction_tax_rate: row.get(21)?,
+            market_price_date: row.get(22)?,
+            market_price_currency_code: row.get(23)?,
+            market_price: row.get(24)?,
+            total_cost: row.get(25)?,
+            market_value: row.get(26)?,
+            liquidation_value: row.get(27)?,
+            unrealized_profit: row.get(28)?,
+            unrealized_return_rate: row.get(29)?,
+            dividend_effective_date: row.get(30)?,
+            dividend_currency_code: row.get(31)?,
+            estimated_annual_dividend_per_unit: row.get(32)?,
+            payments_per_year: row.get(33)?,
+            latest_dividend_per_unit: row.get(34)?,
+            estimated_annual_dividend: row.get(35)?,
+            estimated_yield_on_cost: row.get(36)?,
         })
     })?;
 

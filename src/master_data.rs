@@ -15,6 +15,7 @@ pub struct InstitutionOption {
 pub struct AccountCreateInput {
     pub institution_id: i64,
     pub display_name: String,
+    pub account_number: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,9 +74,15 @@ fn validate_account_create_input(input: &AccountCreateInput) -> AppResult<Accoun
         return Err(AppError::Validation("請輸入帳戶名稱".to_string()));
     }
 
+    let account_number = input.account_number.trim().to_string();
+    if !account_number.is_empty() && !account_number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AppError::Validation("帳戶號碼只能包含數字".to_string()));
+    }
+
     Ok(AccountCreateInput {
         institution_id: input.institution_id,
         display_name,
+        account_number,
     })
 }
 
@@ -138,10 +145,14 @@ fn create_manual_account_with_connection(
 
     transaction.execute(
         r#"
-        INSERT INTO account (display_name, institution_id, account_type)
-        VALUES (?1, ?2, 'BROKERAGE')
+        INSERT INTO account (display_name, institution_id, account_type, account_number, account_number_last4)
+        VALUES (?1, ?2, 'BROKERAGE', NULLIF(?3, ''), NULLIF(SUBSTR(?3, -4), ''))
         "#,
-        params![validated.display_name, validated.institution_id],
+        params![
+            validated.display_name,
+            validated.institution_id,
+            validated.account_number
+        ],
     )?;
 
     let account_id = transaction.last_insert_rowid();
@@ -278,7 +289,9 @@ mod tests {
                     account_id INTEGER PRIMARY KEY,
                     display_name TEXT,
                     institution_id INTEGER,
-                    account_type TEXT
+                    account_type TEXT,
+                    account_number TEXT,
+                    account_number_last4 TEXT
                 );
 
                 CREATE TABLE instrument (
@@ -313,19 +326,35 @@ mod tests {
             AccountCreateInput {
                 institution_id: 1,
                 display_name: "新帳戶".to_string(),
+                account_number: "001234567890".to_string(),
             },
         )
         .expect("create account");
 
-        let display_name: String = connection
+        let (display_name, account_number, account_number_last4):
+            (String, Option<String>, Option<String>) = connection
             .query_row(
-                "SELECT display_name FROM account WHERE account_id = ?1",
+                "SELECT display_name, account_number, account_number_last4 FROM account WHERE account_id = ?1",
                 [account_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("read account");
 
         assert_eq!(display_name, "新帳戶");
+        assert_eq!(account_number.as_deref(), Some("001234567890"));
+        assert_eq!(account_number_last4.as_deref(), Some("7890"));
+    }
+
+    #[test]
+    fn rejects_a_manual_account_number_with_non_digits() {
+        let error = validate_account_create_input(&AccountCreateInput {
+            institution_id: 1,
+            display_name: "新帳戶".to_string(),
+            account_number: "1234-5678".to_string(),
+        })
+        .expect_err("account number should be rejected");
+
+        assert!(error.to_string().contains("帳戶號碼只能包含數字"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

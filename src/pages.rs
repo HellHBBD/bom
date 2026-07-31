@@ -1056,6 +1056,7 @@ fn DividendReceiptTable(
                         tr {
                             th { "所有權人" }
                             th { "入帳帳戶" }
+                            th { "帳戶號碼" }
                             th { "代號" }
                             th { "商品" }
                             th { "來源" }
@@ -1091,6 +1092,7 @@ fn DividendReceiptRowView(
         tr {
             td { "{row.owner_name}" }
             td { "{row.account_name}" }
+            td { class: "mono", "{row.account_number.as_deref().unwrap_or(\"—\")}" }
             td { class: "mono", "{row.symbol}" }
             td { class: "name-cell", "{row.instrument_name}" }
             td { class: "mono", "{row.origin}" }
@@ -1201,6 +1203,7 @@ struct DividendReceiptModalForm {
 #[derive(Clone, Debug, PartialEq)]
 struct AccountCreateModalForm {
     display_name: String,
+    account_number: String,
     institution_id: String,
 }
 
@@ -1685,6 +1688,7 @@ fn AccountCreateModal(
 ) -> Element {
     let initial_form = AccountCreateModalForm {
         display_name: String::new(),
+        account_number: String::new(),
         institution_id: institutions
             .first()
             .map(|institution| institution.institution_id.to_string())
@@ -1692,6 +1696,7 @@ fn AccountCreateModal(
     };
     let initial_form_snapshot = use_signal(|| initial_form.clone());
     let mut display_name = use_signal(|| initial_form.display_name.clone());
+    let mut account_number = use_signal(|| initial_form.account_number.clone());
     let mut institution_id = use_signal(|| initial_form.institution_id.clone());
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
@@ -1700,6 +1705,7 @@ fn AccountCreateModal(
     let interaction_locked = is_saving();
     let is_dirty = AccountCreateModalForm {
         display_name: display_name(),
+        account_number: account_number(),
         institution_id: institution_id(),
     } != initial_form_snapshot();
 
@@ -1723,6 +1729,7 @@ fn AccountCreateModal(
                             confirm_close.set(false);
                             let reset_form = initial_form_snapshot();
                             display_name.set(reset_form.display_name);
+                            account_number.set(reset_form.account_number);
                             institution_id.set(reset_form.institution_id);
                         },
                         "還原"
@@ -1739,6 +1746,16 @@ fn AccountCreateModal(
                             oninput: move |event| display_name.set(event.value()),
                             disabled: interaction_locked,
                             placeholder: "新帳戶",
+                        }
+                    }
+                    label { class: "form-field full-width",
+                        span { "帳戶號碼" }
+                        input {
+                            value: "{account_number}",
+                            oninput: move |event| account_number.set(event.value()),
+                            disabled: interaction_locked,
+                            inputmode: "numeric",
+                            placeholder: "完整帳戶號碼（選填）",
                         }
                     }
                     div { class: "form-field full-width",
@@ -1788,6 +1805,7 @@ fn AccountCreateModal(
                             let input = AccountCreateInput {
                                 institution_id: institution_id().parse::<i64>().unwrap_or_default(),
                                 display_name: display_name(),
+                                account_number: account_number(),
                             };
                             let mut is_saving = is_saving;
                             let mut error_message = error_message;
@@ -2058,10 +2076,12 @@ fn InstrumentCreateModal(
 }
 
 fn dividend_receipt_account_label(option: &DividendReceiptAccountOption) -> String {
+    let account_number = option.account_number.as_deref().unwrap_or("—");
     format!(
-        "{} / {}",
+        "{} / {} / {}",
         option.owner_name.replace(',', "、"),
-        option.account_name
+        option.account_name,
+        account_number
     )
 }
 
@@ -2134,6 +2154,7 @@ mod dividend_income_page_tests {
                 origin: "MANUAL".to_string(),
                 owner_name: "Alex".to_string(),
                 account_name: "Account 1".to_string(),
+                account_number: Some("001234567890".to_string()),
                 symbol: "AAA".to_string(),
                 instrument_name: "Alpha".to_string(),
                 received_on: "2026-07-09".to_string(),
@@ -2151,6 +2172,7 @@ mod dividend_income_page_tests {
                 origin: "MANUAL".to_string(),
                 owner_name: "Alex".to_string(),
                 account_name: "Account 1".to_string(),
+                account_number: Some("001234567890".to_string()),
                 symbol: "AAA".to_string(),
                 instrument_name: "Alpha".to_string(),
                 received_on: "2026-07-10".to_string(),
@@ -2175,9 +2197,10 @@ mod dividend_income_page_tests {
             account_id: 1,
             owner_name: "Alex,Beth".to_string(),
             account_name: "Account 1".to_string(),
+            account_number: Some("001234567890".to_string()),
         });
 
-        assert_eq!(label, "Alex、Beth / Account 1");
+        assert_eq!(label, "Alex、Beth / Account 1 / 001234567890");
     }
 }
 
@@ -3103,6 +3126,7 @@ fn compare_optional_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ord
 const HOLDING_COLUMNS: &[(&str, &str)] = &[
     ("owner", "所有權人"),
     ("account", "證券帳戶"),
+    ("account_number", "帳戶號碼"),
     ("symbol", "代號"),
     ("instrument", "商品名稱"),
     ("instrument_type", "類型"),
@@ -3259,6 +3283,7 @@ mod holding_column_tests {
             instrument_id: 1,
             owner_name: "Owner".to_string(),
             account_name: "Account".to_string(),
+            account_number: Some("001234567890".to_string()),
             symbol: "ABC".to_string(),
             instrument_name: "Example".to_string(),
             instrument_type: "ETF".to_string(),
@@ -3538,6 +3563,7 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                             tr {
                                 if is_holding_column_visible(&visible_columns_value, "owner") { th { "所有權人" } }
                                 if is_holding_column_visible(&visible_columns_value, "account") { th { "證券帳戶" } }
+                                if is_holding_column_visible(&visible_columns_value, "account_number") { th { "帳戶號碼" } }
                                 if is_holding_column_visible(&visible_columns_value, "symbol") { th { "代號" } }
                                 if is_holding_column_visible(&visible_columns_value, "instrument") { th { "商品名稱" } }
                                 if is_holding_column_visible(&visible_columns_value, "instrument_type") { th { "類型" } }
@@ -3806,6 +3832,7 @@ fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
                                 th { "所有權人" }
                                 th { "金融機構" }
                                 th { "帳戶名稱" }
+                                th { "帳戶號碼" }
                                 th { "帳戶類型" }
                                 th { "資產類型" }
                                 th { "幣別" }
@@ -3851,6 +3878,7 @@ fn AccountAssetRow(row: AccountAsset, on_edit: EventHandler<AccountAsset>) -> El
             td { "{row.owner_name}" }
             td { "{row.institution_name}" }
             td { class: "name-cell", "{row.account_name}" }
+            td { class: "mono", "{row.account_number.as_deref().unwrap_or(\"—\")}" }
             td { "{account_type_label(&row.account_type)}" }
             td { "{select_option_label(&row.asset_type)}" }
             td { class: "mono", "{row.currency_code}" }
@@ -4003,6 +4031,10 @@ fn AccountAssetEditModal(
                     div { class: "form-field",
                         span { "帳戶" }
                         div { class: "readonly-field", "{asset.account_name}" }
+                    }
+                    div { class: "form-field",
+                        span { "帳戶號碼" }
+                        div { class: "readonly-field mono", "{asset.account_number.as_deref().unwrap_or(\"—\")}" }
                     }
                     div { class: "form-field",
                         span { "資產類型" }
@@ -4209,6 +4241,7 @@ fn HoldingRow(
         tr {
             if is_holding_column_visible(&visible_columns, "owner") { td { "{row.owner_name}" } }
             if is_holding_column_visible(&visible_columns, "account") { td { "{row.account_name}" } }
+            if is_holding_column_visible(&visible_columns, "account_number") { td { class: "mono", "{row.account_number.as_deref().unwrap_or(\"—\")}" } }
             if is_holding_column_visible(&visible_columns, "symbol") { td { class: "mono", "{row.symbol}" } }
             if is_holding_column_visible(&visible_columns, "instrument") { td { class: "name-cell", "{row.instrument_name}" } }
             if is_holding_column_visible(&visible_columns, "instrument_type") { td { "{select_option_label(&row.instrument_type)}" } }
@@ -4318,6 +4351,10 @@ fn HoldingEditModal(
                     label {
                         span { "證券帳戶" }
                         div { class: "readonly-field", "{row.account_name}" }
+                    }
+                    label {
+                        span { "帳戶號碼" }
+                        div { class: "readonly-field mono", "{row.account_number.as_deref().unwrap_or(\"—\")}" }
                     }
                     label {
                         span { "商品代號" }

@@ -5,6 +5,7 @@ pub struct HoldingMetric {
     pub instrument_id: i64,
     pub owner_name: String,
     pub account_name: String,
+    pub account_number: Option<String>,
     pub symbol: String,
     pub instrument_name: String,
     pub instrument_type: String,
@@ -46,6 +47,7 @@ pub struct AccountAsset {
     pub owner_name: String,
     pub institution_name: String,
     pub account_name: String,
+    pub account_number: Option<String>,
     pub account_type: String,
     pub asset_type: String,
     pub currency_code: String,
@@ -107,6 +109,7 @@ pub struct DividendReceiptRow {
     pub origin: String,
     pub owner_name: String,
     pub account_name: String,
+    pub account_number: Option<String>,
     pub symbol: String,
     pub instrument_name: String,
     pub received_on: String,
@@ -123,6 +126,7 @@ pub struct DividendReceiptAccountOption {
     pub account_id: i64,
     pub owner_name: String,
     pub account_name: String,
+    pub account_number: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
