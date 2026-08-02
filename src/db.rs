@@ -1,18 +1,13 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod backup;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod migration;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod path;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqlResult};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::{
-    backup::{backup_before_migration, backup_for_today},
-    migration::migrate,
-};
+use crate::db::backup::backup_for_today;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::error::{AppError, AppResult};
 use crate::format::account_name;
@@ -685,28 +680,64 @@ fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn ensure_migrated_database() -> AppResult<std::path::PathBuf> {
-    let path = path::ensure_runtime_database()?;
-    let mut connection = Connection::open(&path)?;
-    let current_version = migration::current_version(&connection)?;
-    if current_version < migration::latest_version() {
-        backup_before_migration(&path, current_version)?;
+const BASELINE_DATABASE_VERSION: i64 = 12;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_baseline_database(
+    connection: &Connection,
+    database_path: &std::path::Path,
+) -> AppResult<()> {
+    let reset_directory = database_path.parent().unwrap_or(database_path).display();
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != BASELINE_DATABASE_VERSION {
+        return Err(AppError::Validation(format!(
+            "資料庫版本為 {version}，需要 baseline v{BASELINE_DATABASE_VERSION}。請關閉應用程式後刪除資料夾：{reset_directory}，再重新啟動應用程式"
+        )));
     }
-    migrate(&mut connection)?;
+
+    for object_name in [
+        "account",
+        "account_asset_snapshot",
+        "holding_snapshot",
+        "instrument",
+        "instrument_price",
+        "dividend_assumption",
+        "ui_preference",
+        "v_account_asset_value",
+        "v_holding_metrics",
+    ] {
+        if connection
+            .prepare(&format!("SELECT 1 FROM {object_name} LIMIT 0"))
+            .is_err()
+        {
+            return Err(AppError::Validation(format!(
+                "資料庫缺少 baseline v{BASELINE_DATABASE_VERSION} 的必要結構。請關閉應用程式後刪除資料夾：{reset_directory}，再重新啟動應用程式"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_baseline_database() -> AppResult<std::path::PathBuf> {
+    let path = path::ensure_runtime_database()?;
+    let connection = Connection::open(&path)?;
+    validate_baseline_database(&connection, &path)?;
 
     Ok(path)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open_database() -> SqlResult<Connection> {
-    let path = ensure_migrated_database().map_err(app_error_to_sql_error)?;
+    let path = open_baseline_database().map_err(app_error_to_sql_error)?;
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub fn open_writable_database() -> AppResult<Connection> {
-    let path = ensure_migrated_database()?;
+    let path = open_baseline_database()?;
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
@@ -715,22 +746,15 @@ pub fn open_writable_database() -> AppResult<Connection> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_ui_preference_database() -> AppResult<Connection> {
     let path = path::ensure_runtime_database()?;
-    let connection = Connection::open(path)?;
-    if migration::current_version(&connection)? != migration::latest_version() {
-        drop(connection);
-        let path = ensure_migrated_database()?;
-        let connection = Connection::open(path)?;
-        migration::validate_ui_preference_schema(&connection)?;
-        return Ok(connection);
-    }
-    migration::validate_ui_preference_schema(&connection)?;
+    let connection = Connection::open(&path)?;
+    validate_baseline_database(&connection, &path)?;
     connection.busy_timeout(std::time::Duration::from_secs(2))?;
     Ok(connection)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_manual_write_database() -> AppResult<Connection> {
-    let path = ensure_migrated_database()?;
+    let path = open_baseline_database()?;
     backup_for_today(&path)?;
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;

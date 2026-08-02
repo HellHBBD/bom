@@ -341,14 +341,12 @@ mod tests {
         use tempfile::tempdir;
 
         use super::*;
-        use crate::db::migration::migrate;
 
         fn setup_db() -> (tempfile::TempDir, Connection) {
             let temp_dir = tempdir().expect("temp dir");
             let database_path = temp_dir.path().join("data.sqlite");
             fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
-            let mut connection = Connection::open(&database_path).expect("open temp db");
-            migrate(&mut connection).expect("migrate temp db");
+            let connection = Connection::open(&database_path).expect("open temp db");
             (temp_dir, connection)
         }
 

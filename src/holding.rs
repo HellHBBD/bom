@@ -4,11 +4,39 @@ use rust_decimal::Decimal;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::db::migration::validate_fee_rates;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::db::open_manual_write_database;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
+
+fn validate_fee_rates(
+    buy_fee_rate: Decimal,
+    sell_fee_rate: Decimal,
+    sell_transaction_tax_rate: Decimal,
+) -> AppResult<()> {
+    let zero = Decimal::ZERO;
+    let one = Decimal::ONE;
+    if buy_fee_rate < zero || buy_fee_rate >= one {
+        return Err(AppError::Validation(
+            "買入手續費率必須介於 0 與 1 之間".to_string(),
+        ));
+    }
+    if sell_fee_rate < zero || sell_fee_rate >= one {
+        return Err(AppError::Validation(
+            "賣出手續費率必須介於 0 與 1 之間".to_string(),
+        ));
+    }
+    if sell_transaction_tax_rate < zero || sell_transaction_tax_rate >= one {
+        return Err(AppError::Validation(
+            "賣出交易稅率必須介於 0 與 1 之間".to_string(),
+        ));
+    }
+    if sell_fee_rate + sell_transaction_tax_rate >= one {
+        return Err(AppError::Validation(
+            "賣出手續費率與交易稅率合計必須小於 1".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CurrentHoldingUpdateInput {
@@ -895,7 +923,6 @@ mod tests {
         DividendAssumptionInput,
     };
     #[cfg(not(target_arch = "wasm32"))]
-    use crate::db::migration::migrate;
     use crate::error::AppError;
 
     fn sample_input() -> CurrentHoldingUpdateInput {
@@ -930,13 +957,11 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn migration_normalizes_symbols_and_shares_dividend_assumptions_by_product() {
+    fn baseline_shares_dividend_assumptions_by_product() {
         let temp_dir = tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("data.sqlite");
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
-        let mut connection = Connection::open(&database_path).expect("open temp db");
-
-        migrate(&mut connection).expect("migrate seed database");
+        let connection = Connection::open(&database_path).expect("open temp db");
 
         let symbol: String = connection
             .query_row(
@@ -1090,7 +1115,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1136,7 +1160,7 @@ mod tests {
                 r#"
                 SELECT payments_per_year, latest_dividend_per_unit_text, estimated_annual_dividend_per_unit_text
                 FROM dividend_assumption
-                WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-03-01' AND origin = 'MANUAL'
+                WHERE instrument_id = ?2 AND effective_date = '2099-03-01' AND origin = 'MANUAL'
                 ORDER BY assumption_id DESC
                 LIMIT 1
                 "#,
@@ -1158,7 +1182,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1175,7 +1198,7 @@ mod tests {
 
         let before_row_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2",
+                "SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2",
                 params![account_id, instrument_id],
                 |row| row.get(0),
             )
@@ -1208,7 +1231,7 @@ mod tests {
 
         let row_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2",
+                "SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2",
                 params![account_id, instrument_id],
                 |row| row.get(0),
             )
@@ -1240,7 +1263,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1298,7 +1320,7 @@ mod tests {
 
         let assumption_row_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-01-01'",
+                "SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-01-01'",
                 params![account_id, instrument_id],
                 |row| row.get(0),
             )
@@ -1328,7 +1350,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1383,8 +1404,8 @@ mod tests {
             .execute(
                 r#"
                 INSERT INTO dividend_assumption (
-                    account_id, instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin
-                ) VALUES (?1, ?2, ?3, '9.9', ?4, 'EXCEL_IMPORT')
+                    instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin
+                ) VALUES (?2, ?3, '9.9', ?4, 'EXCEL_IMPORT')
                 "#,
                 params![account_id, instrument_id, input.as_of_date, currency_code],
             )
@@ -1420,7 +1441,7 @@ mod tests {
                 SELECT
                     (SELECT quantity_text FROM holding_snapshot WHERE account_id = ?1 AND instrument_id = ?2 AND snapshot_date = '2099-01-02' AND origin = 'MANUAL' ORDER BY holding_snapshot_id DESC LIMIT 1),
                     (SELECT price_text FROM instrument_price WHERE instrument_id = ?2 AND price_date = '2099-01-02' AND origin = 'MANUAL' ORDER BY price_id DESC LIMIT 1),
-                    (SELECT estimated_annual_dividend_per_unit_text FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-01-02' AND origin = 'MANUAL' ORDER BY assumption_id DESC LIMIT 1)
+                    (SELECT estimated_annual_dividend_per_unit_text FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-01-02' AND origin = 'MANUAL' ORDER BY assumption_id DESC LIMIT 1)
                 "#,
                 params![account_id, instrument_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1440,7 +1461,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1469,10 +1489,10 @@ mod tests {
             .execute(
                 r#"
                 INSERT INTO dividend_assumption (
-                    account_id, instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin, source_row
-                ) VALUES (?1, ?2, '2099-01-03', '1.1', ?3, 'EXCEL_IMPORT', 1)
+                    instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin, source_row
+                ) VALUES (?1, '2099-01-03', '1.1', ?2, 'EXCEL_IMPORT', 1)
                 "#,
-                params![account_id, instrument_id, currency_code],
+                params![instrument_id, currency_code],
             )
             .expect("seed import assumption");
 
@@ -1511,8 +1531,8 @@ mod tests {
             .query_row(
                 r#"
                 SELECT
-                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-01-03' AND origin = 'EXCEL_IMPORT'),
-                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-01-03' AND origin = 'MANUAL')
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-01-03' AND origin = 'EXCEL_IMPORT'),
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-01-03' AND origin = 'MANUAL')
                 "#,
                 params![account_id, instrument_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1530,7 +1550,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1554,7 +1573,7 @@ mod tests {
             .expect("count price rows before save");
         let before_dividend_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-02-01'",
+                "SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-02-01'",
                 params![account_id, instrument_id],
                 |row| row.get(0),
             )
@@ -1605,7 +1624,7 @@ mod tests {
             .expect("count price rows after save");
         let after_dividend_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-02-01'",
+                "SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-02-01'",
                 params![account_id, instrument_id],
                 |row| row.get(0),
             )
@@ -1647,7 +1666,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1666,10 +1684,10 @@ mod tests {
             .execute(
                 r#"
                 INSERT INTO dividend_assumption (
-                    account_id, instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin, source_row
-                ) VALUES (?1, ?2, '2099-02-02', '1.1', ?3, 'EXCEL_IMPORT', 1)
+                    instrument_id, effective_date, estimated_annual_dividend_per_unit_text, currency_code, origin, source_row
+                ) VALUES (?1, '2099-02-02', '1.1', ?2, 'EXCEL_IMPORT', 1)
                 "#,
-                params![account_id, instrument_id, currency_code],
+                params![instrument_id, currency_code],
             )
             .expect("seed import assumption");
 
@@ -1690,8 +1708,8 @@ mod tests {
             .query_row(
                 r#"
                 SELECT
-                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-02-02' AND origin = 'EXCEL_IMPORT'),
-                    (SELECT COUNT(*) FROM dividend_assumption WHERE account_id = ?1 AND instrument_id = ?2 AND effective_date = '2099-02-02' AND origin = 'MANUAL')
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-02-02' AND origin = 'EXCEL_IMPORT'),
+                    (SELECT COUNT(*) FROM dividend_assumption WHERE instrument_id = ?2 AND effective_date = '2099-02-02' AND origin = 'MANUAL')
                 "#,
                 params![account_id, instrument_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1709,7 +1727,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code): (i64, i64, String) = connection
             .query_row(
@@ -1798,7 +1815,6 @@ mod tests {
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
 
         let mut connection = Connection::open(&database_path).expect("open temp db");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (account_id, instrument_id, currency_code, latest_date): (i64, i64, String, String) =
             connection

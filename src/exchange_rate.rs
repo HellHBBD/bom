@@ -231,7 +231,6 @@ mod tests {
     use super::upsert_manual_exchange_rate_with_connection;
     use super::{validate_exchange_rate_input, ExchangeRateInput};
     #[cfg(not(target_arch = "wasm32"))]
-    use crate::db::migration::migrate;
     use crate::error::AppError;
 
     fn sample_input() -> ExchangeRateInput {
@@ -291,7 +290,6 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .expect("fk on");
-        migrate(&mut connection).expect("migrate temp db");
 
         upsert_manual_exchange_rate_with_connection(&mut connection, sample_input())
             .expect("first insert");
@@ -334,7 +332,6 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .expect("fk on");
-        migrate(&mut connection).expect("migrate temp db");
 
         connection.execute(
             r#"

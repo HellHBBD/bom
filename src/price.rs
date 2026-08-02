@@ -294,7 +294,6 @@ mod tests {
     use super::upsert_manual_prices_batch_with_connection;
     use super::{validate_batch_prices, BatchPriceInput, BatchPriceRowInput};
     #[cfg(not(target_arch = "wasm32"))]
-    use crate::db::migration::migrate;
     use crate::error::AppError;
 
     fn sample_batch_input() -> BatchPriceInput {
@@ -384,7 +383,6 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .expect("enable foreign keys");
-        migrate(&mut connection).expect("migrate temp db");
 
         let instrument_rows: Vec<(i64, String, String, String)> = {
             let mut statement = connection
@@ -451,7 +449,6 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .expect("enable foreign keys");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (instrument_id, symbol, instrument_name, currency_code): (i64, String, String, String) = connection
             .query_row(
@@ -514,7 +511,6 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .expect("enable foreign keys");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (instrument_id, symbol, instrument_name, currency_code): (i64, String, String, String) = connection
             .query_row(
@@ -569,7 +565,6 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .expect("enable foreign keys");
-        migrate(&mut connection).expect("migrate temp db");
 
         let (instrument_id, symbol, instrument_name, currency_code): (i64, String, String, String) = connection
             .query_row(
