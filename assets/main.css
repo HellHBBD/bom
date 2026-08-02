@@ -527,7 +527,7 @@ a {
 }
 
 .table-card {
-    overflow: hidden;
+    overflow: visible;
 }
 
 .table-summary {
