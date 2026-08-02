@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use crate::decimal::{normalize_decimal_text, parse_decimal_field};
 use crate::error::{AppError, AppResult};
 
-const LATEST_VERSION: i64 = 12;
+const LATEST_VERSION: i64 = 13;
 const MANUAL_WRITES_SQL: &str = include_str!("migrations/001_manual_writes.sql");
 const PRODUCT_LEVEL_MARKET_DATA_SQL: &str =
     include_str!("migrations/002_product_level_market_data.sql");
@@ -27,6 +27,8 @@ const INSTRUMENT_SYMBOL_IDENTITY_SQL: &str =
     include_str!("migrations/011_instrument_symbol_identity.sql");
 const PRODUCT_LEVEL_DIVIDEND_ASSUMPTION_SQL: &str =
     include_str!("migrations/012_product_level_dividend_assumption.sql");
+const CLEANUP_DUPLICATE_ACCOUNTS_SQL: &str =
+    include_str!("migrations/013_cleanup_duplicate_accounts.sql");
 const LEGACY_BUY_FEE_RATE: Decimal = Decimal::from_parts(1425, 0, 0, false, 6);
 const DIVIDEND_RECEIPT_AMOUNT_VIEW_SQL: &str = r#"
 CREATE VIEW IF NOT EXISTS v_dividend_receipt_amount AS
@@ -285,6 +287,12 @@ pub fn migrate(connection: &mut Connection) -> AppResult<()> {
     if version < 12 {
         transaction.execute_batch(PRODUCT_LEVEL_DIVIDEND_ASSUMPTION_SQL)?;
         transaction.pragma_update(None, "user_version", 12_i64)?;
+        version = 12;
+    }
+
+    if version < 13 {
+        transaction.execute_batch(CLEANUP_DUPLICATE_ACCOUNTS_SQL)?;
+        transaction.pragma_update(None, "user_version", 13_i64)?;
     }
 
     validate_manual_write_schema(&transaction)?;
@@ -1135,6 +1143,84 @@ mod tests {
     use super::{
         column_exists, current_version, migrate, table_exists, validate_fee_rates, AppError,
     };
+
+    #[test]
+    fn cleanup_duplicate_accounts_removes_dbs_and_reassigns_post_accounts() {
+        let connection = Connection::open_in_memory().expect("open test db");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE institution (institution_id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE account (account_id INTEGER PRIMARY KEY, institution_id INTEGER);
+                CREATE TABLE account_owner (account_id INTEGER NOT NULL, person_id INTEGER NOT NULL);
+                CREATE TABLE account_asset_snapshot (
+                    snapshot_id INTEGER PRIMARY KEY,
+                    account_id INTEGER NOT NULL,
+                    asset_type TEXT NOT NULL
+                );
+
+                INSERT INTO institution (institution_id, name) VALUES
+                    (8, '星展-台幣定存'),
+                    (9, '星展-美金定存'),
+                    (10, '星展-活儲(薪資)'),
+                    (11, '星展-活儲'),
+                    (12, '星展-外幣活存'),
+                    (16, '郵局');
+                INSERT INTO account (account_id, institution_id) VALUES
+                    (15, 8), (16, 9), (17, 10), (18, 11), (19, 12),
+                    (27, 16), (29, 16), (30, 16), (34, 16), (36, 16);
+                INSERT INTO account_owner (account_id, person_id) VALUES
+                    (15, 1), (16, 1), (17, 1), (18, 1), (19, 1),
+                    (27, 2), (29, 2), (30, 3), (34, 3), (36, 3);
+                INSERT INTO account_asset_snapshot (snapshot_id, account_id, asset_type) VALUES
+                    (1, 15, 'TIME_DEPOSIT'),
+                    (2, 29, 'TIME_DEPOSIT'),
+                    (3, 34, 'DEMAND_DEPOSIT'),
+                    (4, 36, 'TIME_DEPOSIT');
+                "#,
+            )
+            .expect("seed cleanup data");
+
+        connection
+            .execute_batch(super::CLEANUP_DUPLICATE_ACCOUNTS_SQL)
+            .expect("cleanup succeeds");
+
+        let remaining_accounts: Vec<i64> = connection
+            .prepare("SELECT account_id FROM account ORDER BY account_id")
+            .expect("prepare accounts")
+            .query_map([], |row| row.get(0))
+            .expect("query accounts")
+            .collect::<Result<_, _>>()
+            .expect("collect accounts");
+        assert_eq!(remaining_accounts, vec![27, 30]);
+
+        let snapshots: Vec<(i64, String)> = connection
+            .prepare(
+                "SELECT account_id, asset_type FROM account_asset_snapshot ORDER BY snapshot_id",
+            )
+            .expect("prepare snapshots")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query snapshots")
+            .collect::<Result<_, _>>()
+            .expect("collect snapshots");
+        assert_eq!(
+            snapshots,
+            vec![
+                (27, "TIME_DEPOSIT".to_string()),
+                (30, "DEMAND_DEPOSIT".to_string()),
+                (30, "TIME_DEPOSIT".to_string()),
+            ]
+        );
+
+        let remaining_institutions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM institution WHERE institution_id BETWEEN 8 AND 12",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count DBS institutions");
+        assert_eq!(remaining_institutions, 0);
+    }
 
     #[test]
     fn migrates_old_schema_to_latest_version() {

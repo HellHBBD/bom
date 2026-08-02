@@ -98,7 +98,10 @@ fn load_dividend_receipts_native() -> SqlResult<Vec<DividendReceiptRow>> {
             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(p.display_name, '未指定')), '未指定') AS owner_name,
             COALESCE(a.display_name, '帳戶 #' || r.account_id) AS account_name,
             a.account_number,
-            COALESCE(i.symbol, '-') AS symbol,
+            CASE
+                WHEN i.instrument_type = 'FUND' AND NULLIF(TRIM(i.symbol), '') IS NULL THEN '基金'
+                ELSE COALESCE(i.symbol, '-')
+            END AS symbol,
             COALESCE(i.name, '未命名商品') AS instrument_name,
             COALESCE(r.received_on, '-') AS received_on,
             r.gross_amount_text,
@@ -172,7 +175,10 @@ fn load_dividend_receipt_form_options_native() -> SqlResult<DividendReceiptFormO
         r#"
         SELECT
             instrument_id,
-            COALESCE(symbol, '-') AS symbol,
+            CASE
+                WHEN instrument_type = 'FUND' AND NULLIF(TRIM(symbol), '') IS NULL THEN '基金'
+                ELSE COALESCE(symbol, '-')
+            END AS symbol,
             COALESCE(name, '未命名商品') AS instrument_name,
             COALESCE(trading_currency_code, 'NTD') AS currency_code
         FROM instrument
@@ -222,7 +228,10 @@ fn load_legacy_dividend_summaries(
         r#"
         SELECT
             COALESCE(p.display_name, '未指定') AS owner_name,
-            COALESCE(i.symbol, '-') AS symbol,
+            CASE
+                WHEN i.instrument_type = 'FUND' AND NULLIF(TRIM(i.symbol), '') IS NULL THEN '基金'
+                ELSE COALESCE(i.symbol, '-')
+            END AS symbol,
             COALESCE(i.name, '未命名商品') AS instrument_name,
             s.period_label,
             s.amount_text,
@@ -265,7 +274,10 @@ fn load_legacy_dividend_monthly(
         r#"
         SELECT
             COALESCE(p.display_name, '未指定') AS owner_name,
-            COALESCE(i.symbol, '-') AS symbol,
+            CASE
+                WHEN i.instrument_type = 'FUND' AND NULLIF(TRIM(i.symbol), '') IS NULL THEN '基金'
+                ELSE COALESCE(i.symbol, '-')
+            END AS symbol,
             COALESCE(i.name, '未命名商品') AS instrument_name,
             m.series_type,
             m.month_num,
@@ -586,7 +598,10 @@ fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
             COALESCE(h.owner_name, '未指定') AS owner_name,
             COALESCE(a.display_name, '帳戶 #' || h.account_id) AS account_name,
             a.account_number,
-            COALESCE(h.symbol, '-') AS symbol,
+            CASE
+                WHEN h.instrument_type = 'FUND' AND NULLIF(TRIM(h.symbol), '') IS NULL THEN '基金'
+                ELSE COALESCE(h.symbol, '-')
+            END AS symbol,
             COALESCE(h.instrument_name, '未命名商品') AS instrument_name,
             COALESCE(h.instrument_type, 'UNKNOWN') AS instrument_type,
             COALESCE(h.asset_class, 'UNKNOWN') AS asset_class,
