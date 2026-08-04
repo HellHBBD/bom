@@ -12,9 +12,9 @@ use crate::db::backup::backup_for_today;
 use crate::error::{AppError, AppResult};
 use crate::format::account_name;
 use crate::models::{
-    AccountAsset, DashboardSummary, DividendReceiptAccountOption, DividendReceiptFormOptions,
-    DividendReceiptInstrumentOption, DividendReceiptRow, ExchangeRatePreview, ExchangeRateRow,
-    HoldingMetric, LegacyDividendData,
+    AccountAsset, AnnualDividendRow, DashboardSummary, DividendReceiptAccountOption,
+    DividendReceiptFormOptions, DividendReceiptInstrumentOption, DividendReceiptRow,
+    ExchangeRatePreview, ExchangeRateRow, HoldingMetric, LegacyDividendData,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -48,6 +48,31 @@ pub fn load_dividend_receipts() -> Result<Vec<DividendReceiptRow>, String> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_dividend_receipt_form_options() -> Result<DividendReceiptFormOptions, String> {
     load_dividend_receipt_form_options_native().map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_annual_dividends(instrument_id: i64) -> Result<Vec<AnnualDividendRow>, String> {
+    let connection = open_database().map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT dividend_year, annual_dividend_per_unit_text, currency_code, COALESCE(note, '') FROM instrument_annual_dividend WHERE instrument_id=?1 ORDER BY dividend_year DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([instrument_id], |row| {
+            Ok(AnnualDividendRow {
+                dividend_year: row.get(0)?,
+                annual_dividend_per_unit_text: row.get(1)?,
+                currency_code: row.get(2)?,
+                note: row.get(3)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_annual_dividends(_instrument_id: i64) -> Result<Vec<AnnualDividendRow>, String> {
+    Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -509,9 +534,7 @@ pub fn load_applicable_exchange_rate(
             WHERE base_currency_code = ?1
               AND quote_currency_code = 'NTD'
               AND rate_date <= ?2
-            ORDER BY rate_date DESC,
-                     CASE origin WHEN 'MANUAL' THEN 0 ELSE 1 END,
-                     exchange_rate_id DESC
+            ORDER BY rate_date DESC, exchange_rate_id DESC
             LIMIT 1
             "#,
             rusqlite::params![currency_code, snapshot_date],
@@ -540,14 +563,12 @@ pub fn load_recent_exchange_rates(limit: usize) -> Result<Vec<ExchangeRateRow>, 
                 base_currency_code,
                 quote_currency_code,
                 rate_text,
-                origin,
                 COALESCE(note, '') AS note
             FROM exchange_rate
             ORDER BY rate_date DESC,
-                     base_currency_code ASC,
-                     quote_currency_code ASC,
-                     CASE origin WHEN 'MANUAL' THEN 0 ELSE 1 END,
-                     exchange_rate_id DESC
+                      base_currency_code ASC,
+                      quote_currency_code ASC,
+                      exchange_rate_id DESC
             LIMIT ?1
             "#,
         )
@@ -561,8 +582,7 @@ pub fn load_recent_exchange_rates(limit: usize) -> Result<Vec<ExchangeRateRow>, 
                 base_currency_code: row.get(2)?,
                 quote_currency_code: row.get(3)?,
                 rate_text: row.get(4)?,
-                origin: row.get(5)?,
-                note: row.get(6)?,
+                note: row.get(5)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -695,21 +715,41 @@ fn validate_baseline_database(
         )));
     }
 
-    for object_name in [
-        "account",
-        "account_asset_snapshot",
-        "holding_snapshot",
-        "instrument",
-        "instrument_price",
-        "dividend_assumption",
-        "ui_preference",
-        "v_account_asset_value",
-        "v_holding_metrics",
+    let integrity_check: String =
+        connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity_check != "ok" {
+        return Err(AppError::Validation(format!(
+            "資料庫完整性檢查失敗。請關閉應用程式後刪除資料夾：{reset_directory}，再重新啟動應用程式"
+        )));
+    }
+    if connection.prepare("PRAGMA foreign_key_check")?.exists([])? {
+        return Err(AppError::Validation(format!(
+            "資料庫外鍵檢查失敗。請關閉應用程式後刪除資料夾：{reset_directory}，再重新啟動應用程式"
+        )));
+    }
+
+    for (object_name, object_type) in [
+        ("account", "table"),
+        ("account_asset_snapshot", "table"),
+        ("holding_snapshot", "table"),
+        ("instrument", "table"),
+        ("instrument_annual_dividend", "table"),
+        ("instrument_price", "table"),
+        ("dividend_assumption", "table"),
+        ("ui_preference", "table"),
+        ("v_account_asset_value", "view"),
+        ("v_holding_metrics", "view"),
+        ("uq_account_institution_number", "index"),
+        ("uq_account_asset_snapshot_origin", "index"),
+        ("validate_holding_snapshot_quantity_insert", "trigger"),
+        ("validate_holding_snapshot_quantity_update", "trigger"),
     ] {
-        if connection
-            .prepare(&format!("SELECT 1 FROM {object_name} LIMIT 0"))
-            .is_err()
-        {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1 AND type = ?2)",
+            [object_name, object_type],
+            |row| row.get(0),
+        )?;
+        if !exists {
             return Err(AppError::Validation(format!(
                 "資料庫缺少 baseline v{BASELINE_DATABASE_VERSION} 的必要結構。請關閉應用程式後刪除資料夾：{reset_directory}，再重新啟動應用程式"
             )));

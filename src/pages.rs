@@ -8,29 +8,32 @@ use crate::account_asset::{
     asset_type_label, is_foreign_currency_asset, validate_account_asset_input, AccountAssetInput,
 };
 use crate::db::{
-    load_account_assets, load_applicable_exchange_rate, load_dashboard_summary,
-    load_dividend_receipt_form_options, load_dividend_receipts, load_holding_metrics,
-    load_legacy_dividends, load_recent_exchange_rates,
+    load_account_assets, load_annual_dividends, load_applicable_exchange_rate,
+    load_dashboard_summary, load_dividend_receipt_form_options, load_dividend_receipts,
+    load_holding_metrics, load_legacy_dividends, load_recent_exchange_rates,
 };
 use crate::dividend_receipt::{
     delete_manual_dividend_receipt, update_manual_dividend_receipt, DividendReceiptDeleteInput,
     DividendReceiptUpdateInput,
 };
 use crate::dividend_receipt::{insert_manual_dividend_receipt, DividendReceiptInput};
-use crate::exchange_rate::{upsert_manual_exchange_rate, ExchangeRateInput};
+use crate::exchange_rate::{
+    create_exchange_rate, delete_exchange_rate, update_exchange_rate, ExchangeRateInput,
+};
 use crate::format::{decimal, money, percent};
 use crate::holding::{
-    save_current_holding_state, save_dividend_assumption, CurrentHoldingStateInput,
-    DividendAssumptionInput,
+    delete_annual_dividend, save_current_holding_state, save_dividend_assumption,
+    upsert_annual_dividend, AnnualDividendInput, CurrentHoldingStateInput, DividendAssumptionInput,
 };
 use crate::master_data::{
     create_manual_account, create_manual_instrument, load_institution_options, AccountCreateInput,
     InstitutionOption, InstrumentCreateInput,
 };
 use crate::models::{
-    AccountAsset, DashboardSummary, DividendReceiptAccountOption, DividendReceiptFormOptions,
-    DividendReceiptInstrumentOption, DividendReceiptRow, ExchangeRateRow, HoldingMetric,
-    LegacyDividendData, LegacyDividendMonthlyRow, LegacyDividendSummaryRow,
+    AccountAsset, AnnualDividendRow, DashboardSummary, DividendReceiptAccountOption,
+    DividendReceiptFormOptions, DividendReceiptInstrumentOption, DividendReceiptRow,
+    ExchangeRateRow, HoldingMetric, LegacyDividendData, LegacyDividendMonthlyRow,
+    LegacyDividendSummaryRow,
 };
 use crate::price::{upsert_manual_prices_batch, BatchPriceInput, BatchPriceRowInput};
 use crate::ui_preference::{
@@ -681,6 +684,8 @@ pub fn ExchangeRatePage() -> Element {
     let mut rate_date = use_signal(|| today);
     let mut rate = use_signal(String::new);
     let mut note = use_signal(String::new);
+    let mut editing_rate = use_signal(|| None::<ExchangeRateRow>);
+    let mut deleting_rate = use_signal(|| None::<ExchangeRateRow>);
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
     let mut success_message = use_signal(String::new);
@@ -758,6 +763,19 @@ pub fn ExchangeRatePage() -> Element {
                 }
             }
             div { class: "modal-actions",
+                if editing_rate().is_some() {
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            editing_rate.set(None);
+                            rate.set(String::new());
+                            note.set(String::new());
+                        },
+                        "取消編輯"
+                    }
+                }
                 button {
                     r#type: "button",
                     class: "ghost-button",
@@ -796,9 +814,15 @@ pub fn ExchangeRatePage() -> Element {
                         let mut data_version = data_version;
 
                         spawn(async move {
-                            match run_exchange_rate_save(input).await {
+                            let result = if let Some(editing_rate) = editing_rate() {
+                                run_exchange_rate_update(editing_rate.exchange_rate_id, input).await
+                            } else {
+                                run_exchange_rate_create(input).await
+                            };
+                            match result {
                                 Ok(()) => {
                                     success_message.set("匯率已儲存".to_string());
+                                    editing_rate.set(None);
                                     data_version.with_mut(|value| *value += 1);
                                 }
                                 Err(error) => error_message.set(error.to_string()),
@@ -807,7 +831,7 @@ pub fn ExchangeRatePage() -> Element {
                             is_saving.set(false);
                         });
                     },
-                    if is_saving() { "儲存中..." } else { "儲存匯率" }
+                    if is_saving() { "儲存中..." } else if editing_rate().is_some() { "儲存修改" } else { "新增匯率" }
                 }
             }
         }
@@ -816,13 +840,72 @@ pub fn ExchangeRatePage() -> Element {
             None => rsx! { StatusCard { text: "載入最近匯率中...".to_string() } },
             Some(Err(error)) => rsx! { StatusCard { text: format!("讀取最近匯率失敗：{error}") } },
             Some(Ok(rows)) if rows.is_empty() => rsx! { StatusCard { text: "目前沒有匯率資料。".to_string() } },
-            Some(Ok(rows)) => rsx! { ExchangeRateTable { rows } },
+            Some(Ok(rows)) => rsx! {
+                ExchangeRateTable {
+                    rows,
+                    on_edit: move |row: ExchangeRateRow| {
+                        base_currency_code.set(row.base_currency_code.clone());
+                        rate_date.set(row.rate_date.clone());
+                        rate.set(row.rate_text.clone());
+                        note.set(row.note.clone());
+                        editing_rate.set(Some(row));
+                    },
+                    on_delete: move |row: ExchangeRateRow| deleting_rate.set(Some(row)),
+                }
+            },
+        }
+        if let Some(row) = deleting_rate() {
+            div { class: "delete-confirmation",
+                p { "確定刪除 {row.rate_date} {row.base_currency_code}/NTD 匯率嗎？" }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: is_saving(),
+                        onclick: move |_| deleting_rate.set(None),
+                        "取消"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "danger-button",
+                        disabled: is_saving(),
+                        onclick: move |_| {
+                            if is_saving() {
+                                return;
+                            }
+                            is_saving.set(true);
+                            let exchange_rate_id = row.exchange_rate_id;
+                            let mut is_saving = is_saving;
+                            let mut error_message = error_message;
+                            let mut success_message = success_message;
+                            let mut deleting_rate = deleting_rate;
+                            let mut data_version = data_version;
+                            spawn(async move {
+                                match run_exchange_rate_delete(exchange_rate_id).await {
+                                    Ok(()) => {
+                                        success_message.set("匯率已刪除".to_string());
+                                        deleting_rate.set(None);
+                                        data_version.with_mut(|value| *value += 1);
+                                    }
+                                    Err(error) => error_message.set(error.to_string()),
+                                }
+                                is_saving.set(false);
+                            });
+                        },
+                        "確認刪除"
+                    }
+                }
+            }
         }
     }
 }
 
 #[component]
-fn ExchangeRateTable(rows: Vec<ExchangeRateRow>) -> Element {
+fn ExchangeRateTable(
+    rows: Vec<ExchangeRateRow>,
+    on_edit: EventHandler<ExchangeRateRow>,
+    on_delete: EventHandler<ExchangeRateRow>,
+) -> Element {
     rsx! {
         section { class: "card table-card",
             div { class: "table-summary",
@@ -837,22 +920,49 @@ fn ExchangeRateTable(rows: Vec<ExchangeRateRow>) -> Element {
                             th { "來源幣別" }
                             th { "目標幣別" }
                             th { "匯率" }
-                            th { "來源" }
                             th { "備註" }
+                            th { "操作" }
                         }
                     }
                     tbody {
                         for row in rows {
-                            tr {
-                                td { class: "mono", "{row.rate_date}" }
-                                td { class: "mono", "{row.base_currency_code}" }
-                                td { class: "mono", "{row.quote_currency_code}" }
-                                td { class: "number", "{row.rate_text}" }
-                                td { "{row.origin}" }
-                                td { "{row.note}" }
-                            }
+                            ExchangeRateRowView { row, on_edit, on_delete }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ExchangeRateRowView(
+    row: ExchangeRateRow,
+    on_edit: EventHandler<ExchangeRateRow>,
+    on_delete: EventHandler<ExchangeRateRow>,
+) -> Element {
+    let edit_row = row.clone();
+    let delete_row = row.clone();
+
+    rsx! {
+        tr {
+            td { class: "mono", "{row.rate_date}" }
+            td { class: "mono", "{row.base_currency_code}" }
+            td { class: "mono", "{row.quote_currency_code}" }
+            td { class: "number", "{row.rate_text}" }
+            td { "{row.note}" }
+            td {
+                button {
+                    r#type: "button",
+                    class: "inline-action",
+                    onclick: move |_| on_edit.call(edit_row.clone()),
+                    "編輯"
+                }
+                button {
+                    r#type: "button",
+                    class: "inline-action danger-button",
+                    onclick: move |_| on_delete.call(delete_row.clone()),
+                    "刪除"
                 }
             }
         }
@@ -1755,7 +1865,7 @@ fn AccountCreateModal(
                             oninput: move |event| account_number.set(event.value()),
                             disabled: interaction_locked,
                             inputmode: "numeric",
-                            placeholder: "完整帳戶號碼（選填）",
+                            placeholder: "完整帳戶號碼",
                         }
                     }
                     div { class: "form-field full-width",
@@ -3092,15 +3202,45 @@ async fn run_batch_price_save(input: BatchPriceInput) -> Result<usize, crate::er
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn run_exchange_rate_save(input: ExchangeRateInput) -> Result<(), crate::error::AppError> {
-    tokio::task::spawn_blocking(move || upsert_manual_exchange_rate(input))
+async fn run_exchange_rate_create(input: ExchangeRateInput) -> Result<(), crate::error::AppError> {
+    tokio::task::spawn_blocking(move || create_exchange_rate(input))
         .await
         .map_err(|error| crate::error::AppError::Validation(format!("匯率儲存工作失敗：{error}")))?
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn run_exchange_rate_save(input: ExchangeRateInput) -> Result<(), crate::error::AppError> {
-    upsert_manual_exchange_rate(input)
+async fn run_exchange_rate_create(input: ExchangeRateInput) -> Result<(), crate::error::AppError> {
+    create_exchange_rate(input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_exchange_rate_update(
+    exchange_rate_id: i64,
+    input: ExchangeRateInput,
+) -> Result<(), crate::error::AppError> {
+    tokio::task::spawn_blocking(move || update_exchange_rate(exchange_rate_id, input))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("匯率更新工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_exchange_rate_update(
+    exchange_rate_id: i64,
+    input: ExchangeRateInput,
+) -> Result<(), crate::error::AppError> {
+    update_exchange_rate(exchange_rate_id, input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_exchange_rate_delete(exchange_rate_id: i64) -> Result<(), crate::error::AppError> {
+    tokio::task::spawn_blocking(move || delete_exchange_rate(exchange_rate_id))
+        .await
+        .map_err(|error| crate::error::AppError::Validation(format!("匯率刪除工作失敗：{error}")))?
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_exchange_rate_delete(exchange_rate_id: i64) -> Result<(), crate::error::AppError> {
+    delete_exchange_rate(exchange_rate_id)
 }
 
 fn build_quick_price_update_rows(rows: &[HoldingMetric]) -> Vec<QuickPriceUpdateRow> {
@@ -4579,7 +4719,19 @@ fn HoldingDividendAssumptionModal(
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
     let mut confirm_close = use_signal(|| false);
+    let annual_history = use_resource(move || {
+        let _ = data_version();
+        async move { load_annual_dividends(row.instrument_id) }
+    });
     let interaction_locked = is_saving();
+    let annual_dividend_average = annual_history()
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .filter(|rows| !rows.is_empty())
+        .and_then(|rows| annual_dividend_average_text(rows));
+    let uses_annual_dividend_history = annual_dividend_average.is_some();
+    let displayed_annual_dividend =
+        annual_dividend_average.unwrap_or_else(|| estimated_annual_dividend_per_unit());
     let is_dirty = HoldingDividendAssumptionForm {
         effective_date: effective_date(),
         payments_per_year: payments_per_year(),
@@ -4649,12 +4801,20 @@ fn HoldingDividendAssumptionModal(
                     label { class: "form-field",
                         span { "預估每單位年配息" }
                         input {
-                            value: "{estimated_annual_dividend_per_unit}",
+                            value: "{displayed_annual_dividend}",
                             oninput: move |event| estimated_annual_dividend_per_unit.set(event.value()),
-                            disabled: interaction_locked,
+                            disabled: interaction_locked || uses_annual_dividend_history,
                             placeholder: "0",
                         }
+                        if uses_annual_dividend_history {
+                            small { class: "muted", "依最近三個有資料年度的平均自動計算" }
+                        }
                     }
+                }
+                AnnualDividendPanel {
+                    instrument_id: row.instrument_id,
+                    currency_code: dividend_currency_code.clone(),
+                    data_version,
                 }
                 div { class: "modal-actions",
                     button {
@@ -4683,7 +4843,8 @@ fn HoldingDividendAssumptionModal(
 
                             let has_values = !payments_per_year().trim().is_empty()
                                 || !latest_dividend_per_unit().trim().is_empty()
-                                || !estimated_annual_dividend_per_unit().trim().is_empty();
+                                || (!uses_annual_dividend_history
+                                    && !estimated_annual_dividend_per_unit().trim().is_empty());
                             if row.dividend_effective_date.is_none() && !has_values {
                                 error_message.set("請至少輸入一項配息估計資料".to_string());
                                 is_saving.set(false);
@@ -4746,6 +4907,171 @@ fn HoldingDividendAssumptionModal(
                 }
             }
         }
+    }
+}
+
+#[component]
+fn AnnualDividendPanel(
+    instrument_id: i64,
+    currency_code: String,
+    mut data_version: Signal<u64>,
+) -> Element {
+    let annual_history = use_resource(move || {
+        let _ = data_version();
+        async move { load_annual_dividends(instrument_id) }
+    });
+    let mut dividend_year = use_signal(String::new);
+    let mut annual_amount = use_signal(String::new);
+    let mut note = use_signal(String::new);
+    let mut error_message = use_signal(String::new);
+    let mut confirm_delete_year = use_signal(|| None::<i64>);
+
+    rsx! {
+        section { class: "card",
+            h3 { "年度每單位配息" }
+            p { class: "muted", "有年度資料時，預估年配息會自動採用最近三個有資料年度的平均。" }
+            div { class: "form-grid two-column",
+                label { class: "form-field",
+                    span { "年度" }
+                    input { value: "{dividend_year}", oninput: move |event| dividend_year.set(event.value()), placeholder: "2026" }
+                }
+                label { class: "form-field",
+                    span { "每單位全年配息" }
+                    input { value: "{annual_amount}", oninput: move |event| annual_amount.set(event.value()), placeholder: "0" }
+                }
+                label { class: "form-field full-width",
+                    span { "備註" }
+                    input { value: "{note}", oninput: move |event| note.set(event.value()), placeholder: "選填" }
+                }
+            }
+            if !error_message().is_empty() {
+                div { class: "status-message error", "{error_message}" }
+            }
+            button {
+                r#type: "button",
+                class: "primary-button",
+                onclick: move |_| match upsert_annual_dividend(AnnualDividendInput {
+                    instrument_id,
+                    dividend_year_text: dividend_year(),
+                    annual_dividend_per_unit_text: annual_amount(),
+                    currency_code: currency_code.clone(),
+                    note: note(),
+                }) {
+                    Ok(()) => {
+                        annual_amount.set(String::new());
+                        note.set(String::new());
+                        error_message.set(String::new());
+                        data_version.with_mut(|value| *value += 1);
+                    }
+                    Err(error) => error_message.set(error.to_string()),
+                },
+                "儲存年度配息"
+            }
+            match annual_history() {
+                Some(Ok(rows)) if rows.is_empty() => rsx! { p { class: "muted", "尚無年度配息資料，暫時使用既有預估。" } },
+                Some(Ok(rows)) => rsx! { table {
+                    thead { tr { th { "年度" } th { "每單位配息" } th { "幣別" } th { "備註" } th { "操作" } } }
+                    tbody { for annual in rows {
+                        tr {
+                            key: "{annual.dividend_year}",
+                            td { "{annual.dividend_year}" }
+                            td { class: "number", "{annual.annual_dividend_per_unit_text}" }
+                            td { class: "mono", "{annual.currency_code}" }
+                            td { "{annual.note}" }
+                            td { button {
+                                r#type: "button",
+                                class: "inline-action",
+                                onclick: move |_| {
+                                    dividend_year.set(annual.dividend_year.to_string());
+                                    annual_amount.set(annual.annual_dividend_per_unit_text.clone());
+                                    note.set(annual.note.clone());
+                                    error_message.set(String::new());
+                                },
+                                "編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "inline-action danger-button",
+                                onclick: move |_| confirm_delete_year.set(Some(annual.dividend_year)),
+                                "刪除"
+                            } }
+                        }
+                    } }
+                } },
+                Some(Err(error)) => rsx! { p { class: "status-message error", "讀取年度配息失敗：{error}" } },
+                None => rsx! { p { class: "muted", "載入年度配息中..." } },
+            }
+            if let Some(year) = confirm_delete_year() {
+                div { class: "delete-confirmation",
+                    p { "確定要刪除 {year} 年的年度配息嗎？" }
+                    div { class: "modal-actions",
+                        button {
+                            r#type: "button",
+                            class: "ghost-button",
+                            onclick: move |_| confirm_delete_year.set(None),
+                            "取消"
+                        }
+                        button {
+                            r#type: "button",
+                            class: "danger-button",
+                            onclick: move |_| match delete_annual_dividend(instrument_id, year) {
+                                Ok(()) => {
+                                    confirm_delete_year.set(None);
+                                    error_message.set(String::new());
+                                    data_version.with_mut(|value| *value += 1);
+                                }
+                                Err(error) => error_message.set(error.to_string()),
+                            },
+                            "確認刪除"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn annual_dividend_average_text(rows: &[AnnualDividendRow]) -> Option<String> {
+    let total = rows.iter().try_fold(Decimal::ZERO, |total, row| {
+        crate::decimal::parse_decimal_field(
+            "annual_dividend_per_unit",
+            &row.annual_dividend_per_unit_text,
+        )
+        .map(|amount| total + amount)
+        .ok()
+    })?;
+    Decimal::from_usize(rows.len())
+        .map(|count| crate::decimal::normalize_decimal_text(total / count))
+}
+
+#[cfg(test)]
+mod annual_dividend_tests {
+    use super::{annual_dividend_average_text, AnnualDividendRow};
+
+    #[test]
+    fn averages_available_annual_dividend_years() {
+        let rows = vec![
+            AnnualDividendRow {
+                dividend_year: 2025,
+                annual_dividend_per_unit_text: "1.2".to_string(),
+                currency_code: "USD".to_string(),
+                note: String::new(),
+            },
+            AnnualDividendRow {
+                dividend_year: 2024,
+                annual_dividend_per_unit_text: "1.5".to_string(),
+                currency_code: "USD".to_string(),
+                note: String::new(),
+            },
+            AnnualDividendRow {
+                dividend_year: 2023,
+                annual_dividend_per_unit_text: "1.8".to_string(),
+                currency_code: "USD".to_string(),
+                note: String::new(),
+            },
+        ];
+
+        assert_eq!(annual_dividend_average_text(&rows).as_deref(), Some("1.5"));
     }
 }
 

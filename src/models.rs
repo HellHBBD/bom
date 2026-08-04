@@ -74,7 +74,14 @@ pub struct ExchangeRateRow {
     pub base_currency_code: String,
     pub quote_currency_code: String,
     pub rate_text: String,
-    pub origin: String,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnualDividendRow {
+    pub dividend_year: i64,
+    pub annual_dividend_per_unit_text: String,
+    pub currency_code: String,
     pub note: String,
 }
 

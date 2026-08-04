@@ -74,6 +74,15 @@ pub struct DividendAssumptionInput {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct AnnualDividendInput {
+    pub instrument_id: i64,
+    pub dividend_year_text: String,
+    pub annual_dividend_per_unit_text: String,
+    pub currency_code: String,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct ValidatedHoldingUpdate {
     account_id: i64,
     instrument_id: i64,
@@ -188,6 +197,118 @@ pub fn save_current_holding_state(input: CurrentHoldingStateInput) -> AppResult<
 pub fn save_dividend_assumption(input: DividendAssumptionInput) -> AppResult<()> {
     let mut connection = open_manual_write_database()?;
     save_dividend_assumption_with_connection(&mut connection, input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn upsert_annual_dividend(input: AnnualDividendInput) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    upsert_annual_dividend_with_connection(&mut connection, input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn upsert_annual_dividend_with_connection(
+    connection: &mut Connection,
+    input: AnnualDividendInput,
+) -> AppResult<()> {
+    let validated = validate_annual_dividend_input(&input)?;
+    let transaction = connection.transaction()?;
+    let existing_currency: Option<String> = transaction
+        .query_row(
+            "SELECT currency_code FROM instrument_annual_dividend WHERE instrument_id=?1 LIMIT 1",
+            [validated.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing_currency) = existing_currency {
+        if existing_currency != validated.3 {
+            return Err(AppError::Validation(
+                "同一商品的年度配息必須使用相同幣別".to_string(),
+            ));
+        }
+    }
+    transaction.execute(
+        "INSERT INTO instrument_annual_dividend (instrument_id, dividend_year, annual_dividend_per_unit_text, currency_code, note) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(instrument_id, dividend_year) DO UPDATE SET annual_dividend_per_unit_text=excluded.annual_dividend_per_unit_text, currency_code=excluded.currency_code, note=excluded.note",
+        params![validated.0, validated.1, validated.2, validated.3, validated.4],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn upsert_annual_dividend(_input: AnnualDividendInput) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 年度配息維護".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn delete_annual_dividend(instrument_id: i64, dividend_year: i64) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    delete_annual_dividend_with_connection(&mut connection, instrument_id, dividend_year)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn delete_annual_dividend_with_connection(
+    connection: &mut Connection,
+    instrument_id: i64,
+    dividend_year: i64,
+) -> AppResult<()> {
+    if instrument_id <= 0 || !(1900..=9999).contains(&dividend_year) {
+        return Err(AppError::Validation("年度配息資料無效".to_string()));
+    }
+    let transaction = connection.transaction()?;
+    if transaction.execute(
+        "DELETE FROM instrument_annual_dividend WHERE instrument_id=?1 AND dividend_year=?2",
+        params![instrument_id, dividend_year],
+    )? == 0
+    {
+        return Err(AppError::Validation("找不到要刪除的年度配息".to_string()));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn delete_annual_dividend(_instrument_id: i64, _dividend_year: i64) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 年度配息維護".to_string(),
+    ))
+}
+
+fn validate_annual_dividend_input(
+    input: &AnnualDividendInput,
+) -> AppResult<(i64, i64, String, String, Option<String>)> {
+    if input.instrument_id <= 0 {
+        return Err(AppError::Validation("請選擇商品".to_string()));
+    }
+    let dividend_year = input
+        .dividend_year_text
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| AppError::Validation("年度必須是整數".to_string()))?;
+    if !(1900..=9999).contains(&dividend_year) {
+        return Err(AppError::Validation(
+            "年度必須介於 1900 與 9999".to_string(),
+        ));
+    }
+    let amount = parse_decimal_field(
+        "annual_dividend_per_unit",
+        &input.annual_dividend_per_unit_text,
+    )?;
+    if amount <= Decimal::ZERO {
+        return Err(AppError::Validation("年度配息必須大於零".to_string()));
+    }
+    let currency_code = input.currency_code.trim().to_string();
+    if currency_code.is_empty() {
+        return Err(AppError::Validation("請輸入幣別".to_string()));
+    }
+    Ok((
+        input.instrument_id,
+        dividend_year,
+        normalize_decimal_text(amount),
+        currency_code,
+        normalize_optional_text(&input.note),
+    ))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -912,15 +1033,20 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(not(target_arch = "wasm32"))]
-    use super::save_current_holding_update_with_connection;
-    #[cfg(not(target_arch = "wasm32"))]
     use super::save_dividend_assumption_with_connection;
     #[cfg(not(target_arch = "wasm32"))]
-    use super::{fee_inclusive_cost_for_save, save_current_holding_state_with_connection};
     use super::{
-        validate_current_holding_state_input, validate_current_holding_update,
-        validate_dividend_assumption_input, CurrentHoldingStateInput, CurrentHoldingUpdateInput,
-        DividendAssumptionInput,
+        delete_annual_dividend_with_connection, fee_inclusive_cost_for_save,
+        save_current_holding_state_with_connection,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::{
+        save_current_holding_update_with_connection, upsert_annual_dividend_with_connection,
+    };
+    use super::{
+        validate_annual_dividend_input, validate_current_holding_state_input,
+        validate_current_holding_update, validate_dividend_assumption_input, AnnualDividendInput,
+        CurrentHoldingStateInput, CurrentHoldingUpdateInput, DividendAssumptionInput,
     };
     #[cfg(not(target_arch = "wasm32"))]
     use crate::error::AppError;
@@ -937,6 +1063,16 @@ mod tests {
             payments_per_year_text: "4".to_string(),
             latest_dividend_per_unit_text: "0.5".to_string(),
             estimated_annual_dividend_per_unit_text: "2.0".to_string(),
+        }
+    }
+
+    fn sample_annual_dividend_input() -> AnnualDividendInput {
+        AnnualDividendInput {
+            instrument_id: 1,
+            dividend_year_text: "2025".to_string(),
+            annual_dividend_per_unit_text: "1.2500".to_string(),
+            currency_code: "NTD".to_string(),
+            note: "年度資料".to_string(),
         }
     }
 
@@ -1018,6 +1154,75 @@ mod tests {
         assert_eq!(normalized.market_price_text, "55");
         assert_eq!(normalized.latest_dividend_per_unit_text, "0.5");
         assert_eq!(normalized.estimated_annual_dividend_per_unit_text, "2");
+    }
+
+    #[test]
+    fn validates_annual_dividend_input() {
+        let input = sample_annual_dividend_input();
+        let validated = validate_annual_dividend_input(&input).expect("valid annual dividend");
+
+        assert_eq!(validated.1, 2025);
+        assert_eq!(validated.2, "1.25");
+        assert_eq!(validated.4.as_deref(), Some("年度資料"));
+    }
+
+    #[test]
+    fn rejects_zero_annual_dividend() {
+        let input = AnnualDividendInput {
+            annual_dividend_per_unit_text: "0".to_string(),
+            ..sample_annual_dividend_input()
+        };
+
+        assert!(validate_annual_dividend_input(&input).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn annual_dividends_require_one_currency_and_support_update_and_delete() {
+        let temp_dir = tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("data.sqlite");
+        fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
+        let mut connection = Connection::open(&database_path).expect("open temp db");
+
+        upsert_annual_dividend_with_connection(&mut connection, sample_annual_dividend_input())
+            .expect("insert annual dividend");
+        let updated = AnnualDividendInput {
+            annual_dividend_per_unit_text: "1.5".to_string(),
+            note: "更新".to_string(),
+            ..sample_annual_dividend_input()
+        };
+        upsert_annual_dividend_with_connection(&mut connection, updated)
+            .expect("update annual dividend");
+
+        let (amount, note): (String, Option<String>) = connection
+            .query_row(
+                "SELECT annual_dividend_per_unit_text, note FROM instrument_annual_dividend WHERE instrument_id=1 AND dividend_year=2025",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("updated row");
+        assert_eq!(amount, "1.5");
+        assert_eq!(note.as_deref(), Some("更新"));
+
+        let mismatched_currency = AnnualDividendInput {
+            dividend_year_text: "2024".to_string(),
+            currency_code: "USD".to_string(),
+            ..sample_annual_dividend_input()
+        };
+        assert!(
+            upsert_annual_dividend_with_connection(&mut connection, mismatched_currency).is_err()
+        );
+
+        delete_annual_dividend_with_connection(&mut connection, 1, 2025)
+            .expect("delete annual dividend");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM instrument_annual_dividend WHERE instrument_id=1 AND dividend_year=2025",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(count, 0);
     }
 
     #[test]

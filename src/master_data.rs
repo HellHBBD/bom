@@ -75,7 +75,10 @@ fn validate_account_create_input(input: &AccountCreateInput) -> AppResult<Accoun
     }
 
     let account_number = input.account_number.trim().to_string();
-    if !account_number.is_empty() && !account_number.bytes().all(|byte| byte.is_ascii_digit()) {
+    if account_number.is_empty() {
+        return Err(AppError::Validation("請輸入帳戶號碼".to_string()));
+    }
+    if !account_number.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(AppError::Validation("帳戶號碼只能包含數字".to_string()));
     }
 
@@ -142,6 +145,20 @@ fn create_manual_account_with_connection(
     let validated = validate_account_create_input(&input)?;
     let transaction = connection.transaction()?;
     ensure_institution_exists(&transaction, validated.institution_id)?;
+    if !validated.account_number.is_empty() {
+        let existing_account: Option<i64> = transaction
+            .query_row(
+                "SELECT account_id FROM account WHERE institution_id = ?1 AND account_number = ?2 LIMIT 1",
+                params![validated.institution_id, validated.account_number],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(account_id) = existing_account {
+            return Err(AppError::Validation(format!(
+                "此金融機構的帳戶號碼已存在於帳戶 #{account_id}"
+            )));
+        }
+    }
 
     transaction.execute(
         r#"

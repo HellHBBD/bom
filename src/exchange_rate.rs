@@ -35,13 +35,48 @@ pub fn validate_exchange_rate_input(input: &ExchangeRateInput) -> AppResult<Exch
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn upsert_manual_exchange_rate(input: ExchangeRateInput) -> AppResult<()> {
+pub fn create_exchange_rate(input: ExchangeRateInput) -> AppResult<()> {
     let mut connection = open_manual_write_database()?;
-    upsert_manual_exchange_rate_with_connection(&mut connection, input)
+    create_exchange_rate_with_connection(&mut connection, input)
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn upsert_manual_exchange_rate(_input: ExchangeRateInput) -> AppResult<()> {
+pub fn create_exchange_rate(_input: ExchangeRateInput) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 匯率維護".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn update_exchange_rate(exchange_rate_id: i64, input: ExchangeRateInput) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    update_exchange_rate_with_connection(&mut connection, exchange_rate_id, input)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn update_exchange_rate(_exchange_rate_id: i64, _input: ExchangeRateInput) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 匯率維護".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn delete_exchange_rate(exchange_rate_id: i64) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    let transaction = connection.transaction()?;
+    if transaction.execute(
+        "DELETE FROM exchange_rate WHERE exchange_rate_id = ?1",
+        [exchange_rate_id],
+    )? == 0
+    {
+        return Err(AppError::Validation("找不到要刪除的匯率".to_string()));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn delete_exchange_rate(_exchange_rate_id: i64) -> AppResult<()> {
     Err(AppError::Validation(
         "目前只支援桌面版 SQLite 匯率維護".to_string(),
     ))
@@ -136,7 +171,7 @@ fn is_leap_year(year: i32) -> bool {
 
 #[allow(dead_code)]
 #[cfg(not(target_arch = "wasm32"))]
-fn upsert_manual_exchange_rate_with_connection(
+fn create_exchange_rate_with_connection(
     connection: &mut Connection,
     input: ExchangeRateInput,
 ) -> AppResult<()> {
@@ -153,7 +188,6 @@ fn upsert_manual_exchange_rate_with_connection(
             WHERE rate_date = ?1
               AND base_currency_code = ?2
               AND quote_currency_code = 'NTD'
-              AND origin = 'MANUAL'
             ORDER BY exchange_rate_id DESC
             LIMIT 1
             "#,
@@ -162,40 +196,60 @@ fn upsert_manual_exchange_rate_with_connection(
         )
         .optional()?;
 
-    if let Some(exchange_rate_id) = existing_id {
-        transaction.execute(
-            r#"
-            UPDATE exchange_rate
-            SET rate_text = ?1,
-                note = ?2,
-                source_sheet = NULL,
-                source_cell = NULL,
-                origin = 'MANUAL'
-            WHERE exchange_rate_id = ?3
-            "#,
-            params![validated.rate_text, validated.note, exchange_rate_id],
-        )?;
-    } else {
-        transaction.execute(
-            r#"
+    if existing_id.is_some() {
+        return Err(AppError::Validation(
+            "此日期與幣別組合已有匯率，請使用編輯".to_string(),
+        ));
+    }
+    transaction.execute(
+        r#"
             INSERT INTO exchange_rate (
                 rate_date,
                 base_currency_code,
                 quote_currency_code,
                 rate_text,
-                origin,
                 note
-            ) VALUES (?1, ?2, 'NTD', ?3, 'MANUAL', ?4)
+            ) VALUES (?1, ?2, 'NTD', ?3, ?4)
             "#,
-            params![
-                validated.rate_date,
-                validated.base_currency_code,
-                validated.rate_text,
-                validated.note,
-            ],
-        )?;
-    }
+        params![
+            validated.rate_date,
+            validated.base_currency_code,
+            validated.rate_text,
+            validated.note,
+        ],
+    )?;
 
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn update_exchange_rate_with_connection(
+    connection: &mut Connection,
+    exchange_rate_id: i64,
+    input: ExchangeRateInput,
+) -> AppResult<()> {
+    let validated = validate_exchange_rate_input_inner(&input)?;
+    let transaction = connection.transaction()?;
+    ensure_currency_exists(&transaction, &validated.base_currency_code)?;
+    let duplicate_id: Option<i64> = transaction
+        .query_row(
+            "SELECT exchange_rate_id FROM exchange_rate WHERE rate_date = ?1 AND base_currency_code = ?2 AND quote_currency_code = 'NTD' AND exchange_rate_id <> ?3 LIMIT 1",
+            params![validated.rate_date, validated.base_currency_code, exchange_rate_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if duplicate_id.is_some() {
+        return Err(AppError::Validation(
+            "此日期與幣別組合已有匯率，請使用編輯".to_string(),
+        ));
+    }
+    if transaction.execute(
+        "UPDATE exchange_rate SET rate_date = ?1, base_currency_code = ?2, rate_text = ?3, note = ?4 WHERE exchange_rate_id = ?5",
+        params![validated.rate_date, validated.base_currency_code, validated.rate_text, validated.note, exchange_rate_id],
+    )? == 0 {
+        return Err(AppError::Validation("找不到要編輯的匯率".to_string()));
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -228,7 +282,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(not(target_arch = "wasm32"))]
-    use super::upsert_manual_exchange_rate_with_connection;
+    use super::{create_exchange_rate_with_connection, update_exchange_rate_with_connection};
     use super::{validate_exchange_rate_input, ExchangeRateInput};
     #[cfg(not(target_arch = "wasm32"))]
     use crate::error::AppError;
@@ -291,10 +345,12 @@ mod tests {
             .pragma_update(None, "foreign_keys", "ON")
             .expect("fk on");
 
-        upsert_manual_exchange_rate_with_connection(&mut connection, sample_input())
+        create_exchange_rate_with_connection(&mut connection, sample_input())
             .expect("first insert");
-        upsert_manual_exchange_rate_with_connection(
+        let exchange_rate_id = connection.last_insert_rowid();
+        update_exchange_rate_with_connection(
             &mut connection,
+            exchange_rate_id,
             ExchangeRateInput {
                 rate: "31.5".to_string(),
                 note: "updated".to_string(),
@@ -307,9 +363,9 @@ mod tests {
             .query_row(
                 r#"
                 SELECT
-                    (SELECT rate_text FROM exchange_rate WHERE base_currency_code = 'USD' AND quote_currency_code = 'NTD' AND rate_date = '2099-07-15' AND origin = 'MANUAL' LIMIT 1),
-                    (SELECT note FROM exchange_rate WHERE base_currency_code = 'USD' AND quote_currency_code = 'NTD' AND rate_date = '2099-07-15' AND origin = 'MANUAL' LIMIT 1),
-                    (SELECT COUNT(*) FROM exchange_rate WHERE base_currency_code = 'USD' AND quote_currency_code = 'NTD' AND rate_date = '2099-07-15' AND origin = 'MANUAL')
+                    (SELECT rate_text FROM exchange_rate WHERE base_currency_code = 'USD' AND quote_currency_code = 'NTD' AND rate_date = '2099-07-15' LIMIT 1),
+                    (SELECT note FROM exchange_rate WHERE base_currency_code = 'USD' AND quote_currency_code = 'NTD' AND rate_date = '2099-07-15' LIMIT 1),
+                    (SELECT COUNT(*) FROM exchange_rate WHERE base_currency_code = 'USD' AND quote_currency_code = 'NTD' AND rate_date = '2099-07-15')
                 "#,
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -323,7 +379,7 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn preserves_import_exchange_rate_row() {
+    fn rejects_duplicate_exchange_rate_regardless_of_origin() {
         let temp_dir = tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("data.sqlite");
         fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
@@ -333,16 +389,18 @@ mod tests {
             .pragma_update(None, "foreign_keys", "ON")
             .expect("fk on");
 
-        connection.execute(
-            r#"
+        connection
+            .execute(
+                r#"
             INSERT INTO exchange_rate (
-                rate_date, base_currency_code, quote_currency_code, rate_text, origin, source_sheet, source_cell
-            ) VALUES ('2099-07-16', 'USD', 'NTD', '30.8', 'EXCEL_IMPORT', 'sheet', 'B2')
+                rate_date, base_currency_code, quote_currency_code, rate_text
+            ) VALUES ('2099-07-16', 'USD', 'NTD', '30.8')
             "#,
-            [],
-        ).expect("insert import row");
+                [],
+            )
+            .expect("insert import row");
 
-        upsert_manual_exchange_rate_with_connection(
+        create_exchange_rate_with_connection(
             &mut connection,
             ExchangeRateInput {
                 rate_date: "2099-07-16".to_string(),
@@ -351,17 +409,6 @@ mod tests {
                 ..sample_input()
             },
         )
-        .expect("manual save");
-
-        let (import_origin, import_source_cell): (String, Option<String>) = connection
-            .query_row(
-                "SELECT origin, source_cell FROM exchange_rate WHERE rate_date = '2099-07-16' AND base_currency_code = 'USD' AND quote_currency_code = 'NTD' AND origin = 'EXCEL_IMPORT' LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("import row preserved");
-
-        assert_eq!(import_origin, "EXCEL_IMPORT");
-        assert_eq!(import_source_cell.as_deref(), Some("B2"));
+        .expect_err("duplicate rate should be rejected");
     }
 }
