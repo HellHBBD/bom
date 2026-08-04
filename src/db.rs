@@ -5,6 +5,10 @@ pub mod path;
 
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqlResult};
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::{BTreeMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::db::backup::backup_for_today;
@@ -706,6 +710,74 @@ fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
 const BASELINE_DATABASE_VERSION: i64 = 12;
 
 #[cfg(not(target_arch = "wasm32"))]
+static VALIDATED_RUNTIME_DATABASES: OnceLock<Mutex<HashSet<std::path::PathBuf>>> = OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+type SchemaObjects = BTreeMap<(String, String), String>;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_schema_objects(connection: &Connection) -> SqlResult<SchemaObjects> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql FROM sqlite_schema WHERE type IN ('table', 'index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )?;
+    let objects = statement.query_map([], |row| {
+        Ok((
+            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    objects.collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_schema_matches_seed(
+    connection: &Connection,
+    reset_directory: &std::path::Path,
+) -> AppResult<()> {
+    let seed_path = path::seed_database_path();
+    let seed_connection = Connection::open_with_flags(seed_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let expected = load_schema_objects(&seed_connection)?;
+    let actual = load_schema_objects(connection)?;
+
+    for ((object_type, object_name), _) in &expected {
+        if !actual.contains_key(&(object_type.clone(), object_name.clone())) {
+            return Err(AppError::Validation(format!(
+                "baseline v{BASELINE_DATABASE_VERSION} 結構不一致：缺少 {object_type} {object_name}。請關閉應用程式後刪除資料夾：{}，再重新啟動應用程式",
+                reset_directory.display()
+            )));
+        }
+    }
+    for ((object_type, object_name), _) in &actual {
+        if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+            return Err(AppError::Validation(format!(
+                "baseline v{BASELINE_DATABASE_VERSION} 結構不一致：多出 {object_type} {object_name}。請關閉應用程式後刪除資料夾：{}，再重新啟動應用程式",
+                reset_directory.display()
+            )));
+        }
+    }
+    for ((object_type, object_name), expected_sql) in &expected {
+        let actual_sql = actual
+            .get(&(object_type.clone(), object_name.clone()))
+            .expect("schema object presence checked above");
+        if normalize_schema_sql(expected_sql) != normalize_schema_sql(actual_sql) {
+            return Err(AppError::Validation(format!(
+                "baseline v{BASELINE_DATABASE_VERSION} 結構不一致：{object_type} {object_name} 定義不一致。請關閉應用程式後刪除資料夾：{}，再重新啟動應用程式",
+                reset_directory.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn validate_baseline_database(
     connection: &Connection,
     database_path: &std::path::Path,
@@ -731,34 +803,30 @@ fn validate_baseline_database(
         )));
     }
 
-    for (object_name, object_type) in [
-        ("account", "table"),
-        ("account_asset_snapshot", "table"),
-        ("holding_snapshot", "table"),
-        ("instrument", "table"),
-        ("instrument_annual_dividend", "table"),
-        ("instrument_price", "table"),
-        ("dividend_assumption", "table"),
-        ("ui_preference", "table"),
-        ("v_account_asset_value", "view"),
-        ("v_holding_metrics", "view"),
-        ("uq_account_institution_number", "index"),
-        ("uq_account_asset_snapshot_origin", "index"),
-        ("validate_holding_snapshot_quantity_insert", "trigger"),
-        ("validate_holding_snapshot_quantity_update", "trigger"),
-    ] {
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1 AND type = ?2)",
-            [object_name, object_type],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(AppError::Validation(format!(
-                "資料庫缺少 baseline v{BASELINE_DATABASE_VERSION} 的必要結構。請關閉應用程式後刪除資料夾：{reset_directory}，再重新啟動應用程式"
-            )));
-        }
+    validate_schema_matches_seed(connection, database_path.parent().unwrap_or(database_path))?;
+
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_runtime_baseline_database(
+    connection: &Connection,
+    database_path: &std::path::Path,
+) -> AppResult<()> {
+    let validated_paths = VALIDATED_RUNTIME_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
+    if validated_paths
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(database_path)
+    {
+        return Ok(());
     }
 
+    validate_baseline_database(connection, database_path)?;
+    validated_paths
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(database_path.to_path_buf());
     Ok(())
 }
 
@@ -766,7 +834,7 @@ fn validate_baseline_database(
 fn open_baseline_database() -> AppResult<std::path::PathBuf> {
     let path = path::ensure_runtime_database()?;
     let connection = Connection::open(&path)?;
-    validate_baseline_database(&connection, &path)?;
+    validate_runtime_baseline_database(&connection, &path)?;
 
     Ok(path)
 }
@@ -790,7 +858,7 @@ pub fn open_writable_database() -> AppResult<Connection> {
 pub fn open_ui_preference_database() -> AppResult<Connection> {
     let path = path::ensure_runtime_database()?;
     let connection = Connection::open(&path)?;
-    validate_baseline_database(&connection, &path)?;
+    validate_runtime_baseline_database(&connection, &path)?;
     connection.busy_timeout(std::time::Duration::from_secs(2))?;
     Ok(connection)
 }
@@ -807,4 +875,81 @@ pub fn open_manual_write_database() -> AppResult<Connection> {
 #[cfg(not(target_arch = "wasm32"))]
 fn app_error_to_sql_error(error: AppError) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+#[cfg(test)]
+mod baseline_validation_tests {
+    use std::fs;
+
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    use super::validate_baseline_database;
+
+    fn temporary_baseline_database() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
+        let temp_dir = tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("data.sqlite");
+        fs::copy("assets/data.sqlite", &database_path).expect("copy seed db");
+        let connection = Connection::open(&database_path).expect("open temp db");
+        (temp_dir, database_path, connection)
+    }
+
+    #[test]
+    fn accepts_the_seed_database_schema() {
+        let (_temp_dir, database_path, connection) = temporary_baseline_database();
+
+        validate_baseline_database(&connection, &database_path).expect("valid baseline");
+    }
+
+    #[test]
+    fn reports_a_missing_view_by_name() {
+        let (_temp_dir, database_path, connection) = temporary_baseline_database();
+        connection
+            .execute_batch("DROP VIEW v_holding_metrics")
+            .expect("drop view");
+
+        let error = validate_baseline_database(&connection, &database_path)
+            .expect_err("missing view should fail");
+        assert!(error.to_string().contains("缺少 view v_holding_metrics"));
+    }
+
+    #[test]
+    fn reports_an_unexpected_table_by_name() {
+        let (_temp_dir, database_path, connection) = temporary_baseline_database();
+        connection
+            .execute_batch("CREATE TABLE unexpected_data (id INTEGER PRIMARY KEY)")
+            .expect("create table");
+
+        let error = validate_baseline_database(&connection, &database_path)
+            .expect_err("extra table should fail");
+        assert!(error.to_string().contains("多出 table unexpected_data"));
+    }
+
+    #[test]
+    fn reports_a_changed_view_definition_by_name() {
+        let (_temp_dir, database_path, connection) = temporary_baseline_database();
+        connection
+            .execute_batch(
+                "DROP VIEW v_dividend_yearly; CREATE VIEW v_dividend_yearly AS SELECT 1 AS year",
+            )
+            .expect("replace view");
+
+        let error = validate_baseline_database(&connection, &database_path)
+            .expect_err("changed view should fail");
+        assert!(error
+            .to_string()
+            .contains("view v_dividend_yearly 定義不一致"));
+    }
+
+    #[test]
+    fn reports_an_incorrect_baseline_version() {
+        let (_temp_dir, database_path, connection) = temporary_baseline_database();
+        connection
+            .pragma_update(None, "user_version", 11)
+            .expect("set version");
+
+        let error = validate_baseline_database(&connection, &database_path)
+            .expect_err("version mismatch should fail");
+        assert!(error.to_string().contains("資料庫版本為 11"));
+    }
 }
