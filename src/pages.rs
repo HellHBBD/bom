@@ -3494,6 +3494,7 @@ mod holding_column_tests {
             dividend_effective_date: None,
             dividend_currency_code: None,
             estimated_annual_dividend_per_unit: None,
+            manual_estimated_annual_dividend_per_unit: None,
             payments_per_year: None,
             latest_dividend_per_unit: None,
             estimated_annual_dividend: None,
@@ -4699,7 +4700,9 @@ fn HoldingDividendAssumptionModal(
             .map(|value| value.to_string())
             .unwrap_or_default(),
         latest_dividend_per_unit: editable_number(row.latest_dividend_per_unit),
-        estimated_annual_dividend_per_unit: editable_number(row.estimated_annual_dividend_per_unit),
+        estimated_annual_dividend_per_unit: editable_number(
+            row.manual_estimated_annual_dividend_per_unit,
+        ),
     };
     let initial_form_snapshot = use_signal(|| initial_form.clone());
     let mut effective_date = use_signal(|| {
@@ -4715,10 +4718,12 @@ fn HoldingDividendAssumptionModal(
     });
     let mut latest_dividend_per_unit = use_signal(|| editable_number(row.latest_dividend_per_unit));
     let mut estimated_annual_dividend_per_unit =
-        use_signal(|| editable_number(row.estimated_annual_dividend_per_unit));
+        use_signal(|| editable_number(row.manual_estimated_annual_dividend_per_unit));
     let mut is_saving = use_signal(|| false);
     let mut error_message = use_signal(String::new);
     let mut confirm_close = use_signal(|| false);
+    let mut annual_draft_is_dirty = use_signal(|| false);
+    let mut annual_delete_confirmation_open = use_signal(|| false);
     let annual_history = use_resource(move || {
         let _ = data_version();
         async move { load_annual_dividends(row.instrument_id) }
@@ -4732,20 +4737,43 @@ fn HoldingDividendAssumptionModal(
     let uses_annual_dividend_history = annual_dividend_average.is_some();
     let displayed_annual_dividend =
         annual_dividend_average.unwrap_or_else(|| estimated_annual_dividend_per_unit());
+    let annual_dividend_summary = annual_history()
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|rows| annual_dividend_summary_text(rows));
+    let annual_dividend_description =
+        annual_dividend_summary.unwrap_or_else(|| "由最近三個有資料年度的平均自動計算".to_string());
     let is_dirty = HoldingDividendAssumptionForm {
         effective_date: effective_date(),
         payments_per_year: payments_per_year(),
         latest_dividend_per_unit: latest_dividend_per_unit(),
         estimated_annual_dividend_per_unit: estimated_annual_dividend_per_unit(),
-    } != initial_form_snapshot();
+    } != initial_form_snapshot()
+        || annual_draft_is_dirty();
 
     rsx! {
         div { class: "modal-backdrop",
-            div { class: "modal-card",
+            div {
+                class: "modal-card",
+                role: "dialog",
+                aria_modal: "true",
+                aria_labelledby: "holding-dividend-dialog-title",
+                aria_describedby: "holding-dividend-dialog-description",
+                tabindex: "0",
+                onkeydown: move |event| {
+                    if event.key() == Key::Escape && !annual_delete_confirmation_open() {
+                        event.prevent_default();
+                        if is_dirty {
+                            confirm_close.set(true);
+                        } else {
+                            on_close.call(());
+                        }
+                    }
+                },
                 div { class: "modal-header",
                     div {
-                        h3 { "編輯配息估計" }
-                        p { class: "modal-subtitle", "{row.account_name} / {row.symbol} {row.instrument_name}" }
+                        h3 { id: "holding-dividend-dialog-title", "編輯配息估計" }
+                        p { id: "holding-dividend-dialog-description", class: "modal-subtitle", "{row.account_name} / {row.symbol} {row.instrument_name}" }
                     }
                     button {
                         r#type: "button",
@@ -4768,7 +4796,7 @@ fn HoldingDividendAssumptionModal(
                     }
                 }
                 if !error_message().is_empty() {
-                    div { class: "status-message error", "{error_message}" }
+                    div { class: "status-message error", role: "alert", "{error_message}" }
                 }
                 div { class: "form-grid two-column",
                     label { class: "form-field",
@@ -4800,14 +4828,17 @@ fn HoldingDividendAssumptionModal(
                     }
                     label { class: "form-field",
                         span { "預估每單位年配息" }
-                        input {
-                            value: "{displayed_annual_dividend}",
-                            oninput: move |event| estimated_annual_dividend_per_unit.set(event.value()),
-                            disabled: interaction_locked || uses_annual_dividend_history,
-                            placeholder: "0",
-                        }
                         if uses_annual_dividend_history {
-                            small { class: "muted", "依最近三個有資料年度的平均自動計算" }
+                            output { class: "readonly-field", "{displayed_annual_dividend} {dividend_currency_code}" }
+                            small { class: "muted", "{annual_dividend_description}；手動預估值會在沒有年度資料時使用。" }
+                        } else {
+                            input {
+                                value: "{displayed_annual_dividend}",
+                                oninput: move |event| estimated_annual_dividend_per_unit.set(event.value()),
+                                disabled: interaction_locked,
+                                placeholder: "0",
+                            }
+                            small { class: "muted", "手動預估值" }
                         }
                     }
                 }
@@ -4815,6 +4846,8 @@ fn HoldingDividendAssumptionModal(
                     instrument_id: row.instrument_id,
                     currency_code: dividend_currency_code.clone(),
                     data_version,
+                    on_draft_change: move |is_dirty| annual_draft_is_dirty.set(is_dirty),
+                    on_delete_confirmation_change: move |is_open| annual_delete_confirmation_open.set(is_open),
                 }
                 div { class: "modal-actions",
                     button {
@@ -4915,6 +4948,8 @@ fn AnnualDividendPanel(
     instrument_id: i64,
     currency_code: String,
     mut data_version: Signal<u64>,
+    on_draft_change: EventHandler<bool>,
+    on_delete_confirmation_change: EventHandler<bool>,
 ) -> Element {
     let annual_history = use_resource(move || {
         let _ = data_version();
@@ -4924,105 +4959,185 @@ fn AnnualDividendPanel(
     let mut annual_amount = use_signal(String::new);
     let mut note = use_signal(String::new);
     let mut error_message = use_signal(String::new);
-    let mut confirm_delete_year = use_signal(|| None::<i64>);
+    let mut success_message = use_signal(String::new);
+    let mut confirm_delete = use_signal(|| None::<AnnualDividendRow>);
+    let mut editing_year = use_signal(|| None::<i64>);
+    let mut is_saving_annual = use_signal(|| false);
 
     rsx! {
-        section { class: "card",
+        section {
+            class: "card annual-dividend-panel",
+            onkeydown: move |event| {
+                if event.key() == Key::Escape && confirm_delete().is_some() {
+                    event.prevent_default();
+                    confirm_delete.set(None);
+                    on_delete_confirmation_change.call(false);
+                }
+            },
             h3 { "年度每單位配息" }
-            p { class: "muted", "有年度資料時，預估年配息會自動採用最近三個有資料年度的平均。" }
+            p { class: "muted", "此區儲存後立即生效；有年度資料時，預估年配息會自動採用最近三個有資料年度的平均。" }
+            p { class: "muted", "幣別：{currency_code}" }
             div { class: "form-grid two-column",
                 label { class: "form-field",
                     span { "年度" }
-                    input { value: "{dividend_year}", oninput: move |event| dividend_year.set(event.value()), placeholder: "2026" }
+                    input {
+                        r#type: "number",
+                        min: "1900",
+                        max: "9999",
+                        inputmode: "numeric",
+                        autofocus: true,
+                        value: "{dividend_year}",
+                        disabled: is_saving_annual(),
+                        oninput: move |event| {
+                            dividend_year.set(event.value());
+                            on_draft_change.call(true);
+                        },
+                        placeholder: "2026"
+                    }
                 }
                 label { class: "form-field",
                     span { "每單位全年配息" }
-                    input { value: "{annual_amount}", oninput: move |event| annual_amount.set(event.value()), placeholder: "0" }
+                    input {
+                        inputmode: "decimal",
+                        value: "{annual_amount}",
+                        disabled: is_saving_annual(),
+                        oninput: move |event| {
+                            annual_amount.set(event.value());
+                            on_draft_change.call(true);
+                        },
+                        placeholder: "0"
+                    }
                 }
                 label { class: "form-field full-width",
                     span { "備註" }
-                    input { value: "{note}", oninput: move |event| note.set(event.value()), placeholder: "選填" }
+                    input {
+                        value: "{note}",
+                        disabled: is_saving_annual(),
+                        oninput: move |event| {
+                            note.set(event.value());
+                            on_draft_change.call(true);
+                        },
+                        placeholder: "選填"
+                    }
                 }
             }
             if !error_message().is_empty() {
-                div { class: "status-message error", "{error_message}" }
+                div { class: "status-message error", role: "alert", "{error_message}" }
+            }
+            if !success_message().is_empty() {
+                div { class: "status-message success", aria_live: "polite", "{success_message}" }
             }
             button {
                 r#type: "button",
                 class: "primary-button",
-                onclick: move |_| match upsert_annual_dividend(AnnualDividendInput {
+                disabled: is_saving_annual(),
+                onclick: move |_| {
+                    is_saving_annual.set(true);
+                    match upsert_annual_dividend(AnnualDividendInput {
                     instrument_id,
                     dividend_year_text: dividend_year(),
                     annual_dividend_per_unit_text: annual_amount(),
                     currency_code: currency_code.clone(),
                     note: note(),
-                }) {
+                    }) {
                     Ok(()) => {
+                        let action = if editing_year().is_some() { "已更新" } else { "已新增" };
+                        dividend_year.set(String::new());
                         annual_amount.set(String::new());
                         note.set(String::new());
+                        editing_year.set(None);
+                        on_draft_change.call(false);
                         error_message.set(String::new());
+                        success_message.set(format!("年度配息{action}"));
                         data_version.with_mut(|value| *value += 1);
                     }
                     Err(error) => error_message.set(error.to_string()),
+                    }
+                    is_saving_annual.set(false);
                 },
-                "儲存年度配息"
+                if is_saving_annual() { "儲存中..." } else if let Some(year) = editing_year() { "更新 {year} 年配息" } else { "儲存年度配息" }
+            }
+            if editing_year().is_some() {
+                button {
+                    r#type: "button",
+                    class: "ghost-button",
+                    disabled: is_saving_annual(),
+                    onclick: move |_| {
+                        dividend_year.set(String::new());
+                        annual_amount.set(String::new());
+                        note.set(String::new());
+                        editing_year.set(None);
+                        on_draft_change.call(false);
+                    },
+                    "取消編輯"
+                }
             }
             match annual_history() {
                 Some(Ok(rows)) if rows.is_empty() => rsx! { p { class: "muted", "尚無年度配息資料，暫時使用既有預估。" } },
-                Some(Ok(rows)) => rsx! { table {
+                Some(Ok(rows)) => rsx! { div { class: "table-wrap annual-dividend-table-wrap", table {
                     thead { tr { th { "年度" } th { "每單位配息" } th { "幣別" } th { "備註" } th { "操作" } } }
                     tbody { for annual in rows {
-                        tr {
+                        AnnualDividendHistoryRow {
                             key: "{annual.dividend_year}",
-                            td { "{annual.dividend_year}" }
-                            td { class: "number", "{annual.annual_dividend_per_unit_text}" }
-                            td { class: "mono", "{annual.currency_code}" }
-                            td { "{annual.note}" }
-                            td { button {
-                                r#type: "button",
-                                class: "inline-action",
-                                onclick: move |_| {
-                                    dividend_year.set(annual.dividend_year.to_string());
-                                    annual_amount.set(annual.annual_dividend_per_unit_text.clone());
-                                    note.set(annual.note.clone());
-                                    error_message.set(String::new());
-                                },
-                                "編輯"
-                            }
-                            button {
-                                r#type: "button",
-                                class: "inline-action danger-button",
-                                onclick: move |_| confirm_delete_year.set(Some(annual.dividend_year)),
-                                "刪除"
-                            } }
+                            annual,
+                            on_edit: move |annual: AnnualDividendRow| {
+                                dividend_year.set(annual.dividend_year.to_string());
+                                annual_amount.set(annual.annual_dividend_per_unit_text);
+                                note.set(annual.note);
+                                editing_year.set(Some(annual.dividend_year));
+                                error_message.set(String::new());
+                                success_message.set(String::new());
+                            },
+                            on_delete: move |annual: AnnualDividendRow| {
+                                confirm_delete.set(Some(annual));
+                                on_delete_confirmation_change.call(true);
+                            },
                         }
                     } }
-                } },
+                } } },
                 Some(Err(error)) => rsx! { p { class: "status-message error", "讀取年度配息失敗：{error}" } },
                 None => rsx! { p { class: "muted", "載入年度配息中..." } },
             }
-            if let Some(year) = confirm_delete_year() {
+            if let Some(annual) = confirm_delete() {
                 div { class: "delete-confirmation",
-                    p { "確定要刪除 {year} 年的年度配息嗎？" }
+                    p { "確定要刪除 {annual.dividend_year} 年 {annual.annual_dividend_per_unit_text} {annual.currency_code} 的年度配息嗎？" }
                     div { class: "modal-actions",
                         button {
                             r#type: "button",
                             class: "ghost-button",
-                            onclick: move |_| confirm_delete_year.set(None),
+                            disabled: is_saving_annual(),
+                            onclick: move |_| {
+                                confirm_delete.set(None);
+                                on_delete_confirmation_change.call(false);
+                            },
                             "取消"
                         }
                         button {
                             r#type: "button",
                             class: "danger-button",
-                            onclick: move |_| match delete_annual_dividend(instrument_id, year) {
+                            disabled: is_saving_annual(),
+                            onclick: move |_| {
+                                is_saving_annual.set(true);
+                                match delete_annual_dividend(instrument_id, annual.dividend_year) {
                                 Ok(()) => {
-                                    confirm_delete_year.set(None);
+                                    confirm_delete.set(None);
+                                    on_delete_confirmation_change.call(false);
+                                    if editing_year() == Some(annual.dividend_year) {
+                                        dividend_year.set(String::new());
+                                        annual_amount.set(String::new());
+                                        note.set(String::new());
+                                        editing_year.set(None);
+                                        on_draft_change.call(false);
+                                    }
                                     error_message.set(String::new());
+                                    success_message.set(format!("已刪除 {} 年年度配息", annual.dividend_year));
                                     data_version.with_mut(|value| *value += 1);
                                 }
                                 Err(error) => error_message.set(error.to_string()),
+                                }
+                                is_saving_annual.set(false);
                             },
-                            "確認刪除"
+                            if is_saving_annual() { "刪除中..." } else { "確認刪除" }
                         }
                     }
                 }
@@ -5031,8 +5146,47 @@ fn AnnualDividendPanel(
     }
 }
 
+#[component]
+fn AnnualDividendHistoryRow(
+    annual: AnnualDividendRow,
+    on_edit: EventHandler<AnnualDividendRow>,
+    on_delete: EventHandler<AnnualDividendRow>,
+) -> Element {
+    let edit_annual = annual.clone();
+    let delete_annual = annual.clone();
+
+    rsx! {
+        tr {
+            td { "{annual.dividend_year}" }
+            td { class: "number", "{annual.annual_dividend_per_unit_text}" }
+            td { class: "mono", "{annual.currency_code}" }
+            td { "{annual.note}" }
+            td {
+                button {
+                    r#type: "button",
+                    class: "inline-action",
+                    aria_label: "編輯 {annual.dividend_year} 年配息",
+                    onclick: move |_| on_edit.call(edit_annual.clone()),
+                    "編輯"
+                }
+                button {
+                    r#type: "button",
+                    class: "inline-action danger-button",
+                    aria_label: "刪除 {annual.dividend_year} 年配息",
+                    onclick: move |_| on_delete.call(delete_annual.clone()),
+                    "刪除"
+                }
+            }
+        }
+    }
+}
+
 fn annual_dividend_average_text(rows: &[AnnualDividendRow]) -> Option<String> {
-    let total = rows.iter().try_fold(Decimal::ZERO, |total, row| {
+    if rows.is_empty() {
+        return None;
+    }
+    let recent_rows = rows.get(..rows.len().min(3))?;
+    let total = recent_rows.iter().try_fold(Decimal::ZERO, |total, row| {
         crate::decimal::parse_decimal_field(
             "annual_dividend_per_unit",
             &row.annual_dividend_per_unit_text,
@@ -5040,13 +5194,32 @@ fn annual_dividend_average_text(rows: &[AnnualDividendRow]) -> Option<String> {
         .map(|amount| total + amount)
         .ok()
     })?;
-    Decimal::from_usize(rows.len())
+    Decimal::from_usize(recent_rows.len())
         .map(|count| crate::decimal::normalize_decimal_text(total / count))
+}
+
+fn annual_dividend_summary_text(rows: &[AnnualDividendRow]) -> Option<String> {
+    let recent_rows = rows.get(..rows.len().min(3))?;
+    let average = annual_dividend_average_text(recent_rows)?;
+    let years = recent_rows
+        .iter()
+        .map(|row| row.dividend_year.to_string())
+        .collect::<Vec<_>>()
+        .join("、");
+    Some(format!(
+        "目前採用 {years} 年平均：{average} {}",
+        recent_rows.first()?.currency_code
+    ))
 }
 
 #[cfg(test)]
 mod annual_dividend_tests {
-    use super::{annual_dividend_average_text, AnnualDividendRow};
+    use super::{annual_dividend_average_text, annual_dividend_summary_text, AnnualDividendRow};
+
+    #[test]
+    fn does_not_average_empty_annual_dividends() {
+        assert_eq!(annual_dividend_average_text(&[]), None);
+    }
 
     #[test]
     fn averages_available_annual_dividend_years() {
@@ -5069,9 +5242,19 @@ mod annual_dividend_tests {
                 currency_code: "USD".to_string(),
                 note: String::new(),
             },
+            AnnualDividendRow {
+                dividend_year: 2022,
+                annual_dividend_per_unit_text: "9".to_string(),
+                currency_code: "USD".to_string(),
+                note: String::new(),
+            },
         ];
 
         assert_eq!(annual_dividend_average_text(&rows).as_deref(), Some("1.5"));
+        assert_eq!(
+            annual_dividend_summary_text(&rows).as_deref(),
+            Some("目前採用 2025、2024、2023 年平均：1.5 USD")
+        );
     }
 }
 

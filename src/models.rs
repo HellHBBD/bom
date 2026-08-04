@@ -33,6 +33,7 @@ pub struct HoldingMetric {
     pub dividend_effective_date: Option<String>,
     pub dividend_currency_code: Option<String>,
     pub estimated_annual_dividend_per_unit: Option<f64>,
+    pub manual_estimated_annual_dividend_per_unit: Option<f64>,
     pub payments_per_year: Option<i64>,
     pub latest_dividend_per_unit: Option<f64>,
     pub estimated_annual_dividend: Option<f64>,

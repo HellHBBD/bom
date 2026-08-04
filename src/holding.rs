@@ -221,9 +221,10 @@ fn upsert_annual_dividend_with_connection(
         .optional()?;
     if let Some(existing_currency) = existing_currency {
         if existing_currency != validated.3 {
-            return Err(AppError::Validation(
-                "同一商品的年度配息必須使用相同幣別".to_string(),
-            ));
+            return Err(AppError::Validation(format!(
+                "此商品年度配息已使用 {existing_currency}，不能儲存為 {}",
+                validated.3
+            )));
         }
     }
     transaction.execute(

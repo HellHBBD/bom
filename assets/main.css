@@ -685,6 +685,30 @@ tbody tr:hover {
     background: rgba(56, 189, 248, 0.08);
 }
 
+.danger-button {
+    border: 1px solid rgba(248, 113, 113, 0.5);
+    border-radius: 10px;
+    background: rgba(248, 113, 113, 0.12);
+    color: #fecaca;
+    cursor: pointer;
+    min-height: 38px;
+    padding: 8px 12px;
+}
+
+.danger-button:hover {
+    background: rgba(248, 113, 113, 0.2);
+}
+
+.inline-action:focus-visible,
+.primary-button:focus-visible,
+.ghost-button:focus-visible,
+.danger-button:focus-visible,
+.form-grid input:focus-visible,
+.form-grid textarea:focus-visible {
+    outline: 3px solid #38bdf8;
+    outline-offset: 2px;
+}
+
 .primary-button {
     border-color: rgba(56, 189, 248, 0.6);
     background: rgba(56, 189, 248, 0.18);
@@ -697,7 +721,8 @@ tbody tr:hover {
 
 .inline-action:disabled,
 .primary-button:disabled,
-.ghost-button:disabled {
+.ghost-button:disabled,
+.danger-button:disabled {
     cursor: not-allowed;
     opacity: 0.65;
 }
@@ -734,11 +759,13 @@ tbody tr:hover {
 
 .modal-card {
     width: min(760px, 100%);
+    max-height: calc(100vh - 48px);
     border: 1px solid rgba(148, 163, 184, 0.18);
     border-radius: 22px;
     background: #0f172a;
     box-shadow: 0 28px 80px rgba(2, 6, 23, 0.45);
     padding: 22px;
+    overflow-y: auto;
 }
 
 .modal-header {
@@ -802,6 +829,25 @@ tbody tr:hover {
     justify-content: end;
     gap: 12px;
     margin-top: 18px;
+}
+
+.annual-dividend-panel {
+    box-shadow: none;
+    margin-top: 22px;
+    padding: 18px;
+}
+
+.annual-dividend-table-wrap {
+    margin-top: 14px;
+}
+
+.annual-dividend-table-wrap table {
+    min-width: 620px;
+}
+
+.annual-dividend-table-wrap td:last-child {
+    display: flex;
+    gap: 8px;
 }
 
 .form-field {
@@ -899,6 +945,10 @@ tbody tr:hover {
 
     .form-grid.two-column {
         grid-template-columns: 1fr;
+    }
+
+    .modal-actions {
+        flex-wrap: wrap;
     }
 }
 

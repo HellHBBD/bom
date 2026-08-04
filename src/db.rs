@@ -646,10 +646,12 @@ fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
             h.payments_per_year,
             h.latest_dividend_per_unit,
             h.estimated_annual_dividend,
-            h.estimated_yield_on_cost
+            h.estimated_yield_on_cost,
+            CAST(manual_da.estimated_annual_dividend_per_unit_text AS REAL)
         FROM v_holding_metrics h
         LEFT JOIN holding_snapshot s ON s.holding_snapshot_id = h.holding_snapshot_id
         LEFT JOIN account a ON a.account_id = h.account_id
+        LEFT JOIN v_latest_dividend_assumption manual_da ON manual_da.instrument_id = h.instrument_id
         ORDER BY h.market_value DESC, h.instrument_name ASC
         "#,
     )?;
@@ -693,6 +695,7 @@ fn load_holding_metrics_native() -> SqlResult<Vec<HoldingMetric>> {
             latest_dividend_per_unit: row.get(34)?,
             estimated_annual_dividend: row.get(35)?,
             estimated_yield_on_cost: row.get(36)?,
+            manual_estimated_annual_dividend_per_unit: row.get(37)?,
         })
     })?;
 
