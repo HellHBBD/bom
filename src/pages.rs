@@ -4985,7 +4985,6 @@ fn AnnualDividendPanel(
                         min: "1900",
                         max: "9999",
                         inputmode: "numeric",
-                        autofocus: true,
                         value: "{dividend_year}",
                         disabled: is_saving_annual(),
                         oninput: move |event| {

@@ -15,6 +15,7 @@ mod format;
 mod holding;
 mod layout;
 mod master_data;
+mod modal;
 mod models;
 mod pages;
 mod price;
@@ -51,6 +52,7 @@ fn App() -> Element {
 
     rsx! {
         document::Stylesheet { href: asset!("/assets/main.css") }
+        modal::ModalFocusManager {}
         Router::<Route> {}
     }
 }
