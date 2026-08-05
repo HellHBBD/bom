@@ -25,6 +25,7 @@ pub const HOLDINGS_REGION: &str = "holdings.region";
 pub const HOLDINGS_SORT: &str = "holdings.sort";
 pub const HOLDINGS_VISIBLE_COLUMNS: &str = "holdings.visible_columns";
 pub const HOLDINGS_SHOW_CLOSED: &str = "holdings.show_closed";
+pub const HOLDINGS_ISSUE: &str = "holdings.issue";
 pub const QUICK_PRICE_SEARCH: &str = "quick_price.search";
 pub const QUICK_PRICE_CURRENCY: &str = "quick_price.currency";
 pub const QUICK_PRICE_SORT: &str = "quick_price.sort";

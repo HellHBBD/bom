@@ -40,15 +40,18 @@ use crate::ui_preference::{
     parse_visible_columns, persist_preference, preference_value, serialize_visible_columns,
     valid_option, valid_sort, UiPreferences, ACCOUNTS_ASSET_TYPE, ACCOUNTS_CURRENCY,
     ACCOUNTS_INSTITUTION, ACCOUNTS_OWNER, ACCOUNTS_SEARCH, ACCOUNTS_SORT, HOLDINGS_ASSET_CLASS,
-    HOLDINGS_OWNER, HOLDINGS_REGION, HOLDINGS_SEARCH, HOLDINGS_SHOW_CLOSED, HOLDINGS_SORT,
-    HOLDINGS_TYPE, HOLDINGS_VISIBLE_COLUMNS, LEGACY_DIVIDENDS_INSTRUMENT, LEGACY_DIVIDENDS_OWNER,
-    LEGACY_DIVIDENDS_PERIOD, LEGACY_DIVIDENDS_SEARCH, LEGACY_DIVIDENDS_SORT, QUICK_PRICE_CURRENCY,
-    QUICK_PRICE_DATE, QUICK_PRICE_SEARCH, QUICK_PRICE_SORT,
+    HOLDINGS_ISSUE, HOLDINGS_OWNER, HOLDINGS_REGION, HOLDINGS_SEARCH, HOLDINGS_SHOW_CLOSED,
+    HOLDINGS_SORT, HOLDINGS_TYPE, HOLDINGS_VISIBLE_COLUMNS, LEGACY_DIVIDENDS_INSTRUMENT,
+    LEGACY_DIVIDENDS_OWNER, LEGACY_DIVIDENDS_PERIOD, LEGACY_DIVIDENDS_SEARCH,
+    LEGACY_DIVIDENDS_SORT, QUICK_PRICE_CURRENCY, QUICK_PRICE_DATE, QUICK_PRICE_SEARCH,
+    QUICK_PRICE_SORT,
 };
 
 #[component]
 pub fn DashboardPage() -> Element {
     let data_version = use_context::<Signal<u64>>();
+    let preferences = use_context::<UiPreferences>();
+    let navigator = use_navigator();
     let summary = use_resource(move || async move {
         let _ = data_version();
         load_dashboard_summary()
@@ -63,7 +66,19 @@ pub fn DashboardPage() -> Element {
         match summary() {
             None => rsx! { StatusCard { text: "載入資產總覽中...".to_string() } },
             Some(Err(error)) => rsx! { StatusCard { text: format!("讀取資產總覽失敗：{error}") } },
-            Some(Ok(summary)) => rsx! { DashboardCards { summary } },
+            Some(Ok(summary)) => rsx! {
+                DashboardCards {
+                    summary,
+                    on_show_missing_dividend: move |_| {
+                        persist_preference(preferences, HOLDINGS_ISSUE, "missing_dividend".to_string());
+                        navigator.push(crate::routes::Route::HoldingsPage {});
+                    },
+                    on_show_missing_market_value: move |_| {
+                        persist_preference(preferences, HOLDINGS_ISSUE, "missing_market_value".to_string());
+                        navigator.push(crate::routes::Route::HoldingsPage {});
+                    },
+                }
+            },
         }
     }
 }
@@ -79,7 +94,7 @@ pub fn AccountsPage() -> Element {
     rsx! {
         PageHeader {
             title: "帳戶資產".to_string(),
-            description: "由 v_account_asset_value 讀取最新帳戶資產快照與台幣換算值。".to_string(),
+            description: "顯示各帳戶的最新資產、幣別與台幣換算值。".to_string(),
         }
 
         match account_assets() {
@@ -102,7 +117,7 @@ pub fn HoldingsPage() -> Element {
     rsx! {
         PageHeader {
             title: "持股明細".to_string(),
-            description: "由 v_holding_metrics 讀取最新持股、成本、市值、損益與預估配息。".to_string(),
+            description: "顯示最新持股、成本、市值、損益與預估配息。".to_string(),
         }
 
         match holdings() {
@@ -212,6 +227,10 @@ pub fn QuickPriceUpdatePage() -> Element {
                 let price_rows = build_quick_price_update_rows(&rows);
                 let currency_options = unique_strings(price_rows.iter().map(|row| row.currency_code.as_str()));
                 let draft_values = draft_prices();
+                let entered_price_count = draft_values
+                    .values()
+                    .filter(|value| !value.trim().is_empty())
+                    .count();
                 let save_rows = price_rows.clone();
                 let visible_rows = filter_quick_price_rows(
                     &price_rows,
@@ -273,7 +292,7 @@ pub fn QuickPriceUpdatePage() -> Element {
                                     disabled: is_saving(),
                                 }
                             }
-                            div { class: "filter-total", "{display_rows.len()} / {price_rows.len()} 檔商品可更新市價" }
+                            div { class: "filter-total", "{display_rows.len()} / {price_rows.len()} 檔商品可更新市價；已輸入 {entered_price_count} 檔" }
                             button {
                                 r#type: "button",
                                 class: "ghost-button",
@@ -298,6 +317,7 @@ pub fn QuickPriceUpdatePage() -> Element {
                             }
                             button {
                                 r#type: "button",
+                                id: "quick-price-save",
                                 class: "primary-button",
                                 disabled: is_saving(),
                                 onclick: move |_| {
@@ -408,8 +428,17 @@ fn QuickPriceUpdateRowView(
                 input {
                     class: "table-input mono",
                     value: "{draft_value}",
-                    placeholder: "0",
+                    placeholder: "輸入新市價",
+                    inputmode: "decimal",
                     disabled: is_saving,
+                    onkeydown: move |event| {
+                        if event.key() == Key::Enter
+                            && event.modifiers().intersects(Modifiers::CONTROL | Modifiers::META)
+                        {
+                            event.prevent_default();
+                            click_element("quick-price-save");
+                        }
+                    },
                     oninput: move |event| on_price_input.call((instrument_id, event.value())),
                 }
             }
@@ -583,8 +612,8 @@ pub fn DividendIncomePage() -> Element {
                     Some(Err(error)) => rsx! { StatusCard { text: format!("無法讀取逐筆股息資料：{error}") } },
                     Some(Ok(rows)) if rows.is_empty() => rsx! {
                         section { class: "card empty-state",
-                            h3 { "目前沒有逐筆股息紀錄" }
-                            p { "這不是錯誤。第一階段不新增資料；Excel 匯入的歷史彙總保留為唯讀歷史參考。" }
+                            h3 { "目前沒有實際入帳股息" }
+                            p { "可點「新增股息」記錄實際入帳資料；Excel 歷史彙總保留在「Excel 歷史股息」供查閱。" }
                         }
                     },
                     Some(Ok(rows)) => rsx! {
@@ -860,9 +889,14 @@ pub fn ExchangeRatePage() -> Element {
             },
         }
         if let Some(row) = deleting_rate() {
-            div { class: "delete-confirmation",
-                p { "確定刪除 {row.rate_date} {row.base_currency_code}/NTD 匯率嗎？" }
-                div { class: "modal-actions",
+            div { class: "modal-backdrop",
+                div { class: "modal-card delete-confirmation",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "確認刪除匯率",
+                    h3 { "刪除匯率" }
+                    p { "確定刪除 {row.rate_date} {row.base_currency_code}/NTD 匯率嗎？" }
+                    div { class: "modal-actions",
                     button {
                         r#type: "button",
                         class: "ghost-button",
@@ -898,6 +932,7 @@ pub fn ExchangeRatePage() -> Element {
                             });
                         },
                         "確認刪除"
+                    }
                     }
                 }
             }
@@ -986,7 +1021,7 @@ pub fn DividendsLegacyPage() -> Element {
 
         section { class: "card legacy-note",
             strong { "唯讀歷史資料" }
-            p { "這些資料保留原始 Excel 手動輸入的年度、累積與月份彙總，包含來源儲存格位置；不包含入帳日期、入帳帳戶、稅額、費用或除息資訊，因此不會轉成逐筆 dividend_receipt。" }
+            p { "這些資料保留原始 Excel 手動輸入的年度、累積與月份彙總，包含來源儲存格位置；不包含入帳日期、入帳帳戶、稅額、費用或除息資訊，因此不會轉成逐筆實收股息。" }
         }
 
         match legacy_dividends() {
@@ -1023,7 +1058,11 @@ fn StatusCard(text: String) -> Element {
 }
 
 #[component]
-fn DashboardCards(summary: DashboardSummary) -> Element {
+fn DashboardCards(
+    summary: DashboardSummary,
+    on_show_missing_dividend: EventHandler<()>,
+    on_show_missing_market_value: EventHandler<()>,
+) -> Element {
     let latest_account_asset_date = summary.latest_account_asset_date.as_deref().unwrap_or("-");
     let latest_holding_date = summary.latest_holding_date.as_deref().unwrap_or("-");
 
@@ -1035,6 +1074,14 @@ fn DashboardCards(summary: DashboardSummary) -> Element {
                 hint: incomplete_total_hint(&summary),
                 accent: "primary".to_string(),
             }
+            if summary.holding_missing_market_value_count > 0 {
+                button {
+                    r#type: "button",
+                    class: "ghost-button inline-action",
+                    onclick: move |_| on_show_missing_market_value.call(()),
+                    "處理缺市值 {summary.holding_missing_market_value_count} 筆"
+                }
+            }
             MetricCard {
                 label: "帳戶資產".to_string(),
                 value: money(summary.account_assets),
@@ -1045,6 +1092,14 @@ fn DashboardCards(summary: DashboardSummary) -> Element {
                     "筆缺台幣價值",
                 ),
                 accent: "cash".to_string(),
+            }
+            if summary.holding_missing_dividend_count > 0 {
+                button {
+                    r#type: "button",
+                    class: "ghost-button inline-action",
+                    onclick: move |_| on_show_missing_dividend.call(()),
+                    "處理缺配息 {summary.holding_missing_dividend_count} 筆"
+                }
             }
             MetricCard {
                 label: "投資資產".to_string(),
@@ -1162,7 +1217,7 @@ fn DividendReceiptTable(
         section { class: "card table-card",
             div { class: "table-summary",
                 strong { "{rows.len()} 筆逐筆股息" }
-                span { "來源 dividend_receipt / v_dividend_receipt_amount" }
+                span { "依實際入帳的逐筆股息計算" }
             }
             DividendReceiptSummaryPanel { summary }
             div { class: "table-wrap",
@@ -1448,6 +1503,7 @@ fn DividendReceiptUpsertModal(
     let mut is_saving = use_signal(|| false);
     let mut is_deleting = use_signal(|| false);
     let mut error_message = use_signal(String::new);
+    let mut success_message = use_signal(String::new);
     let mut confirm_delete = use_signal(|| false);
     let mut confirm_close = use_signal(|| false);
     let mut save_and_continue = use_signal(|| false);
@@ -1481,30 +1537,12 @@ fn DividendReceiptUpsertModal(
                             h3 { "新增股息收入" }
                         }
                     }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            if interaction_locked {
-                                return;
-                            }
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            confirm_delete.set(false);
-                            let reset_form = initial_form_snapshot();
-                            account_id.set(reset_form.account_id);
-                            instrument_id.set(reset_form.instrument_id);
-                            received_on.set(reset_form.received_on);
-                            net_amount.set(reset_form.net_amount);
-                            currency_code.set(reset_form.currency_code);
-                            note.set(reset_form.note);
-                        },
-                        "還原"
-                    }
                 }
                 if !error_message().is_empty() {
                     div { class: "status-message error", role: "alert", "{error_message}" }
+                }
+                if !success_message().is_empty() {
+                    div { class: "status-message success", role: "status", aria_live: "polite", "{success_message}" }
                 }
                 if !is_editing {
                     p { class: "modal-subtitle", "此處記錄實際已入帳的股息，不會改變持股的配息預估。" }
@@ -1533,6 +1571,7 @@ fn DividendReceiptUpsertModal(
                     div { class: "form-field",
                         span { "商品" }
                         SearchableSelect {
+                            id: "dividend-receipt-instrument".to_string(),
                             label: "商品".to_string(),
                             value: "{instrument_id}",
                             empty_label: Some("請選擇商品".to_string()),
@@ -1623,6 +1662,28 @@ fn DividendReceiptUpsertModal(
                     button {
                         r#type: "button",
                         class: "ghost-button",
+                        disabled: interaction_locked || !is_dirty,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            error_message.set(String::new());
+                            success_message.set(String::new());
+                            confirm_close.set(false);
+                            confirm_delete.set(false);
+                            let reset_form = initial_form_snapshot();
+                            account_id.set(reset_form.account_id);
+                            instrument_id.set(reset_form.instrument_id);
+                            received_on.set(reset_form.received_on);
+                            net_amount.set(reset_form.net_amount);
+                            currency_code.set(reset_form.currency_code);
+                            note.set(reset_form.note);
+                        },
+                        "重設欄位"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
                         disabled: interaction_locked,
                         onclick: move |_| {
                             if interaction_locked {
@@ -1672,6 +1733,7 @@ fn DividendReceiptUpsertModal(
                             let continue_after_save = save_and_continue();
                             let mut is_saving = is_saving;
                             let mut error_message = error_message;
+                            let mut success_message = success_message;
                             let mut confirm_close = confirm_close;
                             let receipt_id = receipt_for_save.as_ref().map(|row| row.receipt_id);
 
@@ -1717,6 +1779,8 @@ fn DividendReceiptUpsertModal(
                                                 currency_code: String::new(),
                                                 note: String::new(),
                                             });
+                                            success_message.set(format!("{message}，可繼續新增下一筆"));
+                                            focus_element("dividend-receipt-instrument");
                                             on_saved_and_continue.call(message);
                                         } else {
                                             on_saved.call(message);
@@ -1883,23 +1947,6 @@ fn AccountCreateModal(
                         p { class: "eyebrow", "最小主檔" }
                         h3 { "新增帳戶" }
                     }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            if interaction_locked {
-                                return;
-                            }
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            display_name.set(reset_form.display_name);
-                            account_number.set(reset_form.account_number);
-                            institution_id.set(reset_form.institution_id);
-                        },
-                        "還原"
-                    }
                 }
                 if !error_message().is_empty() {
                     div { class: "status-message error", "{error_message}" }
@@ -1941,6 +1988,23 @@ fn AccountCreateModal(
                     }
                 }
                 div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked || !is_dirty,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            display_name.set(reset_form.display_name);
+                            account_number.set(reset_form.account_number);
+                            institution_id.set(reset_form.institution_id);
+                        },
+                        "重設欄位"
+                    }
                     button {
                         r#type: "button",
                         class: "ghost-button",
@@ -2066,26 +2130,6 @@ fn InstrumentCreateModal(
                         p { class: "eyebrow", "最小主檔" }
                         h3 { "新增商品" }
                     }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        disabled: interaction_locked,
-                        onclick: move |_| {
-                            if interaction_locked {
-                                return;
-                            }
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            symbol.set(reset_form.symbol);
-                            name.set(reset_form.name);
-                            instrument_type.set(reset_form.instrument_type);
-                            asset_class.set(reset_form.asset_class);
-                            region_type.set(reset_form.region_type);
-                            trading_currency_code.set(reset_form.trading_currency_code);
-                        },
-                        "還原"
-                    }
                 }
                 if !error_message().is_empty() {
                     div { class: "status-message error", "{error_message}" }
@@ -2158,6 +2202,26 @@ fn InstrumentCreateModal(
                     }
                 }
                 div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked || !is_dirty,
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            symbol.set(reset_form.symbol);
+                            name.set(reset_form.name);
+                            instrument_type.set(reset_form.instrument_type);
+                            asset_class.set(reset_form.asset_class);
+                            region_type.set(reset_form.region_type);
+                            trading_currency_code.set(reset_form.trading_currency_code);
+                        },
+                        "重設欄位"
+                    }
                     button {
                         r#type: "button",
                         class: "ghost-button",
@@ -2726,7 +2790,7 @@ fn LegacySummaryTable(rows: Vec<LegacyDividendSummaryRow>) -> Element {
         section { class: "card table-card",
             div { class: "table-summary",
                 strong { "年度／累積資料" }
-                span { "{rows.len()} 筆，來自 dividend_legacy_summary" }
+                span { "{rows.len()} 筆 Excel 歷史彙總資料" }
             }
             if is_empty {
                 div { class: "empty-state", h3 { "目前沒有符合條件的年度／累積資料" } }
@@ -2960,6 +3024,7 @@ fn SelectFilter(
                 }
             } else {
                 select {
+                    aria_label: "{label}",
                     value: "{value}",
                     oninput: move |event| on_change.call(event.value()),
                     option { value: "", "全部" }
@@ -2976,6 +3041,7 @@ const SEARCHABLE_SELECT_MIN_OPTIONS: usize = 10;
 
 #[component]
 fn SearchableSelect(
+    #[props(default)] id: String,
     label: String,
     value: String,
     options: Vec<(String, String)>,
@@ -2992,8 +3058,10 @@ fn SearchableSelect(
     rsx! {
         div { class: if is_open() { "searchable-select open" } else { "searchable-select" },
             button {
+                id: "{id}",
                 r#type: "button",
                 class: "searchable-select-trigger",
+                aria_label: "{label}",
                 aria_haspopup: "listbox",
                 aria_expanded: is_open(),
                 disabled,
@@ -3599,6 +3667,7 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
     let mut is_column_picker_open = use_signal(|| false);
     let mut show_closed =
         use_signal(move || preference_value(&preferences(), HOLDINGS_SHOW_CLOSED) == "true");
+    let mut issue_filter = use_signal(move || preference_value(&preferences(), HOLDINGS_ISSUE));
 
     let owner_options = unique_strings(rows.iter().map(|row| row.owner_name.as_str()));
     let type_options = unique_strings(rows.iter().map(|row| row.instrument_type.as_str()));
@@ -3620,6 +3689,7 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
             valid_option(&owner_filter(), &owner_options_for_persistence, ""),
         )
     });
+    use_effect(move || persist_preference(preferences, HOLDINGS_ISSUE, issue_filter()));
     use_effect(move || {
         persist_preference(preferences, HOLDINGS_SHOW_CLOSED, show_closed().to_string())
     });
@@ -3693,6 +3763,7 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
     let search_value = search().to_lowercase();
     let sort_value = sort_by();
     let visible_columns_value = visible_columns();
+    let issue_value = issue_filter();
     let column_picker_options = HOLDING_COLUMNS
         .iter()
         .map(|(column_id, label)| {
@@ -3715,6 +3786,11 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                 || row.instrument_name.to_lowercase().contains(&search_value)
         })
         .filter(|row| show_closed() || row.quantity.unwrap_or(0.0) > 0.0)
+        .filter(|row| match issue_value.as_str() {
+            "missing_dividend" => row.estimated_annual_dividend.is_none(),
+            "missing_market_value" => row.market_value.is_none(),
+            _ => true,
+        })
         .cloned()
         .collect::<Vec<_>>();
     let filtered_totals = build_holding_report_totals(&filtered_rows);
@@ -3737,6 +3813,12 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                 span { "已依幣別彙總篩選結果" }
             }
             div { class: "filters",
+                if issue_value == "missing_dividend" {
+                    button { r#type: "button", class: "ghost-button", onclick: move |_| issue_filter.set(String::new()), "正在顯示缺配息持股，清除" }
+                }
+                if issue_value == "missing_market_value" {
+                    button { r#type: "button", class: "ghost-button", onclick: move |_| issue_filter.set(String::new()), "正在顯示缺市值持股，清除" }
+                }
                 input {
                     placeholder: "搜尋商品名稱或代號",
                     value: "{search}",
@@ -4263,25 +4345,6 @@ fn AccountAssetEditModal(
                         h3 { "編輯帳戶資產" }
                         p { class: "modal-subtitle", "{asset.account_name} / {asset_type_label(&asset.asset_type)} {asset.currency_code}" }
                     }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        onclick: move |_| {
-                            if interaction_locked {
-                                return;
-                            }
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            snapshot_date.set(reset_form.snapshot_date);
-                            quantity.set(reset_form.quantity);
-                            current_value_override.set(reset_form.current_value_override);
-                            invested_amount.set(reset_form.invested_amount);
-                            note.set(reset_form.note);
-                        },
-                        disabled: interaction_locked,
-                        "還原"
-                    }
                 }
                 if !error_message().is_empty() {
                     div { class: "status-message error", role: "alert", "{error_message}" }
@@ -4392,6 +4455,25 @@ fn AccountAssetEditModal(
                     }
                 }
                 div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            snapshot_date.set(reset_form.snapshot_date);
+                            quantity.set(reset_form.quantity);
+                            current_value_override.set(reset_form.current_value_override);
+                            invested_amount.set(reset_form.invested_amount);
+                            note.set(reset_form.note);
+                        },
+                        disabled: interaction_locked || !is_dirty,
+                        "重設欄位"
+                    }
                     button {
                         r#type: "button",
                         class: "ghost-button",
@@ -4587,24 +4669,6 @@ fn HoldingEditModal(
                         h3 { "更新持股" }
                         p { class: "modal-subtitle", "{row.symbol} {row.instrument_name}" }
                     }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        onclick: move |_| {
-                            if interaction_locked {
-                                return;
-                            }
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            as_of_date.set(reset_form.as_of_date);
-                            quantity_text.set(reset_form.quantity_text);
-                            average_cost_text.set(reset_form.average_cost_text);
-                            note.set(reset_form.note);
-                        },
-                        disabled: interaction_locked || !is_dirty,
-                        "還原"
-                    }
                 }
                 if !error_message().is_empty() {
                     div { class: "status-message error", role: "alert", "{error_message}" }
@@ -4700,6 +4764,24 @@ fn HoldingEditModal(
                     }
                 }
                 div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| {
+                            if interaction_locked {
+                                return;
+                            }
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            as_of_date.set(reset_form.as_of_date);
+                            quantity_text.set(reset_form.quantity_text);
+                            average_cost_text.set(reset_form.average_cost_text);
+                            note.set(reset_form.note);
+                        },
+                        disabled: interaction_locked || !is_dirty,
+                        "重設欄位"
+                    }
                     button {
                         r#type: "button",
                         class: "ghost-button",
@@ -4886,25 +4968,6 @@ fn HoldingDividendAssumptionModal(
                         h3 { id: "holding-dividend-dialog-title", "編輯配息估計" }
                         p { id: "holding-dividend-dialog-description", class: "modal-subtitle", "{row.account_name} / {row.symbol} {row.instrument_name}" }
                     }
-                    button {
-                        r#type: "button",
-                        class: "ghost-button",
-                        onclick: move |_| {
-                            if interaction_locked {
-                                return;
-                            }
-                            error_message.set(String::new());
-                            confirm_close.set(false);
-                            let reset_form = initial_form_snapshot();
-                            effective_date.set(reset_form.effective_date);
-                            payments_per_year.set(reset_form.payments_per_year);
-                            latest_dividend_per_unit.set(reset_form.latest_dividend_per_unit);
-                            estimated_annual_dividend_per_unit
-                                .set(reset_form.estimated_annual_dividend_per_unit);
-                        },
-                        disabled: interaction_locked || !settings_dirty,
-                        "還原"
-                    }
                 }
                 if !error_message().is_empty() {
                     div { class: "status-message error", role: "alert", "{error_message}" }
@@ -4954,13 +5017,6 @@ fn HoldingDividendAssumptionModal(
                         }
                     }
                 }
-                AnnualDividendPanel {
-                    instrument_id: row.instrument_id,
-                    currency_code: dividend_currency_code.clone(),
-                    data_version,
-                    on_draft_change: move |is_dirty| annual_draft_is_dirty.set(is_dirty),
-                    on_delete_confirmation_change: move |is_open| annual_delete_confirmation_open.set(is_open),
-                }
                 div { class: "modal-actions",
                     button {
                         r#type: "button",
@@ -4969,11 +5025,28 @@ fn HoldingDividendAssumptionModal(
                             if interaction_locked {
                                 return;
                             }
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            effective_date.set(reset_form.effective_date);
+                            payments_per_year.set(reset_form.payments_per_year);
+                            latest_dividend_per_unit.set(reset_form.latest_dividend_per_unit);
+                            estimated_annual_dividend_per_unit
+                                .set(reset_form.estimated_annual_dividend_per_unit);
+                        },
+                        disabled: interaction_locked || !settings_dirty,
+                        "重設欄位"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| {
+                            if interaction_locked { return; }
                             if is_dirty {
                                 confirm_close.set(true);
-                                return;
+                            } else {
+                                on_close.call(());
                             }
-                            on_close.call(());
                         },
                         disabled: interaction_locked,
                         "取消"
@@ -4981,11 +5054,10 @@ fn HoldingDividendAssumptionModal(
                     button {
                         r#type: "button",
                         class: "primary-button",
-                        disabled: interaction_locked,
+                        disabled: interaction_locked || !settings_dirty,
                         onclick: move |_| {
                             is_saving.set(true);
                             error_message.set(String::new());
-
                             let has_values = !payments_per_year().trim().is_empty()
                                 || !latest_dividend_per_unit().trim().is_empty()
                                 || (!uses_annual_dividend_history
@@ -5000,31 +5072,32 @@ fn HoldingDividendAssumptionModal(
                                 is_saving.set(false);
                                 return;
                             }
-
-                            let result = save_dividend_assumption(DividendAssumptionInput {
+                            match save_dividend_assumption(DividendAssumptionInput {
                                 instrument_id: row.instrument_id,
                                 effective_date: effective_date(),
                                 payments_per_year_text: payments_per_year(),
                                 latest_dividend_per_unit_text: latest_dividend_per_unit(),
                                 estimated_annual_dividend_per_unit_text: estimated_annual_dividend_per_unit(),
                                 currency_code: dividend_currency_code.clone(),
-                            });
-
-                            is_saving.set(false);
-
-                            match result {
+                            }) {
                                 Ok(()) => {
                                     data_version.with_mut(|value| *value += 1);
                                     confirm_close.set(false);
                                     on_saved.call(format!("{} 配息估計已更新", row.instrument_name));
                                 }
-                                Err(error) => {
-                                    error_message.set(format!("儲存失敗：{error}"));
-                                }
+                                Err(error) => error_message.set(format!("儲存失敗：{error}")),
                             }
+                            is_saving.set(false);
                         },
                         if is_saving() { "儲存中..." } else { "儲存配息設定" }
                     }
+                }
+                AnnualDividendPanel {
+                    instrument_id: row.instrument_id,
+                    currency_code: dividend_currency_code.clone(),
+                    data_version,
+                    on_draft_change: move |is_dirty| annual_draft_is_dirty.set(is_dirty),
+                    on_delete_confirmation_change: move |is_open| annual_delete_confirmation_open.set(is_open),
                 }
                 if confirm_close() {
                     div { class: "delete-confirmation",
@@ -5417,6 +5490,12 @@ fn holding_update_default_date(snapshot_date: &str, today: &str) -> String {
 
 fn click_element(id: &str) {
     document::eval(&format!("document.getElementById('{id}')?.click()"));
+}
+
+fn focus_element(id: &str) {
+    document::eval(&format!(
+        "requestAnimationFrame(() => document.getElementById('{id}')?.focus())"
+    ));
 }
 
 fn fee_exclusive_average_cost(row: &HoldingMetric) -> String {

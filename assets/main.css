@@ -322,6 +322,11 @@ a {
     padding: 8px 10px;
 }
 
+.filters select,
+.form-grid select {
+    color-scheme: dark;
+}
+
 .filters button {
     cursor: pointer;
 }
@@ -571,6 +576,22 @@ table {
     width: max-content;
 }
 
+.holdings-table th:last-child,
+.holdings-table td:last-child {
+    position: sticky;
+    right: 0;
+    background: #111827;
+    box-shadow: -10px 0 14px rgba(2, 6, 23, 0.28);
+}
+
+.holdings-table td:last-child {
+    background: #0f172a;
+}
+
+.holdings-table tbody tr:hover td:last-child {
+    background: #132038;
+}
+
 .price-update-table {
     min-width: 980px;
 }
@@ -626,6 +647,10 @@ td {
 
 .quick-price-controls {
     align-items: end;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #0f172a;
 }
 
 .quick-price-error {
