@@ -30,12 +30,16 @@ fn main() {
 
     dioxus::LaunchBuilder::new()
         .with_cfg(
-            Config::new().with_window(
-                WindowBuilder::new()
-                    .with_title("BOM")
-                    .with_inner_size(LogicalSize::new(1440.0, 900.0))
-                    .with_min_inner_size(LogicalSize::new(1024.0, 700.0)),
-            ),
+            Config::new()
+                .with_window(
+                    WindowBuilder::new()
+                        .with_title("BOM")
+                        .with_inner_size(LogicalSize::new(1440.0, 900.0))
+                        .with_min_inner_size(LogicalSize::new(1024.0, 700.0)),
+                )
+                .with_data_directory(
+                    db::path::webview_data_directory().expect("無法取得 WebView 資料目錄"),
+                ),
         )
         .launch(App);
 }

@@ -14,9 +14,17 @@ const DATABASE_FILE_NAME: &str = "data.sqlite";
 const SEED_DATABASE_PATH: &str = "assets/data.sqlite";
 
 pub fn runtime_database_path() -> AppResult<PathBuf> {
-    let project_dirs = ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
-        .ok_or_else(|| AppError::Validation("無法取得應用程式資料目錄".to_string()))?;
-    Ok(project_dirs.data_dir().join(DATABASE_FILE_NAME))
+    Ok(application_data_directory()?.join(DATABASE_FILE_NAME))
+}
+
+pub fn webview_data_directory() -> AppResult<PathBuf> {
+    Ok(application_data_directory()?.join("webview"))
+}
+
+fn application_data_directory() -> AppResult<PathBuf> {
+    ProjectDirs::from(APP_QUALIFIER, APP_ORGANIZATION, APP_NAME)
+        .map(|project_dirs| project_dirs.data_dir().to_path_buf())
+        .ok_or_else(|| AppError::Validation("無法取得應用程式資料目錄".to_string()))
 }
 
 pub fn seed_database_path() -> PathBuf {
