@@ -12,10 +12,26 @@ pub struct InstitutionOption {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct PersonOption {
+    pub person_id: i64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AccountCreateInput {
     pub institution_id: i64,
     pub display_name: String,
     pub account_number: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountUpdateInput {
+    pub account_id: i64,
+    pub institution_id: i64,
+    pub display_name: String,
+    pub account_number: String,
+    pub account_type: String,
+    pub owner_id: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,8 +49,18 @@ pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
     load_institution_options_native().map_err(|error| error.to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_person_options() -> Result<Vec<PersonOption>, String> {
+    load_person_options_native().map_err(|error| error.to_string())
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
+    Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_person_options() -> Result<Vec<PersonOption>, String> {
     Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
 }
 
@@ -48,6 +74,19 @@ pub fn create_manual_account(input: AccountCreateInput) -> AppResult<i64> {
 pub fn create_manual_account(_input: AccountCreateInput) -> AppResult<i64> {
     Err(AppError::Validation(
         "目前只支援桌面版 SQLite 帳戶新增".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn update_manual_account(input: AccountUpdateInput) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    update_manual_account_with_connection(&mut connection, input)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn update_manual_account(_input: AccountUpdateInput) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 帳戶更新".to_string(),
     ))
 }
 
@@ -86,6 +125,34 @@ fn validate_account_create_input(input: &AccountCreateInput) -> AppResult<Accoun
         institution_id: input.institution_id,
         display_name,
         account_number,
+    })
+}
+
+fn validate_account_update_input(input: &AccountUpdateInput) -> AppResult<AccountUpdateInput> {
+    if input.account_id <= 0 {
+        return Err(AppError::Validation("找不到帳戶".to_string()));
+    }
+
+    let created = validate_account_create_input(&AccountCreateInput {
+        institution_id: input.institution_id,
+        display_name: input.display_name.clone(),
+        account_number: input.account_number.clone(),
+    })?;
+    let account_type = input.account_type.trim().to_string();
+    if !matches!(account_type.as_str(), "BANK" | "BROKERAGE") {
+        return Err(AppError::Validation("帳戶類型不正確".to_string()));
+    }
+    if input.owner_id <= 0 {
+        return Err(AppError::Validation("請選擇所有權人".to_string()));
+    }
+
+    Ok(AccountUpdateInput {
+        account_id: input.account_id,
+        institution_id: created.institution_id,
+        display_name: created.display_name,
+        account_number: created.account_number,
+        account_type,
+        owner_id: input.owner_id,
     })
 }
 
@@ -178,6 +245,60 @@ fn create_manual_account_with_connection(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn update_manual_account_with_connection(
+    connection: &mut Connection,
+    input: AccountUpdateInput,
+) -> AppResult<()> {
+    let validated = validate_account_update_input(&input)?;
+    let transaction = connection.transaction()?;
+    ensure_account_exists(&transaction, validated.account_id)?;
+    ensure_institution_exists(&transaction, validated.institution_id)?;
+    ensure_person_exists(&transaction, validated.owner_id)?;
+
+    let existing_account: Option<i64> = transaction
+        .query_row(
+            "SELECT account_id FROM account WHERE institution_id = ?1 AND account_number = ?2 AND account_id <> ?3 LIMIT 1",
+            params![validated.institution_id, validated.account_number, validated.account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(account_id) = existing_account {
+        return Err(AppError::Validation(format!(
+            "此金融機構的帳戶號碼已存在於帳戶 #{account_id}"
+        )));
+    }
+
+    transaction.execute(
+        r#"
+        UPDATE account
+        SET display_name = ?1,
+            institution_id = ?2,
+            account_type = ?3,
+            account_number = ?4,
+            account_number_last4 = SUBSTR(?4, -4)
+        WHERE account_id = ?5
+        "#,
+        params![
+            validated.display_name,
+            validated.institution_id,
+            validated.account_type,
+            validated.account_number,
+            validated.account_id,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM account_owner WHERE account_id = ?1",
+        [validated.account_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO account_owner (account_id, person_id) VALUES (?1, ?2)",
+        params![validated.account_id, validated.owner_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn create_manual_instrument_with_connection(
     connection: &mut Connection,
     input: InstrumentCreateInput,
@@ -250,6 +371,23 @@ fn load_institution_options_native() -> rusqlite::Result<Vec<InstitutionOption>>
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn load_person_options_native() -> rusqlite::Result<Vec<PersonOption>> {
+    let connection = crate::db::open_database()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let mut statement = connection.prepare(
+        "SELECT person_id, COALESCE(display_name, '未命名') FROM person ORDER BY display_name ASC, person_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(PersonOption {
+            person_id: row.get(0)?,
+            name: row.get(1)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_institution_exists(connection: &Connection, institution_id: i64) -> AppResult<()> {
     let exists: Option<i64> = connection
         .query_row(
@@ -265,6 +403,40 @@ fn ensure_institution_exists(connection: &Connection, institution_id: i64) -> Ap
         Err(AppError::Validation(format!(
             "找不到金融機構：{institution_id}"
         )))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_account_exists(connection: &Connection, account_id: i64) -> AppResult<()> {
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT account_id FROM account WHERE account_id = ?1 LIMIT 1",
+            [account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!("找不到帳戶：{account_id}")))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_person_exists(connection: &Connection, person_id: i64) -> AppResult<()> {
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT person_id FROM person WHERE person_id = ?1 LIMIT 1",
+            [person_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!("找不到所有權人：{person_id}")))
     }
 }
 
@@ -311,6 +483,16 @@ mod tests {
                     account_number_last4 TEXT
                 );
 
+                CREATE TABLE person (
+                    person_id INTEGER PRIMARY KEY,
+                    display_name TEXT
+                );
+
+                CREATE TABLE account_owner (
+                    account_id INTEGER PRIMARY KEY,
+                    person_id INTEGER NOT NULL
+                );
+
                 CREATE TABLE instrument (
                     instrument_id INTEGER PRIMARY KEY,
                     symbol TEXT,
@@ -326,6 +508,9 @@ mod tests {
                 );
 
                 INSERT INTO institution (institution_id, name) VALUES (1, 'Demo Bank');
+                INSERT INTO institution (institution_id, name) VALUES (2, 'Other Bank');
+                INSERT INTO person (person_id, display_name) VALUES (1, '原所有權人');
+                INSERT INTO person (person_id, display_name) VALUES (2, '新所有權人');
                 INSERT INTO currency (currency_code) VALUES ('NTD');
                 "#,
             )
@@ -372,6 +557,93 @@ mod tests {
         .expect_err("account number should be rejected");
 
         assert!(error.to_string().contains("帳戶號碼只能包含數字"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn update_manual_account_replaces_its_owner_and_master_data() {
+        let mut connection = Connection::open_in_memory().expect("open db");
+        seed_db(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO account (account_id, display_name, institution_id, account_type, account_number, account_number_last4) VALUES (1, '舊帳戶', 1, 'BANK', '00001234', '1234')",
+                [],
+            )
+            .expect("insert account");
+        connection
+            .execute(
+                "INSERT INTO account_owner (account_id, person_id) VALUES (1, 1)",
+                [],
+            )
+            .expect("insert owner");
+
+        update_manual_account_with_connection(
+            &mut connection,
+            AccountUpdateInput {
+                account_id: 1,
+                institution_id: 2,
+                display_name: "新帳戶".to_string(),
+                account_number: "99887766".to_string(),
+                account_type: "BROKERAGE".to_string(),
+                owner_id: 2,
+            },
+        )
+        .expect("update account");
+
+        let account: (String, i64, String, String, String) = connection
+            .query_row(
+                "SELECT display_name, institution_id, account_type, account_number, account_number_last4 FROM account WHERE account_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read account");
+        let owner_id: i64 = connection
+            .query_row(
+                "SELECT person_id FROM account_owner WHERE account_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read owner");
+
+        assert_eq!(
+            account,
+            (
+                "新帳戶".to_string(),
+                2,
+                "BROKERAGE".to_string(),
+                "99887766".to_string(),
+                "7766".to_string()
+            )
+        );
+        assert_eq!(owner_id, 2);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn update_manual_account_rejects_an_existing_institution_account_number() {
+        let mut connection = Connection::open_in_memory().expect("open db");
+        seed_db(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO account (account_id, display_name, institution_id, account_type, account_number, account_number_last4) VALUES (1, '帳戶一', 1, 'BANK', '00001234', '1234'), (2, '帳戶二', 1, 'BANK', '99887766', '7766')",
+                [],
+            )
+            .expect("insert accounts");
+
+        let error = update_manual_account_with_connection(
+            &mut connection,
+            AccountUpdateInput {
+                account_id: 1,
+                institution_id: 1,
+                display_name: "帳戶一".to_string(),
+                account_number: "99887766".to_string(),
+                account_type: "BANK".to_string(),
+                owner_id: 1,
+            },
+        )
+        .expect_err("duplicate account number should fail");
+
+        assert!(error.to_string().contains("帳戶號碼已存在"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

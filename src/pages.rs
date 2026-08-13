@@ -26,8 +26,9 @@ use crate::holding::{
     upsert_annual_dividend, AnnualDividendInput, CurrentHoldingStateInput, DividendAssumptionInput,
 };
 use crate::master_data::{
-    create_manual_account, create_manual_instrument, load_institution_options, AccountCreateInput,
-    InstitutionOption, InstrumentCreateInput,
+    create_manual_account, create_manual_instrument, load_institution_options, load_person_options,
+    update_manual_account, AccountCreateInput, AccountUpdateInput, InstitutionOption,
+    InstrumentCreateInput, PersonOption,
 };
 use crate::models::{
     AccountAsset, AnnualDividendRow, DashboardSummary, DividendReceiptAccountOption,
@@ -1375,6 +1376,15 @@ struct AccountCreateModalForm {
     display_name: String,
     account_number: String,
     institution_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AccountEditModalForm {
+    display_name: String,
+    account_number: String,
+    institution_id: String,
+    account_type: String,
+    owner_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3990,7 +4000,17 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
 #[component]
 fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
     let mut editing_row = use_signal(|| None::<AccountAsset>);
+    let mut editing_account = use_signal(|| None::<AccountAsset>);
     let mut status_message = use_signal(String::new);
+    let mut data_version = use_context::<Signal<u64>>();
+    let master_institution_options = use_resource(move || {
+        let _ = data_version();
+        async move { load_institution_options() }
+    });
+    let person_options = use_resource(move || {
+        let _ = data_version();
+        async move { load_person_options() }
+    });
     let preferences = use_context::<UiPreferences>();
     let mut owner_filter = use_signal(move || preference_value(&preferences(), ACCOUNTS_OWNER));
     let mut institution_filter =
@@ -4192,6 +4212,10 @@ fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
                                         status_message.set(String::new());
                                         editing_row.set(Some(asset));
                                     },
+                                    on_account_edit: move |asset| {
+                                        status_message.set(String::new());
+                                        editing_account.set(Some(asset));
+                                    },
                                 }
                             }
                         }
@@ -4209,11 +4233,39 @@ fn AccountAssetsTable(rows: Vec<AccountAsset>) -> Element {
                 },
             }
         }
+        if let Some(account) = editing_account() {
+            match (master_institution_options(), person_options()) {
+                (Some(Ok(institutions)), Some(Ok(people))) => rsx! {
+                    AccountEditModal {
+                        account,
+                        institutions,
+                        people,
+                        on_close: move |_| editing_account.set(None),
+                        on_saved: move |message| {
+                            status_message.set(message);
+                            editing_account.set(None);
+                            data_version.with_mut(|value| *value += 1);
+                        },
+                    }
+                },
+                (Some(Err(error)), _) | (_, Some(Err(error))) => rsx! {
+                    StatusCard { text: format!("讀取帳戶編輯選項失敗：{error}") }
+                },
+                _ => rsx! { StatusCard { text: "載入帳戶編輯選項中...".to_string() } },
+            }
+        }
     }
 }
 
 #[component]
-fn AccountAssetRow(row: AccountAsset, on_edit: EventHandler<AccountAsset>) -> Element {
+fn AccountAssetRow(
+    row: AccountAsset,
+    on_edit: EventHandler<AccountAsset>,
+    on_account_edit: EventHandler<AccountAsset>,
+) -> Element {
+    let asset_for_edit = row.clone();
+    let account_for_edit = row.clone();
+
     rsx! {
         tr {
             td { "{row.owner_name}" }
@@ -4231,8 +4283,208 @@ fn AccountAssetRow(row: AccountAsset, on_edit: EventHandler<AccountAsset>) -> El
                 button {
                     r#type: "button",
                     class: "inline-action",
-                    onclick: move |_| on_edit.call(row.clone()),
-                    "編輯"
+                    onclick: move |_| on_edit.call(asset_for_edit.clone()),
+                    "編輯資產"
+                }
+                button {
+                    r#type: "button",
+                    class: "inline-action",
+                    onclick: move |_| on_account_edit.call(account_for_edit.clone()),
+                    "編輯帳戶"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn AccountEditModal(
+    account: AccountAsset,
+    institutions: Vec<InstitutionOption>,
+    people: Vec<PersonOption>,
+    on_close: EventHandler<()>,
+    on_saved: EventHandler<String>,
+) -> Element {
+    let initial_form = AccountEditModalForm {
+        display_name: account.account_name.clone(),
+        account_number: account.account_number.clone().unwrap_or_default(),
+        institution_id: account
+            .institution_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        account_type: account.account_type.clone(),
+        owner_id: account
+            .owner_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+    };
+    let initial_form_snapshot = use_signal(|| initial_form.clone());
+    let mut display_name = use_signal(|| initial_form.display_name.clone());
+    let mut account_number = use_signal(|| initial_form.account_number.clone());
+    let mut institution_id = use_signal(|| initial_form.institution_id.clone());
+    let mut account_type = use_signal(|| initial_form.account_type.clone());
+    let mut owner_id = use_signal(|| initial_form.owner_id.clone());
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+    let mut confirm_close = use_signal(|| false);
+    let interaction_locked = is_saving();
+    let is_dirty = AccountEditModalForm {
+        display_name: display_name(),
+        account_number: account_number(),
+        institution_id: institution_id(),
+        account_type: account_type(),
+        owner_id: owner_id(),
+    } != initial_form_snapshot();
+
+    rsx! {
+        div { class: "modal-backdrop",
+            div { class: "modal-card",
+                div { class: "modal-header",
+                    div {
+                        h3 { "編輯帳戶" }
+                        p { class: "modal-subtitle", "此處變更會套用到此帳戶的資產、持股與股息紀錄。" }
+                    }
+                }
+                if !error_message().is_empty() {
+                    div { class: "status-message error", role: "alert", "{error_message}" }
+                }
+                div { class: "form-grid two-column",
+                    label { class: "form-field full-width",
+                        span { "帳戶名稱" }
+                        input {
+                            value: "{display_name}",
+                            oninput: move |event| display_name.set(event.value()),
+                            disabled: interaction_locked,
+                        }
+                    }
+                    label { class: "form-field full-width",
+                        span { "帳戶號碼" }
+                        input {
+                            value: "{account_number}",
+                            oninput: move |event| account_number.set(event.value()),
+                            disabled: interaction_locked,
+                            inputmode: "numeric",
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "金融機構" }
+                        select {
+                            value: "{institution_id}",
+                            oninput: move |event| institution_id.set(event.value()),
+                            disabled: interaction_locked,
+                            option { value: "", disabled: true, "請選擇金融機構" }
+                            for institution in institutions.iter() {
+                                option { value: "{institution.institution_id}", "{institution.name}" }
+                            }
+                        }
+                    }
+                    label { class: "form-field",
+                        span { "帳戶類型" }
+                        select {
+                            value: "{account_type}",
+                            oninput: move |event| account_type.set(event.value()),
+                            disabled: interaction_locked,
+                            option { value: "BANK", "銀行帳戶" }
+                            option { value: "BROKERAGE", "證券帳戶" }
+                        }
+                    }
+                    label { class: "form-field full-width",
+                        span { "所有權人" }
+                        select {
+                            value: "{owner_id}",
+                            oninput: move |event| owner_id.set(event.value()),
+                            disabled: interaction_locked,
+                            option { value: "", disabled: true, "請選擇所有權人" }
+                            for person in people.iter() {
+                                option { value: "{person.person_id}", "{person.name}" }
+                            }
+                        }
+                    }
+                }
+                div { class: "modal-actions",
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked || !is_dirty,
+                        onclick: move |_| {
+                            error_message.set(String::new());
+                            confirm_close.set(false);
+                            let reset_form = initial_form_snapshot();
+                            display_name.set(reset_form.display_name);
+                            account_number.set(reset_form.account_number);
+                            institution_id.set(reset_form.institution_id);
+                            account_type.set(reset_form.account_type);
+                            owner_id.set(reset_form.owner_id);
+                        },
+                        "重設欄位"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            if is_dirty {
+                                confirm_close.set(true);
+                            } else {
+                                on_close.call(());
+                            }
+                        },
+                        "取消"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        disabled: interaction_locked,
+                        onclick: move |_| {
+                            is_saving.set(true);
+                            error_message.set(String::new());
+                            let input = AccountUpdateInput {
+                                account_id: account.account_id,
+                                institution_id: institution_id().parse::<i64>().unwrap_or_default(),
+                                display_name: display_name(),
+                                account_number: account_number(),
+                                account_type: account_type(),
+                                owner_id: owner_id().parse::<i64>().unwrap_or_default(),
+                            };
+
+                            match update_manual_account(input) {
+                                Ok(()) => {
+                                    is_saving.set(false);
+                                    confirm_close.set(false);
+                                    on_saved.call(format!("帳戶 {} 已更新", account.account_name));
+                                }
+                                Err(error) => {
+                                    error_message.set(format!("儲存失敗：{error}"));
+                                    is_saving.set(false);
+                                }
+                            }
+                        },
+                        if is_saving() { "儲存中..." } else { "儲存帳戶" }
+                    }
+                }
+                if confirm_close() {
+                    div { class: "delete-confirmation",
+                        p { "尚未儲存變更，確定要關閉嗎？" }
+                        div { class: "modal-actions",
+                            button {
+                                r#type: "button",
+                                class: "ghost-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| confirm_close.set(false),
+                                "繼續編輯"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "danger-button",
+                                disabled: interaction_locked,
+                                onclick: move |_| {
+                                    confirm_close.set(false);
+                                    on_close.call(());
+                                },
+                                "確認關閉"
+                            }
+                        }
+                    }
                 }
             }
         }

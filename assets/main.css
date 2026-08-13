@@ -577,18 +577,22 @@ table {
 }
 
 .holdings-table th:last-child,
-.holdings-table td:last-child {
+.holdings-table td:last-child,
+.account-assets-table th:last-child,
+.account-assets-table td:last-child {
     position: sticky;
     right: 0;
     background: #111827;
     box-shadow: -10px 0 14px rgba(2, 6, 23, 0.28);
 }
 
-.holdings-table td:last-child {
+.holdings-table td:last-child,
+.account-assets-table td:last-child {
     background: #0f172a;
 }
 
-.holdings-table tbody tr:hover td:last-child {
+.holdings-table tbody tr:hover td:last-child,
+.account-assets-table tbody tr:hover td:last-child {
     background: #132038;
 }
 

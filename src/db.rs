@@ -464,7 +464,9 @@ fn load_account_assets_native() -> SqlResult<Vec<AccountAsset>> {
             v.snapshot_id,
             v.account_id,
             s.origin,
+            ao.person_id,
             COALESCE(p.display_name, '未指定') AS owner_name,
+            i.institution_id,
             COALESCE(i.name, '未指定機構') AS institution_name,
             COALESCE(a.display_name, '帳戶 #' || v.account_id) AS account_name,
             a.account_number,
@@ -488,26 +490,28 @@ fn load_account_assets_native() -> SqlResult<Vec<AccountAsset>> {
     )?;
 
     let rows = statement.query_map([], |row| {
-        let quantity_text: Option<String> = row.get(10)?;
-        let invested_amount_text: Option<String> = row.get(12)?;
+        let quantity_text: Option<String> = row.get(12)?;
+        let invested_amount_text: Option<String> = row.get(14)?;
 
         Ok(AccountAsset {
             snapshot_id: row.get(0)?,
             account_id: row.get(1)?,
             origin: row.get(2)?,
-            owner_name: row.get(3)?,
-            institution_name: row.get(4)?,
-            account_name: account_name(&row.get::<_, String>(5)?),
-            account_number: row.get(6)?,
-            account_type: row.get(7)?,
-            asset_type: row.get(8)?,
-            currency_code: row.get(9)?,
+            owner_id: row.get(3)?,
+            owner_name: row.get(4)?,
+            institution_id: row.get(5)?,
+            institution_name: row.get(6)?,
+            account_name: account_name(&row.get::<_, String>(7)?),
+            account_number: row.get(8)?,
+            account_type: row.get(9)?,
+            asset_type: row.get(10)?,
+            currency_code: row.get(11)?,
             quantity_text: quantity_text.clone(),
-            current_value_override_text: row.get(11)?,
+            current_value_override_text: row.get(13)?,
             invested_amount_text: invested_amount_text.clone(),
-            current_value_ntd: row.get(13)?,
-            snapshot_date: row.get(14)?,
-            note: row.get(15)?,
+            current_value_ntd: row.get(15)?,
+            snapshot_date: row.get(16)?,
+            note: row.get(17)?,
             quantity: parse_number_text(quantity_text),
             invested_amount: parse_number_text(invested_amount_text),
         })
