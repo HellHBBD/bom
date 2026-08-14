@@ -218,15 +218,16 @@ jobs:
             throw "No Windows NSIS EXE was found under $bundleOutputDir."
           }
 
-          $bundleExe = $exeFiles |
-            Where-Object { $_.Name -match "setup" } |
-            Select-Object -First 1
+          $setupFiles = @(
+            $exeFiles |
+              Where-Object { $_.Name -like "*-setup.exe" }
+          )
 
-          if (-not $bundleExe) {
-            $bundleExe = $exeFiles |
-              Sort-Object Length -Descending |
-              Select-Object -First 1
+          if ($setupFiles.Count -ne 1) {
+            throw "Expected exactly one NSIS setup.exe, found $($setupFiles.Count)."
           }
+
+          $bundleExe = $setupFiles[0]
 
           $shortSha = $env:GITHUB_SHA.Substring(0, 7)
           $buildLabel = "test-$env:GITHUB_RUN_NUMBER-$shortSha"
@@ -424,15 +425,16 @@ jobs:
             throw "No Windows NSIS EXE was found under $bundleOutputDir."
           }
 
-          $bundleExe = $exeFiles |
-            Where-Object { $_.Name -match "setup" } |
-            Select-Object -First 1
+          $setupFiles = @(
+            $exeFiles |
+              Where-Object { $_.Name -like "*-setup.exe" }
+          )
 
-          if (-not $bundleExe) {
-            $bundleExe = $exeFiles |
-              Sort-Object Length -Descending |
-              Select-Object -First 1
+          if ($setupFiles.Count -ne 1) {
+            throw "Expected exactly one NSIS setup.exe, found $($setupFiles.Count)."
           }
+
+          $bundleExe = $setupFiles[0]
 
           $shortSha = $env:GITHUB_SHA.Substring(0, 7)
 
@@ -448,6 +450,10 @@ jobs:
           $destination = Join-Path "dist" $fileName
 
           Copy-Item -Path $bundleExe.FullName -Destination $destination -Force
+
+          if (-not (Test-Path $destination)) {
+            throw "Expected installer was not created: $destination"
+          }
 
           Write-Host ""
           Write-Host "Windows NSIS installer created:"

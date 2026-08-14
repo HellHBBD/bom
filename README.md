@@ -60,6 +60,12 @@
 
 ## Related Pages
 
+### 設定
+
+- 側邊欄點 `設定` 可查看目前 BOM 版本。
+- Windows 安裝版可手動檢查 GitHub 最新正式 Release、下載並驗證 Windows Setup，之後手動開始安裝。
+- 更新不會處理 runtime SQLite 資料庫；目前只允許在 runtime 與新版 seed database schema 完全相同時發布更新。
+
 ### 快速市價更新
 
 - 側邊欄點 `快速市價更新`

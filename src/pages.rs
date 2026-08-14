@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+
 use dioxus::prelude::*;
 use rust_decimal::{prelude::FromPrimitive, prelude::ToPrimitive, Decimal};
 
@@ -47,6 +50,10 @@ use crate::ui_preference::{
     LEGACY_DIVIDENDS_SORT, QUICK_PRICE_CURRENCY, QUICK_PRICE_DATE, QUICK_PRICE_SEARCH,
     QUICK_PRICE_SORT,
 };
+use crate::update::APP_VERSION;
+
+#[cfg(target_os = "windows")]
+use crate::update::{check_for_update, download_update, launch_installer, UpdateInfo};
 
 #[component]
 pub fn DashboardPage() -> Element {
@@ -1030,6 +1037,212 @@ pub fn DividendsLegacyPage() -> Element {
             Some(Err(error)) => rsx! { StatusCard { text: format!("讀取 Excel 歷史股息彙總失敗：{error}") } },
             Some(Ok(data)) if data.summaries.is_empty() && data.monthly.is_empty() => rsx! { StatusCard { text: "目前沒有 Excel 歷史股息彙總資料。".to_string() } },
             Some(Ok(data)) => rsx! { LegacyDividendTables { data } },
+        }
+    }
+}
+
+#[component]
+pub fn SettingsPage() -> Element {
+    rsx! {
+        PageHeader {
+            title: "設定".to_string(),
+            description: "管理 BOM 應用程式版本與更新。".to_string(),
+        }
+        UpdateSettingsCard {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, PartialEq)]
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading(UpdateInfo),
+    ReadyToInstall {
+        update: UpdateInfo,
+        installer: PathBuf,
+    },
+    CheckFailed(String),
+    DownloadFailed {
+        update: UpdateInfo,
+        message: String,
+    },
+    InstallFailed {
+        update: UpdateInfo,
+        installer: PathBuf,
+        message: String,
+    },
+}
+
+#[cfg(target_os = "windows")]
+#[component]
+fn UpdateSettingsCard() -> Element {
+    let mut state = use_signal(|| UpdateState::Idle);
+
+    rsx! {
+        section { class: "card update-card",
+            div { class: "update-card-header",
+                div {
+                    p { class: "eyebrow", "應用程式" }
+                    h3 { "應用程式更新" }
+                }
+                span { class: "update-version", "目前版本 {APP_VERSION}" }
+            }
+            match state() {
+                UpdateState::Idle => rsx! {
+                    p { class: "update-copy", "手動檢查 GitHub 的最新正式版本。" }
+                    button {
+                        r#type: "button",
+                        class: "primary-button",
+                        onclick: move |_| {
+                            state.set(UpdateState::Checking);
+                            spawn(async move {
+                                state.set(match check_for_update().await {
+                                    Ok(Some(update)) => UpdateState::Available(update),
+                                    Ok(None) => UpdateState::UpToDate,
+                                    Err(error) => UpdateState::CheckFailed(error.to_string()),
+                                });
+                            });
+                        },
+                        "檢查更新"
+                    }
+                },
+                UpdateState::Checking => rsx! {
+                    p { class: "update-copy", role: "status", aria_live: "polite", "正在檢查更新..." }
+                    button { r#type: "button", class: "primary-button", disabled: true, "檢查更新" }
+                },
+                UpdateState::UpToDate => rsx! {
+                    div { class: "status-message success", role: "status", aria_live: "polite", "目前已是最新版本 {APP_VERSION}" }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| state.set(UpdateState::Idle),
+                        "再次檢查"
+                    }
+                },
+                UpdateState::Available(update) => {
+                    let update_for_download = update.clone();
+                    rsx! {
+                        UpdateAvailable { update: update.clone() }
+                        button {
+                            r#type: "button",
+                            class: "primary-button",
+                            onclick: move |_| {
+                                let update = update_for_download.clone();
+                                state.set(UpdateState::Downloading(update.clone()));
+                                spawn(async move {
+                                    state.set(match download_update(&update).await {
+                                        Ok(installer) => UpdateState::ReadyToInstall { update, installer },
+                                        Err(error) => UpdateState::DownloadFailed { update, message: error.to_string() },
+                                    });
+                                });
+                            },
+                            "下載更新"
+                        }
+                    }
+                }
+                UpdateState::Downloading(update) => rsx! {
+                    p { class: "update-copy", role: "status", aria_live: "polite", "正在下載 BOM {update.version}..." }
+                    button { r#type: "button", class: "primary-button", disabled: true, "下載更新" }
+                },
+                UpdateState::ReadyToInstall { update, installer } => {
+                    let update_for_install = update.clone();
+                    let installer_for_install = installer.clone();
+                    rsx! {
+                        div { class: "status-message success", role: "status", aria_live: "polite", "BOM {update.version} 已下載並完成完整性驗證。" }
+                        p { class: "update-copy", "開始安裝後，BOM 將關閉。" }
+                        button {
+                            r#type: "button",
+                            class: "primary-button",
+                            onclick: move |_| {
+                                let update = update_for_install.clone();
+                                let installer = installer_for_install.clone();
+                                match launch_installer(&installer) {
+                                    Ok(()) => dioxus::desktop::window().close(),
+                                    Err(error) => state.set(UpdateState::InstallFailed {
+                                        update,
+                                        installer,
+                                        message: error.to_string(),
+                                    }),
+                                }
+                            },
+                            "開始安裝"
+                        }
+                    }
+                }
+                UpdateState::CheckFailed(message) => rsx! {
+                    div { class: "status-message error", role: "alert", "{message}" }
+                    button {
+                        r#type: "button",
+                        class: "ghost-button",
+                        onclick: move |_| state.set(UpdateState::Idle),
+                        "重新檢查"
+                    }
+                },
+                UpdateState::DownloadFailed { update, message } => {
+                    let update_for_retry = update.clone();
+                    rsx! {
+                        div { class: "status-message error", role: "alert", "{message}" }
+                        button {
+                            r#type: "button",
+                            class: "ghost-button",
+                            onclick: move |_| state.set(UpdateState::Available(update_for_retry.clone())),
+                            "重新下載"
+                        }
+                    }
+                }
+                UpdateState::InstallFailed { update, installer, message } => {
+                    let update_for_retry = update.clone();
+                    let installer_for_retry = installer.clone();
+                    rsx! {
+                        div { class: "status-message error", role: "alert", "{message}" }
+                        button {
+                            r#type: "button",
+                            class: "ghost-button",
+                            onclick: move |_| state.set(UpdateState::ReadyToInstall {
+                                update: update_for_retry.clone(),
+                                installer: installer_for_retry.clone(),
+                            }),
+                            "再次嘗試安裝"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[component]
+fn UpdateAvailable(update: UpdateInfo) -> Element {
+    rsx! {
+        div { class: "update-available",
+            h4 { "有可用更新" }
+            dl { class: "update-details",
+                div { dt { "目前版本" } dd { "{APP_VERSION}" } }
+                div { dt { "最新版本" } dd { "{update.version}" } }
+            }
+            if let Some(notes) = update.release_notes {
+                div { class: "update-notes",
+                    h4 { "更新內容" }
+                    p { "{notes}" }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[component]
+fn UpdateSettingsCard() -> Element {
+    rsx! {
+        section { class: "card update-card",
+            p { class: "eyebrow", "應用程式" }
+            h3 { "應用程式更新" }
+            p { class: "update-copy", "目前版本 {APP_VERSION}" }
+            p { class: "update-copy", "更新僅支援 Windows 安裝版。" }
         }
     }
 }

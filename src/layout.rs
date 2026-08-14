@@ -96,6 +96,7 @@ pub fn AppLayout() -> Element {
                     NavLink { route: Route::ExchangeRatePage {}, label: "匯率維護" }
                     NavLink { route: Route::DividendIncomePage {}, label: "股息收入" }
                     NavLink { route: Route::DividendsLegacyPage {}, label: "Excel 歷史股息" }
+                    NavLink { route: Route::SettingsPage {}, label: "設定" }
                 }
             }
             main { class: "content",
@@ -126,6 +127,7 @@ fn route_from_preference(path: &str) -> Option<Route> {
         "/market/exchange-rates" => Some(Route::ExchangeRatePage {}),
         "/dividends" => Some(Route::DividendIncomePage {}),
         "/dividends/legacy" => Some(Route::DividendsLegacyPage {}),
+        "/settings" => Some(Route::SettingsPage {}),
         _ => None,
     }
 }
@@ -143,6 +145,7 @@ fn route_path(route: &Route) -> &'static str {
         Route::ExchangeRatePage {} => "/market/exchange-rates",
         Route::DividendIncomePage {} => "/dividends",
         Route::DividendsLegacyPage {} => "/dividends/legacy",
+        Route::SettingsPage {} => "/settings",
     }
 }
 
@@ -153,6 +156,7 @@ mod tests {
     #[test]
     fn restores_only_defined_routes() {
         assert!(route_from_preference("/holdings").is_some());
+        assert!(route_from_preference("/settings").is_some());
         assert!(route_from_preference("/not-a-route").is_none());
     }
 

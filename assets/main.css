@@ -142,6 +142,85 @@ a {
     gap: 14px;
 }
 
+.update-card {
+    display: grid;
+    gap: 18px;
+    max-width: 760px;
+    padding: 24px;
+}
+
+.update-card h3,
+.update-available h4,
+.update-notes h4 {
+    margin: 0;
+}
+
+.update-card-header {
+    align-items: start;
+    display: flex;
+    gap: 18px;
+    justify-content: space-between;
+}
+
+.update-version {
+    color: #cbd5e1;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 13px;
+}
+
+.update-copy {
+    color: #cbd5e1;
+    line-height: 1.6;
+    margin: 0;
+}
+
+.update-card .status-message {
+    margin: 0;
+}
+
+.update-available {
+    display: grid;
+    gap: 16px;
+}
+
+.update-details {
+    display: grid;
+    gap: 10px;
+    margin: 0;
+}
+
+.update-details div {
+    align-items: center;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    display: flex;
+    justify-content: space-between;
+    padding-bottom: 10px;
+}
+
+.update-details dt {
+    color: #94a3b8;
+}
+
+.update-details dd {
+    color: #f8fafc;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    margin: 0;
+}
+
+.update-notes {
+    border-top: 1px solid rgba(148, 163, 184, 0.16);
+    display: grid;
+    gap: 10px;
+    padding-top: 16px;
+}
+
+.update-notes p {
+    color: #cbd5e1;
+    line-height: 1.6;
+    margin: 0;
+    white-space: pre-wrap;
+}
+
 .section-actions {
     display: flex;
     flex-wrap: wrap;

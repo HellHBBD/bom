@@ -21,6 +21,7 @@ mod pages;
 mod price;
 mod routes;
 mod ui_preference;
+mod update;
 
 use routes::Route;
 
