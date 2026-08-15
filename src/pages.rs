@@ -1080,6 +1080,7 @@ enum UpdateState {
 #[component]
 fn UpdateSettingsCard() -> Element {
     let mut state = use_signal(|| UpdateState::Idle);
+    let desktop = dioxus::desktop::use_window();
 
     rsx! {
         section { class: "card update-card",
@@ -1150,6 +1151,7 @@ fn UpdateSettingsCard() -> Element {
                 UpdateState::ReadyToInstall { update, installer } => {
                     let update_for_install = update.clone();
                     let installer_for_install = installer.clone();
+                    let desktop_for_install = desktop.clone();
                     rsx! {
                         div { class: "status-message success", role: "status", aria_live: "polite", "BOM {update.version} 已下載並完成完整性驗證。" }
                         p { class: "update-copy", "開始安裝後，BOM 將關閉。" }
@@ -1160,7 +1162,7 @@ fn UpdateSettingsCard() -> Element {
                                 let update = update_for_install.clone();
                                 let installer = installer_for_install.clone();
                                 match launch_installer(&installer) {
-                                    Ok(()) => dioxus::desktop::window().close(),
+                                    Ok(()) => desktop_for_install.close(),
                                     Err(error) => state.set(UpdateState::InstallFailed {
                                         update,
                                         installer,
@@ -5394,7 +5396,7 @@ fn HoldingDividendAssumptionModal(
         .and_then(|rows| annual_dividend_average_text(rows));
     let uses_annual_dividend_history = annual_dividend_average.is_some();
     let displayed_annual_dividend =
-        annual_dividend_average.unwrap_or_else(|| estimated_annual_dividend_per_unit());
+        annual_dividend_average.unwrap_or_else(&*estimated_annual_dividend_per_unit);
     let annual_dividend_summary = annual_history()
         .as_ref()
         .and_then(|result| result.as_ref().ok())

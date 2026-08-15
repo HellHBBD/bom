@@ -2,6 +2,8 @@ name: Windows CI and Dioxus Bundle
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -35,7 +37,7 @@ jobs:
     name: Windows checks
     if: >-
       github.event_name == 'pull_request' ||
-      (github.event_name == 'push' && github.ref_type == 'tag') ||
+      (github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')) ||
       (github.event_name == 'workflow_dispatch' && !inputs.bundle_windows)
     runs-on: windows-latest
 
@@ -236,6 +238,10 @@ jobs:
           $destination = Join-Path "dist" $fileName
 
           Copy-Item -Path $bundleExe.FullName -Destination $destination -Force
+
+          if (-not (Test-Path $destination)) {
+            throw "Expected installer was not created: $destination"
+          }
 
           Write-Host ""
           Write-Host "Windows NSIS installer created:"

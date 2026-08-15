@@ -750,7 +750,7 @@ fn validate_schema_matches_seed(
     let expected = load_schema_objects(&seed_connection)?;
     let actual = load_schema_objects(connection)?;
 
-    for ((object_type, object_name), _) in &expected {
+    for (object_type, object_name) in expected.keys() {
         if !actual.contains_key(&(object_type.clone(), object_name.clone())) {
             return Err(AppError::Validation(format!(
                 "baseline v{BASELINE_DATABASE_VERSION} 結構不一致：缺少 {object_type} {object_name}。請關閉應用程式後刪除資料夾：{}，再重新啟動應用程式",
@@ -758,7 +758,7 @@ fn validate_schema_matches_seed(
             )));
         }
     }
-    for ((object_type, object_name), _) in &actual {
+    for (object_type, object_name) in actual.keys() {
         if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
             return Err(AppError::Validation(format!(
                 "baseline v{BASELINE_DATABASE_VERSION} 結構不一致：多出 {object_type} {object_name}。請關閉應用程式後刪除資料夾：{}，再重新啟動應用程式",

@@ -10,7 +10,6 @@ const ASSET_SUFFIX: &str = "-windows-x86_64-setup.exe";
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpdateInfo {
     pub version: Version,
-    pub tag: String,
     pub asset_name: String,
     pub download_url: String,
     pub expected_size: u64,
@@ -87,6 +86,7 @@ mod windows {
     use std::time::Duration;
 
     use reqwest::{Client, StatusCode};
+    use semver::Version;
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
@@ -117,7 +117,7 @@ mod windows {
         Client::builder()
             .user_agent(format!("BOM-Updater/{APP_VERSION}"))
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
+            .read_timeout(Duration::from_secs(30))
             .build()
             .map_err(|error| {
                 eprintln!("無法建立更新 HTTP client：{error}");
@@ -132,6 +132,7 @@ mod windows {
             ))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .timeout(Duration::from_secs(60))
             .send()
             .await
             .map_err(|error| {
@@ -167,7 +168,6 @@ mod windows {
 
         Ok(Some(UpdateInfo {
             version,
-            tag: release.tag_name,
             asset_name: asset.name,
             download_url: asset.browser_download_url,
             expected_size: asset.size,
@@ -195,6 +195,7 @@ mod windows {
 
         let response = client()?
             .get(&update.download_url)
+            .timeout(Duration::from_secs(15 * 60))
             .send()
             .await
             .map_err(|error| {
@@ -223,6 +224,9 @@ mod windows {
                 UpdateError::Download
             })? {
                 downloaded += chunk.len() as u64;
+                if downloaded > update.expected_size {
+                    return Err(UpdateError::IncompleteDownload);
+                }
                 hasher.update(&chunk);
                 file.write_all(&chunk).await.map_err(|error| {
                     eprintln!("寫入更新檔案失敗：{error}");
