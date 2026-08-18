@@ -1,15 +1,9 @@
-name: Windows CI and Dioxus Bundle
+name: Windows Bundle and Release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-
-  pull_request:
-    branches:
-      - main
 
   workflow_dispatch:
     inputs:
@@ -30,49 +24,9 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
-  check:
-    name: Windows checks
-    if: >-
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/main')) ||
-      (github.event_name == 'workflow_dispatch' && !inputs.bundle_windows)
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.97.0
-        with:
-          components: rustfmt, clippy
-
-      - name: Show Rust versions
-        run: |
-          rustc -Vv
-          cargo -V
-          cargo clippy -V
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Run tests
-        run: cargo test --locked
-
-      - name: Cargo check
-        run: cargo check --locked
-
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
   bundle-windows-manual:
     name: Bundle Windows EXE (Manual)
     if: >-
@@ -259,8 +213,6 @@ jobs:
   bundle-windows-release:
     name: Bundle Windows EXE (Release)
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - check
     runs-on: windows-latest
 
     permissions:
@@ -269,6 +221,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify release commit is on main
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor HEAD origin/main
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag commit is not contained in origin/main."
+          }
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.97.0
