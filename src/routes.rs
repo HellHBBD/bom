@@ -1,8 +1,8 @@
 use dioxus::prelude::*;
 
 use crate::pages::{
-    AccountsPage, DashboardPage, DividendIncomePage, DividendsLegacyPage, ExchangeRatePage,
-    HoldingsPage, QuickPriceUpdatePage, SettingsPage,
+    AccountsPage, AssetsPage, DashboardPage, DividendIncomePage, DividendsLegacyPage,
+    ExchangeRatePage, HoldingsPage, QuickPriceUpdatePage, SettingsPage,
 };
 
 #[derive(Clone, Routable, PartialEq)]
@@ -11,6 +11,8 @@ pub enum Route {
     #[layout(crate::layout::AppLayout)]
     #[route("/")]
     DashboardPage {},
+    #[route("/assets")]
+    AssetsPage {},
     #[route("/accounts")]
     AccountsPage {},
     #[route("/holdings")]

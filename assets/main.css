@@ -1015,6 +1015,109 @@ tbody tr:hover {
     font-size: 13px;
 }
 
+.asset-view-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 18px;
+}
+
+.asset-view-tab {
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    border-radius: 999px;
+    background: rgba(15, 23, 42, 0.72);
+    color: #cbd5e1;
+    min-height: 40px;
+    padding: 8px 14px;
+}
+
+.asset-view-tab:hover,
+.asset-view-tab.active {
+    border-color: rgba(56, 189, 248, 0.72);
+    background: rgba(56, 189, 248, 0.14);
+    color: #f8fafc;
+}
+
+.asset-portfolio-view {
+    display: grid;
+    gap: 18px;
+    padding: 22px;
+}
+
+.asset-portfolio-search {
+    max-width: 420px;
+}
+
+.asset-portfolio-list {
+    display: grid;
+    gap: 14px;
+}
+
+.asset-portfolio-card {
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 16px;
+    background: rgba(15, 23, 42, 0.5);
+    padding: 18px;
+}
+
+.asset-portfolio-header {
+    align-items: start;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    justify-content: space-between;
+}
+
+.asset-portfolio-header h2,
+.asset-portfolio-card h3 {
+    margin: 0;
+}
+
+.asset-portfolio-header p,
+.asset-portfolio-card .muted {
+    color: #94a3b8;
+    margin: 6px 0 0;
+}
+
+.asset-portfolio-summary {
+    display: grid;
+    gap: 4px;
+    text-align: right;
+}
+
+.asset-portfolio-sections {
+    display: grid;
+    gap: 18px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-top: 18px;
+}
+
+.asset-portfolio-sections section {
+    display: grid;
+    gap: 10px;
+}
+
+.asset-portfolio-rows {
+    display: grid;
+    gap: 6px;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.asset-portfolio-rows li {
+    align-items: baseline;
+    border-top: 1px solid rgba(148, 163, 184, 0.12);
+    display: grid;
+    gap: 8px;
+    grid-template-columns: minmax(160px, 1fr) auto auto auto;
+    padding: 9px 0 0;
+}
+
+.product-portfolio-rows li {
+    grid-template-columns: minmax(160px, 1fr) auto auto auto auto;
+}
+
 @media (max-width: 860px) {
     body {
         height: auto;
@@ -1057,6 +1160,19 @@ tbody tr:hover {
 
     .modal-actions {
         flex-wrap: wrap;
+    }
+
+    .asset-portfolio-sections {
+        grid-template-columns: 1fr;
+    }
+
+    .asset-portfolio-summary {
+        text-align: left;
+    }
+
+    .asset-portfolio-rows li,
+    .product-portfolio-rows li {
+        grid-template-columns: 1fr 1fr;
     }
 }
 

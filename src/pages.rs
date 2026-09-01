@@ -43,12 +43,12 @@ use crate::price::{upsert_manual_prices_batch, BatchPriceInput, BatchPriceRowInp
 use crate::ui_preference::{
     parse_visible_columns, persist_preference, preference_value, serialize_visible_columns,
     valid_option, valid_sort, UiPreferences, ACCOUNTS_ASSET_TYPE, ACCOUNTS_CURRENCY,
-    ACCOUNTS_INSTITUTION, ACCOUNTS_OWNER, ACCOUNTS_SEARCH, ACCOUNTS_SORT, HOLDINGS_ASSET_CLASS,
-    HOLDINGS_ISSUE, HOLDINGS_OWNER, HOLDINGS_REGION, HOLDINGS_SEARCH, HOLDINGS_SHOW_CLOSED,
-    HOLDINGS_SORT, HOLDINGS_TYPE, HOLDINGS_VISIBLE_COLUMNS, LEGACY_DIVIDENDS_INSTRUMENT,
-    LEGACY_DIVIDENDS_OWNER, LEGACY_DIVIDENDS_PERIOD, LEGACY_DIVIDENDS_SEARCH,
-    LEGACY_DIVIDENDS_SORT, QUICK_PRICE_CURRENCY, QUICK_PRICE_DATE, QUICK_PRICE_SEARCH,
-    QUICK_PRICE_SORT,
+    ACCOUNTS_INSTITUTION, ACCOUNTS_OWNER, ACCOUNTS_SEARCH, ACCOUNTS_SORT, ASSETS_VIEW,
+    HOLDINGS_ASSET_CLASS, HOLDINGS_ISSUE, HOLDINGS_OWNER, HOLDINGS_REGION, HOLDINGS_SEARCH,
+    HOLDINGS_SHOW_CLOSED, HOLDINGS_SORT, HOLDINGS_TYPE, HOLDINGS_VISIBLE_COLUMNS,
+    LEGACY_DIVIDENDS_INSTRUMENT, LEGACY_DIVIDENDS_OWNER, LEGACY_DIVIDENDS_PERIOD,
+    LEGACY_DIVIDENDS_SEARCH, LEGACY_DIVIDENDS_SORT, QUICK_PRICE_CURRENCY, QUICK_PRICE_DATE,
+    QUICK_PRICE_SEARCH, QUICK_PRICE_SORT,
 };
 use crate::update::APP_VERSION;
 
@@ -93,48 +93,363 @@ pub fn DashboardPage() -> Element {
 
 #[component]
 pub fn AccountsPage() -> Element {
+    rsx! { AssetDetailsPage { initial_view: Some(AssetView::Cash) } }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AssetView {
+    Accounts,
+    Products,
+    Cash,
+    Holdings,
+}
+
+impl AssetView {
+    fn from_preference(value: &str) -> Self {
+        match value {
+            "products" => Self::Products,
+            "cash" => Self::Cash,
+            "holdings" => Self::Holdings,
+            _ => Self::Accounts,
+        }
+    }
+
+    fn preference_value(self) -> String {
+        match self {
+            Self::Accounts => "accounts",
+            Self::Products => "products",
+            Self::Cash => "cash",
+            Self::Holdings => "holdings",
+        }
+        .to_string()
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct AccountPortfolio {
+    owner_name: String,
+    institution_name: Option<String>,
+    account_name: String,
+    account_number: Option<String>,
+    assets: Vec<AccountAsset>,
+    holdings: Vec<HoldingMetric>,
+}
+
+#[derive(Clone, PartialEq)]
+struct ProductPortfolio {
+    symbol: String,
+    instrument_name: String,
+    instrument_type: String,
+    trading_currency_code: String,
+    holdings: Vec<HoldingMetric>,
+}
+
+#[component]
+pub fn AssetsPage() -> Element {
+    rsx! { AssetDetailsPage { initial_view: None } }
+}
+
+#[component]
+fn AssetDetailsPage(initial_view: Option<AssetView>) -> Element {
     let data_version = use_context::<Signal<u64>>();
+    let preferences = use_context::<UiPreferences>();
+    let mut view = use_signal(move || {
+        initial_view.unwrap_or_else(|| {
+            AssetView::from_preference(&preference_value(&preferences(), ASSETS_VIEW))
+        })
+    });
     let account_assets = use_resource(move || async move {
         let _ = data_version();
         load_account_assets()
     });
-
-    rsx! {
-        PageHeader {
-            title: "帳戶資產".to_string(),
-            description: "顯示各帳戶的最新資產、幣別與台幣換算值。".to_string(),
-        }
-
-        match account_assets() {
-            None => rsx! { StatusCard { text: "載入帳戶資產中...".to_string() } },
-            Some(Err(error)) => rsx! { StatusCard { text: format!("讀取帳戶資產失敗：{error}") } },
-            Some(Ok(rows)) if rows.is_empty() => rsx! { StatusCard { text: "目前沒有帳戶資產資料。".to_string() } },
-            Some(Ok(rows)) => rsx! { AccountAssetsTable { rows } },
-        }
-    }
-}
-
-#[component]
-pub fn HoldingsPage() -> Element {
-    let data_version = use_context::<Signal<u64>>();
     let holdings = use_resource(move || async move {
         let _ = data_version();
         load_holding_metrics()
     });
 
+    use_effect(move || persist_preference(preferences, ASSETS_VIEW, view().preference_value()));
+
     rsx! {
         PageHeader {
-            title: "持股明細".to_string(),
-            description: "顯示最新持股、成本、市值、損益與預估配息。".to_string(),
+            title: "資產明細".to_string(),
+            description: "依帳戶或商品查看現金、存款與投資持股；詳細表格保留原有篩選與編輯功能。".to_string(),
         }
-
-        match holdings() {
-            None => rsx! { StatusCard { text: "載入持股資料中...".to_string() } },
-            Some(Err(error)) => rsx! { StatusCard { text: format!("讀取持股資料失敗：{error}") } },
-            Some(Ok(rows)) if rows.is_empty() => rsx! { StatusCard { text: "目前沒有持股資料。".to_string() } },
-            Some(Ok(rows)) => rsx! { HoldingsTable { rows } },
+        div { class: "asset-view-tabs", role: "tablist", aria_label: "資產明細檢視",
+            AssetViewTab { selected: view() == AssetView::Accounts, label: "按帳戶".to_string(), on_select: move |_| view.set(AssetView::Accounts) }
+            AssetViewTab { selected: view() == AssetView::Products, label: "按商品".to_string(), on_select: move |_| view.set(AssetView::Products) }
+            AssetViewTab { selected: view() == AssetView::Cash, label: "現金與存款明細".to_string(), on_select: move |_| view.set(AssetView::Cash) }
+            AssetViewTab { selected: view() == AssetView::Holdings, label: "持股報表".to_string(), on_select: move |_| view.set(AssetView::Holdings) }
+        }
+        match (account_assets(), holdings()) {
+            (None, _) | (_, None) => rsx! { StatusCard { text: "載入資產明細中...".to_string() } },
+            (Some(Err(error)), _) | (_, Some(Err(error))) => rsx! { StatusCard { text: format!("讀取資產明細失敗：{error}") } },
+            (Some(Ok(account_assets)), Some(Ok(holdings))) => match view() {
+                AssetView::Accounts => rsx! { AccountPortfolioView { account_assets, holdings } },
+                AssetView::Products => rsx! { ProductPortfolioView { holdings } },
+                AssetView::Cash => rsx! { AccountAssetsTable { rows: account_assets } },
+                AssetView::Holdings => rsx! { HoldingsTable { rows: holdings } },
+            },
         }
     }
+}
+
+#[component]
+fn AssetViewTab(selected: bool, label: String, on_select: EventHandler<()>) -> Element {
+    rsx! {
+        button {
+            r#type: "button",
+            class: if selected { "asset-view-tab active" } else { "asset-view-tab" },
+            role: "tab",
+            aria_selected: selected,
+            onclick: move |_| on_select.call(()),
+            "{label}"
+        }
+    }
+}
+
+#[component]
+fn AccountPortfolioView(
+    account_assets: Vec<AccountAsset>,
+    holdings: Vec<HoldingMetric>,
+) -> Element {
+    let mut search = use_signal(String::new);
+    let portfolios = group_account_portfolios(&account_assets, &holdings);
+    let query = search().trim().to_lowercase();
+    let portfolios = portfolios
+        .into_iter()
+        .filter(|portfolio| {
+            query.is_empty()
+                || portfolio.account_name.to_lowercase().contains(&query)
+                || portfolio.owner_name.to_lowercase().contains(&query)
+                || portfolio.holdings.iter().any(|holding| {
+                    holding.symbol.to_lowercase().contains(&query)
+                        || holding.instrument_name.to_lowercase().contains(&query)
+                })
+        })
+        .collect::<Vec<_>>();
+
+    rsx! {
+        section { class: "card asset-portfolio-view",
+            div { class: "table-summary",
+                strong { "{portfolios.len()} 個帳戶" }
+                span { "帳戶下同時列出現金、存款與持股" }
+            }
+            label { class: "filter-field asset-portfolio-search",
+                span { "搜尋帳戶或商品" }
+                input { placeholder: "帳戶名稱、商品名稱或代號", value: "{search}", oninput: move |event| search.set(event.value()) }
+            }
+            if portfolios.is_empty() {
+                div { class: "empty-state", h3 { "目前沒有符合條件的帳戶資產或持股資料" } }
+            } else {
+                div { class: "asset-portfolio-list",
+                    for portfolio in portfolios {
+                        AccountPortfolioCard { portfolio }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn AccountPortfolioCard(portfolio: AccountPortfolio) -> Element {
+    let cash_total = portfolio
+        .assets
+        .iter()
+        .filter_map(|asset| asset.current_value_ntd)
+        .sum::<f64>();
+    let missing_cash_values = portfolio
+        .assets
+        .iter()
+        .filter(|asset| asset.current_value_ntd.is_none())
+        .count();
+    let mut holding_values = BTreeMap::<String, f64>::new();
+    let missing_holding_values = portfolio
+        .holdings
+        .iter()
+        .filter(|holding| holding.market_value.is_none())
+        .count();
+    for holding in &portfolio.holdings {
+        if let Some(value) = holding.market_value {
+            *holding_values
+                .entry(holding.trading_currency_code.clone())
+                .or_default() += value;
+        }
+    }
+    let institution = portfolio
+        .institution_name
+        .unwrap_or_else(|| "未指定機構".to_string());
+
+    rsx! {
+        article { class: "asset-portfolio-card",
+            header { class: "asset-portfolio-header",
+                div {
+                    h2 { "{portfolio.account_name}" }
+                    p { "{portfolio.owner_name} / {institution} / {account_number_display(portfolio.account_number.as_deref())}" }
+                }
+                div { class: "asset-portfolio-summary",
+                    span { "現金與存款：{money(Some(cash_total))}" }
+                    for (currency, value) in holding_values {
+                        span { "{currency} 持股市值：{money(Some(value))}" }
+                    }
+                }
+            }
+            if missing_cash_values > 0 || missing_holding_values > 0 {
+                p { class: "form-warning", "有 {missing_cash_values} 筆現金／存款或 {missing_holding_values} 筆持股無法估值，未計入摘要。" }
+            }
+            div { class: "asset-portfolio-sections",
+                section {
+                    h3 { "現金與存款" }
+                    if portfolio.assets.is_empty() {
+                        p { class: "muted", "此帳戶沒有現金或存款資料。" }
+                    } else {
+                        ul { class: "asset-portfolio-rows",
+                            for asset in portfolio.assets {
+                                li {
+                                    span { "{select_option_label(&asset.asset_type)} {asset.currency_code}" }
+                                    span { "{money(asset.current_value_ntd)}" }
+                                    span { class: "mono", "{asset.snapshot_date}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                section {
+                    h3 { "投資持股" }
+                    if portfolio.holdings.is_empty() {
+                        p { class: "muted", "此帳戶沒有持股資料。" }
+                    } else {
+                        ul { class: "asset-portfolio-rows",
+                            for holding in portfolio.holdings {
+                                li {
+                                    span { "{holding.symbol} {holding.instrument_name}" }
+                                    span { "{decimal(holding.quantity, 2)} {holding.trading_currency_code}" }
+                                    span { "{money(holding.market_value)}" }
+                                    span { class: "mono", "{holding.snapshot_date}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ProductPortfolioView(holdings: Vec<HoldingMetric>) -> Element {
+    let mut search = use_signal(String::new);
+    let query = search().trim().to_lowercase();
+    let portfolios = group_product_portfolios(&holdings)
+        .into_iter()
+        .filter(|portfolio| {
+            query.is_empty()
+                || portfolio.symbol.to_lowercase().contains(&query)
+                || portfolio.instrument_name.to_lowercase().contains(&query)
+                || portfolio
+                    .holdings
+                    .iter()
+                    .any(|holding| holding.account_name.to_lowercase().contains(&query))
+        })
+        .collect::<Vec<_>>();
+
+    rsx! {
+        section { class: "card asset-portfolio-view",
+            div { class: "table-summary",
+                strong { "{portfolios.len()} 個商品" }
+                span { "查看每個商品分布在哪些帳戶" }
+            }
+            label { class: "filter-field asset-portfolio-search",
+                span { "搜尋商品或帳戶" }
+                input { placeholder: "商品名稱、代號或帳戶名稱", value: "{search}", oninput: move |event| search.set(event.value()) }
+            }
+            if portfolios.is_empty() {
+                div { class: "empty-state", h3 { "目前沒有符合條件的持股資料" } }
+            } else {
+                div { class: "asset-portfolio-list",
+                    for portfolio in portfolios {
+                        article { class: "asset-portfolio-card",
+                            header { class: "asset-portfolio-header",
+                                div {
+                                    h2 { "{portfolio.symbol} {portfolio.instrument_name}" }
+                                    p { "{select_option_label(&portfolio.instrument_type)} / {portfolio.trading_currency_code}" }
+                                }
+                                span { "{portfolio.holdings.len()} 個帳戶持有" }
+                            }
+                            ul { class: "asset-portfolio-rows product-portfolio-rows",
+                                for holding in portfolio.holdings {
+                                    li {
+                                        span { "{holding.owner_name} / {holding.account_name}" }
+                                        span { class: "mono", "{account_number_display(holding.account_number.as_deref())}" }
+                                        span { "數量：{decimal(holding.quantity, 2)}" }
+                                        span { "市值：{money(holding.market_value)}" }
+                                        span { class: "mono", "{holding.snapshot_date}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn group_account_portfolios(
+    account_assets: &[AccountAsset],
+    holdings: &[HoldingMetric],
+) -> Vec<AccountPortfolio> {
+    let mut portfolios = BTreeMap::<i64, AccountPortfolio>::new();
+    for asset in account_assets {
+        let portfolio = portfolios
+            .entry(asset.account_id)
+            .or_insert_with(|| AccountPortfolio {
+                owner_name: asset.owner_name.clone(),
+                institution_name: Some(asset.institution_name.clone()),
+                account_name: asset.account_name.clone(),
+                account_number: asset.account_number.clone(),
+                assets: Vec::new(),
+                holdings: Vec::new(),
+            });
+        portfolio.assets.push(asset.clone());
+    }
+    for holding in holdings {
+        let portfolio = portfolios
+            .entry(holding.account_id)
+            .or_insert_with(|| AccountPortfolio {
+                owner_name: holding.owner_name.clone(),
+                institution_name: None,
+                account_name: holding.account_name.clone(),
+                account_number: holding.account_number.clone(),
+                assets: Vec::new(),
+                holdings: Vec::new(),
+            });
+        portfolio.holdings.push(holding.clone());
+    }
+    portfolios.into_values().collect()
+}
+
+fn group_product_portfolios(holdings: &[HoldingMetric]) -> Vec<ProductPortfolio> {
+    let mut portfolios = BTreeMap::<i64, ProductPortfolio>::new();
+    for holding in holdings {
+        let portfolio =
+            portfolios
+                .entry(holding.instrument_id)
+                .or_insert_with(|| ProductPortfolio {
+                    symbol: holding.symbol.clone(),
+                    instrument_name: holding.instrument_name.clone(),
+                    instrument_type: holding.instrument_type.clone(),
+                    trading_currency_code: holding.trading_currency_code.clone(),
+                    holdings: Vec::new(),
+                });
+        portfolio.holdings.push(holding.clone());
+    }
+    portfolios.into_values().collect()
+}
+
+#[component]
+pub fn HoldingsPage() -> Element {
+    rsx! { AssetDetailsPage { initial_view: Some(AssetView::Holdings) } }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3814,6 +4129,61 @@ mod holding_column_tests {
             holding_update_default_date("2026-08-07", "2026-08-06"),
             "2026-08-07"
         );
+        assert_eq!(holding_update_default_date("-", "2026-08-06"), "2026-08-06");
+    }
+
+    #[test]
+    fn account_portfolios_include_accounts_from_assets_and_holdings() {
+        let asset = sample_account_asset(1, "現金帳戶");
+        let mut holding = sample_holding_metric("NTD", Some(10.0), Some(100.0));
+        holding.account_id = 2;
+        holding.account_name = "證券帳戶".to_string();
+
+        let portfolios = group_account_portfolios(&[asset], &[holding]);
+
+        assert_eq!(portfolios.len(), 2);
+        assert_eq!(portfolios[0].assets.len(), 1);
+        assert!(portfolios[0].holdings.is_empty());
+        assert!(portfolios[1].assets.is_empty());
+        assert_eq!(portfolios[1].holdings.len(), 1);
+    }
+
+    #[test]
+    fn product_portfolios_group_the_same_instrument_across_accounts() {
+        let first = sample_holding_metric("USD", Some(10.0), Some(100.0));
+        let mut second = first.clone();
+        second.account_id = 2;
+        second.account_name = "另一個帳戶".to_string();
+
+        let portfolios = group_product_portfolios(&[first, second]);
+
+        assert_eq!(portfolios.len(), 1);
+        assert_eq!(portfolios[0].holdings.len(), 2);
+    }
+
+    fn sample_account_asset(account_id: i64, account_name: &str) -> AccountAsset {
+        AccountAsset {
+            snapshot_id: account_id,
+            account_id,
+            origin: "MANUAL".to_string(),
+            owner_id: Some(1),
+            owner_name: "Owner".to_string(),
+            institution_id: Some(1),
+            institution_name: "Institution".to_string(),
+            account_name: account_name.to_string(),
+            account_number: Some("1234".to_string()),
+            account_type: "BANK".to_string(),
+            asset_type: "DEMAND_DEPOSIT".to_string(),
+            currency_code: "NTD".to_string(),
+            quantity_text: None,
+            invested_amount_text: None,
+            current_value_override_text: Some("100".to_string()),
+            note: String::new(),
+            quantity: None,
+            invested_amount: None,
+            current_value_ntd: Some(100.0),
+            snapshot_date: "2026-08-28".to_string(),
+        }
     }
 
     fn sample_holding_metric(
@@ -4741,11 +5111,7 @@ fn AccountAssetEditModal(
         .to_string();
 
     let initial_form = AccountAssetEditForm {
-        snapshot_date: if asset.snapshot_date == "-" {
-            today
-        } else {
-            asset.snapshot_date.clone()
-        },
+        snapshot_date: holding_update_default_date(&asset.snapshot_date, &today),
         quantity: if is_foreign {
             asset.quantity_text.clone().unwrap_or_default()
         } else {
@@ -5945,6 +6311,10 @@ fn editable_number(value: Option<f64>) -> String {
             text.trim_end_matches('0').trim_end_matches('.').to_string()
         })
         .unwrap_or_default()
+}
+
+fn account_number_display(account_number: Option<&str>) -> &str {
+    account_number.unwrap_or("—")
 }
 
 fn holding_update_default_date(snapshot_date: &str, today: &str) -> String {

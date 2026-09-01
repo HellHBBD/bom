@@ -11,6 +11,7 @@ use dioxus::prelude::*;
 use crate::db::{open_database, open_ui_preference_database};
 
 pub const LAST_ROUTE: &str = "layout.last_route";
+pub const ASSETS_VIEW: &str = "assets.view";
 pub const ACCOUNTS_SEARCH: &str = "accounts.search";
 pub const ACCOUNTS_OWNER: &str = "accounts.owner";
 pub const ACCOUNTS_INSTITUTION: &str = "accounts.institution";

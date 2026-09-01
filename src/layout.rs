@@ -90,8 +90,7 @@ pub fn AppLayout() -> Element {
                 }
                 nav { class: "nav-list",
                     NavLink { route: Route::DashboardPage {}, label: "總覽" }
-                    NavLink { route: Route::AccountsPage {}, label: "帳戶資產" }
-                    NavLink { route: Route::HoldingsPage {}, label: "持股明細" }
+                    NavLink { route: Route::AssetsPage {}, label: "資產明細" }
                     NavLink { route: Route::QuickPriceUpdatePage {}, label: "快速市價更新" }
                     NavLink { route: Route::ExchangeRatePage {}, label: "匯率維護" }
                     NavLink { route: Route::DividendIncomePage {}, label: "股息收入" }
@@ -121,6 +120,7 @@ fn NavLink(route: Route, label: &'static str) -> Element {
 fn route_from_preference(path: &str) -> Option<Route> {
     match path {
         "/" => Some(Route::DashboardPage {}),
+        "/assets" => Some(Route::AssetsPage {}),
         "/accounts" => Some(Route::AccountsPage {}),
         "/holdings" => Some(Route::HoldingsPage {}),
         "/market/prices" => Some(Route::QuickPriceUpdatePage {}),
@@ -139,6 +139,7 @@ fn saved_route_to_restore(saved_path: &str, current_path: &str) -> Option<Route>
 fn route_path(route: &Route) -> &'static str {
     match route {
         Route::DashboardPage {} => "/",
+        Route::AssetsPage {} => "/assets",
         Route::AccountsPage {} => "/accounts",
         Route::HoldingsPage {} => "/holdings",
         Route::QuickPriceUpdatePage {} => "/market/prices",
@@ -155,6 +156,7 @@ mod tests {
 
     #[test]
     fn restores_only_defined_routes() {
+        assert!(route_from_preference("/assets").is_some());
         assert!(route_from_preference("/holdings").is_some());
         assert!(route_from_preference("/settings").is_some());
         assert!(route_from_preference("/not-a-route").is_none());
