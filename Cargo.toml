@@ -1,6 +1,6 @@
 [package]
 name = "bom"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Hell HBBD <paulyu602@gmail.com>"]
 edition = "2021"
 
