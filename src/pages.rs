@@ -29,9 +29,12 @@ use crate::holding::{
     upsert_annual_dividend, AnnualDividendInput, CurrentHoldingStateInput, DividendAssumptionInput,
 };
 use crate::master_data::{
-    create_manual_account, create_manual_instrument, load_institution_options, load_person_options,
-    update_manual_account, AccountCreateInput, AccountUpdateInput, InstitutionOption,
-    InstrumentCreateInput, PersonOption,
+    create_manual_account, create_manual_instrument, delete_manual_account,
+    delete_manual_instrument, load_account_master_rows, load_currency_codes,
+    load_institution_options, load_instrument_master_rows, load_person_options,
+    update_manual_account, update_manual_instrument, AccountCreateInput, AccountMasterRow,
+    AccountUpdateInput, InstitutionOption, InstrumentCreateInput, InstrumentMasterRow,
+    InstrumentUpdateInput, PersonOption,
 };
 use crate::models::{
     AccountAsset, AnnualDividendRow, DashboardSummary, DividendReceiptAccountOption,
@@ -102,6 +105,8 @@ enum AssetView {
     Products,
     Cash,
     Holdings,
+    AccountManagement,
+    InstrumentManagement,
 }
 
 impl AssetView {
@@ -110,6 +115,8 @@ impl AssetView {
             "products" => Self::Products,
             "cash" => Self::Cash,
             "holdings" => Self::Holdings,
+            "account-management" => Self::AccountManagement,
+            "instrument-management" => Self::InstrumentManagement,
             _ => Self::Accounts,
         }
     }
@@ -120,6 +127,8 @@ impl AssetView {
             Self::Products => "products",
             Self::Cash => "cash",
             Self::Holdings => "holdings",
+            Self::AccountManagement => "account-management",
+            Self::InstrumentManagement => "instrument-management",
         }
         .to_string()
     }
@@ -179,6 +188,8 @@ fn AssetDetailsPage(initial_view: Option<AssetView>) -> Element {
             AssetViewTab { selected: view() == AssetView::Products, label: "按商品".to_string(), on_select: move |_| view.set(AssetView::Products) }
             AssetViewTab { selected: view() == AssetView::Cash, label: "現金與存款明細".to_string(), on_select: move |_| view.set(AssetView::Cash) }
             AssetViewTab { selected: view() == AssetView::Holdings, label: "持股報表".to_string(), on_select: move |_| view.set(AssetView::Holdings) }
+            AssetViewTab { selected: view() == AssetView::AccountManagement, label: "帳戶管理".to_string(), on_select: move |_| view.set(AssetView::AccountManagement) }
+            AssetViewTab { selected: view() == AssetView::InstrumentManagement, label: "商品管理".to_string(), on_select: move |_| view.set(AssetView::InstrumentManagement) }
         }
         match (account_assets(), holdings()) {
             (None, _) | (_, None) => rsx! { StatusCard { text: "載入資產明細中...".to_string() } },
@@ -188,6 +199,8 @@ fn AssetDetailsPage(initial_view: Option<AssetView>) -> Element {
                 AssetView::Products => rsx! { ProductPortfolioView { holdings } },
                 AssetView::Cash => rsx! { AccountAssetsTable { rows: account_assets } },
                 AssetView::Holdings => rsx! { HoldingsTable { rows: holdings } },
+                AssetView::AccountManagement => rsx! { AccountManagementTable {} },
+                AssetView::InstrumentManagement => rsx! { InstrumentManagementTable {} },
             },
         }
     }
@@ -2845,6 +2858,49 @@ fn InstrumentCreateModal(
     }
 }
 
+#[component]
+fn InstrumentEditModal(
+    instrument: InstrumentMasterRow,
+    currency_codes: Vec<String>,
+    on_close: EventHandler<()>,
+    on_saved: EventHandler<String>,
+) -> Element {
+    let mut symbol = use_signal(|| instrument.symbol.clone());
+    let mut name = use_signal(|| instrument.name.clone());
+    let mut instrument_type = use_signal(|| instrument.instrument_type.clone());
+    let mut asset_class = use_signal(|| instrument.asset_class.clone());
+    let mut region_type = use_signal(|| instrument.region_type.clone());
+    let mut trading_currency_code = use_signal(|| instrument.trading_currency_code.clone());
+    let mut is_saving = use_signal(|| false);
+    let mut error_message = use_signal(String::new);
+    rsx! {
+        div { class: "modal-backdrop", div { class: "modal-card",
+            div { class: "modal-header", div { h3 { "編輯商品" } p { class: "modal-subtitle", "此處變更會套用到商品的持股、價格與股息紀錄。" } } }
+            if !error_message().is_empty() { div { class: "status-message error", role: "alert", "{error_message}" } }
+            div { class: "form-grid two-column",
+                label { class: "form-field", span { "商品代號" } input { value: "{symbol}", oninput: move |event| symbol.set(event.value()), disabled: is_saving() } }
+                label { class: "form-field", span { "商品名稱" } input { value: "{name}", oninput: move |event| name.set(event.value()), disabled: is_saving() } }
+                label { class: "form-field full-width", span { "交易幣別" } select { value: "{trading_currency_code}", oninput: move |event| trading_currency_code.set(event.value()), disabled: is_saving(), for currency in &currency_codes { option { value: "{currency}", "{currency}" } } } }
+                label { class: "form-field", span { "商品類型" } select { value: "{instrument_type}", oninput: move |event| instrument_type.set(event.value()), disabled: is_saving(), option { value: "STOCK", "股票" } option { value: "ETF", "ETF" } option { value: "BOND", "債券" } option { value: "FUND", "基金" } option { value: "OTHER", "其他" } } }
+                label { class: "form-field", span { "資產類別" } select { value: "{asset_class}", oninput: move |event| asset_class.set(event.value()), disabled: is_saving(), option { value: "EQUITY", "股票" } option { value: "BOND", "債券" } option { value: "MIXED", "混合" } option { value: "CASH_EQUIVALENT", "現金等價" } option { value: "OTHER", "其他" } } }
+                label { class: "form-field", span { "區域" } select { value: "{region_type}", oninput: move |event| region_type.set(event.value()), disabled: is_saving(), option { value: "DOMESTIC", "國內" } option { value: "FOREIGN", "海外" } } }
+            }
+            div { class: "modal-actions",
+                button { r#type: "button", class: "ghost-button", disabled: is_saving(), onclick: move |_| on_close.call(()), "取消" }
+                button { r#type: "button", class: "primary-button", disabled: is_saving(), onclick: move |_| {
+                    is_saving.set(true);
+                    error_message.set(String::new());
+                    let input = InstrumentUpdateInput { instrument_id: instrument.instrument_id, symbol: symbol(), name: name(), instrument_type: instrument_type(), asset_class: asset_class(), region_type: region_type(), trading_currency_code: trading_currency_code() };
+                    match update_manual_instrument(input) {
+                        Ok(()) => { is_saving.set(false); on_saved.call(format!("商品 {} 已更新", instrument.name)); }
+                        Err(error) => { error_message.set(format!("儲存失敗：{error}")); is_saving.set(false); }
+                    }
+                }, if is_saving() { "儲存中..." } else { "儲存商品" } }
+            }
+        } }
+    }
+}
+
 fn dividend_receipt_account_label(option: &DividendReceiptAccountOption) -> String {
     let account_number = option.account_number.as_deref().unwrap_or("—");
     format!(
@@ -4579,6 +4635,171 @@ fn HoldingsTable(rows: Vec<HoldingMetric>) -> Element {
                 }
             }
         }
+    }
+}
+
+#[component]
+fn AccountManagementTable() -> Element {
+    let mut data_version = use_context::<Signal<u64>>();
+    let rows = use_resource(move || {
+        let _ = data_version();
+        async move { load_account_master_rows() }
+    });
+    let institutions = use_resource(move || async move { load_institution_options() });
+    let people = use_resource(move || async move { load_person_options() });
+    let mut creating = use_signal(|| false);
+    let mut editing = use_signal(|| None::<AccountMasterRow>);
+    let mut deleting = use_signal(|| None::<AccountMasterRow>);
+    let mut status_message = use_signal(String::new);
+    let mut error_message = use_signal(String::new);
+
+    rsx! {
+        section { class: "card table-card",
+            div { class: "table-summary",
+                div { strong { "帳戶管理" } span { "新增、編輯或刪除未使用的帳戶主檔" } }
+                button { r#type: "button", class: "primary-button", onclick: move |_| creating.set(true), "新增帳戶" }
+            }
+            if !status_message().is_empty() { div { class: "status-message success", role: "status", "{status_message}" } }
+            if !error_message().is_empty() { div { class: "status-message error", role: "alert", "{error_message}" } }
+            match rows() {
+                None => rsx! { p { class: "muted", "載入帳戶主檔中..." } },
+                Some(Err(error)) => rsx! { p { class: "status-message error", "讀取帳戶主檔失敗：{error}" } },
+                Some(Ok(rows)) => rsx! {
+                    if rows.is_empty() { div { class: "empty-state", h3 { "目前沒有帳戶" } } } else {
+                        div { class: "table-wrap", table { class: "account-assets-table",
+                            thead { tr { th { "帳戶名稱" } th { "金融機構" } th { "帳戶號碼" } th { "類型" } th { "所有權人" } th { "操作" } } }
+                            tbody { for row in rows {
+                                tr { key: "{row.account_id}",
+                                    td { class: "name-cell", "{row.display_name}" }
+                                    td { "{row.institution_name}" }
+                                    td { class: "mono", "{row.account_number.as_deref().unwrap_or_default()}" }
+                                    td { "{account_type_label(&row.account_type)}" }
+                                    td { "{row.owner_name}" }
+                                    td {
+                                        button { r#type: "button", class: "inline-action", onclick: { let row = row.clone(); move |_| editing.set(Some(row.clone())) }, "編輯" }
+                                        button { r#type: "button", class: "inline-action danger-button", onclick: { let row = row.clone(); move |_| deleting.set(Some(row.clone())) }, "刪除" }
+                                    }
+                                }
+                            } }
+                        } }
+                    }
+                },
+            }
+        }
+        if creating() {
+            match institutions() {
+                Some(Ok(institutions)) => rsx! { AccountCreateModal { institutions, on_close: move |_| creating.set(false), on_created: move |account_id| { status_message.set(format!("帳戶 #{account_id} 已新增")); creating.set(false); data_version.with_mut(|value| *value += 1); } } },
+                Some(Err(error)) => rsx! { StatusCard { text: format!("讀取金融機構失敗：{error}") } },
+                None => rsx! { StatusCard { text: "載入金融機構中...".to_string() } },
+            }
+        }
+        if let Some(account) = editing() {
+            match (institutions(), people()) {
+                (Some(Ok(institutions)), Some(Ok(people))) => rsx! { AccountEditModal { account: account_master_as_asset(&account), institutions, people, on_close: move |_| editing.set(None), on_saved: move |message| { status_message.set(message); editing.set(None); data_version.with_mut(|value| *value += 1); } } },
+                (Some(Err(error)), _) | (_, Some(Err(error))) => rsx! { StatusCard { text: format!("讀取帳戶編輯選項失敗：{error}") } },
+                _ => rsx! { StatusCard { text: "載入帳戶編輯選項中...".to_string() } },
+            }
+        }
+        if let Some(account) = deleting() {
+            div { class: "modal-backdrop", div { class: "modal-card",
+                h3 { "刪除帳戶" }
+                p { "確定刪除「{account.display_name}」嗎？若帳戶已有資產、持股或股息歷史資料，系統會拒絕刪除。" }
+                div { class: "modal-actions",
+                    button { r#type: "button", class: "ghost-button", onclick: move |_| deleting.set(None), "取消" }
+                    button { r#type: "button", class: "danger-button", onclick: { let account = account.clone(); move |_| match delete_manual_account(account.account_id) { Ok(()) => { status_message.set(format!("帳戶 {} 已刪除", account.display_name)); error_message.set(String::new()); deleting.set(None); data_version.with_mut(|value| *value += 1); }, Err(error) => { error_message.set(error.to_string()); deleting.set(None); } } }, "確認刪除" }
+                }
+            } }
+        }
+    }
+}
+
+fn account_master_as_asset(account: &AccountMasterRow) -> AccountAsset {
+    AccountAsset {
+        snapshot_id: 0,
+        account_id: account.account_id,
+        origin: String::new(),
+        owner_id: account.owner_id,
+        owner_name: account.owner_name.clone(),
+        institution_id: account.institution_id,
+        institution_name: account.institution_name.clone(),
+        account_name: account.display_name.clone(),
+        account_number: account.account_number.clone(),
+        account_type: account.account_type.clone(),
+        asset_type: String::new(),
+        currency_code: String::new(),
+        quantity_text: None,
+        invested_amount_text: None,
+        current_value_override_text: None,
+        note: String::new(),
+        quantity: None,
+        invested_amount: None,
+        current_value_ntd: None,
+        snapshot_date: String::new(),
+    }
+}
+
+#[component]
+fn InstrumentManagementTable() -> Element {
+    let mut data_version = use_context::<Signal<u64>>();
+    let rows = use_resource(move || {
+        let _ = data_version();
+        async move { load_instrument_master_rows() }
+    });
+    let currencies = use_resource(move || async move { load_currency_codes() });
+    let mut creating = use_signal(|| false);
+    let mut editing = use_signal(|| None::<InstrumentMasterRow>);
+    let mut deleting = use_signal(|| None::<InstrumentMasterRow>);
+    let mut status_message = use_signal(String::new);
+    let mut error_message = use_signal(String::new);
+    rsx! {
+        section { class: "card table-card",
+            div { class: "table-summary",
+                div { strong { "商品管理" } span { "新增、編輯或刪除未使用的商品主檔" } }
+                button { r#type: "button", class: "primary-button", onclick: move |_| creating.set(true), "新增商品" }
+            }
+            if !status_message().is_empty() { div { class: "status-message success", role: "status", "{status_message}" } }
+            if !error_message().is_empty() { div { class: "status-message error", role: "alert", "{error_message}" } }
+            match rows() {
+                None => rsx! { p { class: "muted", "載入商品主檔中..." } },
+                Some(Err(error)) => rsx! { p { class: "status-message error", "讀取商品主檔失敗：{error}" } },
+                Some(Ok(rows)) => rsx! {
+                    if rows.is_empty() {
+                        div { class: "empty-state", h3 { "目前沒有商品" } }
+                    } else {
+                        div { class: "table-wrap",
+                            table { class: "holdings-table",
+                                thead { tr { th { "代號" } th { "商品名稱" } th { "類型" } th { "資產類別" } th { "區域" } th { "幣別" } th { "操作" } } }
+                                tbody {
+                                    for row in rows {
+                                        tr { key: "{row.instrument_id}",
+                                            td { class: "mono", "{row.symbol}" }
+                                            td { class: "name-cell", "{row.name}" }
+                                            td { "{select_option_label(&row.instrument_type)}" }
+                                            td { "{select_option_label(&row.asset_class)}" }
+                                            td { "{select_option_label(&row.region_type)}" }
+                                            td { class: "mono", "{row.trading_currency_code}" }
+                                            td {
+                                                button { r#type: "button", class: "inline-action", onclick: { let row = row.clone(); move |_| editing.set(Some(row.clone())) }, "編輯" }
+                                                button { r#type: "button", class: "inline-action danger-button", onclick: { let row = row.clone(); move |_| deleting.set(Some(row.clone())) }, "刪除" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+        match currencies() {
+            Some(Ok(currency_codes)) => rsx! {
+                if creating() { InstrumentCreateModal { currency_codes: currency_codes.clone(), on_close: move |_| creating.set(false), on_created: move |(instrument_id, _)| { status_message.set(format!("商品 #{instrument_id} 已新增")); creating.set(false); data_version.with_mut(|value| *value += 1); } } }
+                if let Some(instrument) = editing() { InstrumentEditModal { instrument, currency_codes, on_close: move |_| editing.set(None), on_saved: move |message| { status_message.set(message); editing.set(None); data_version.with_mut(|value| *value += 1); } } }
+            },
+            Some(Err(error)) => rsx! { StatusCard { text: format!("讀取幣別失敗：{error}") } },
+            None => rsx! {},
+        }
+        if let Some(instrument) = deleting() { div { class: "modal-backdrop", div { class: "modal-card", h3 { "刪除商品" } p { "確定刪除「{instrument.name}」嗎？若商品已有持股、價格或股息歷史資料，系統會拒絕刪除。" } div { class: "modal-actions", button { r#type: "button", class: "ghost-button", onclick: move |_| deleting.set(None), "取消" } button { r#type: "button", class: "danger-button", onclick: { let instrument = instrument.clone(); move |_| match delete_manual_instrument(instrument.instrument_id) { Ok(()) => { status_message.set(format!("商品 {} 已刪除", instrument.name)); error_message.set(String::new()); deleting.set(None); data_version.with_mut(|value| *value += 1); }, Err(error) => { error_message.set(error.to_string()); deleting.set(None); } } }, "確認刪除" } } } } }
     }
 }
 

@@ -18,6 +18,29 @@ pub struct PersonOption {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct AccountMasterRow {
+    pub account_id: i64,
+    pub display_name: String,
+    pub institution_id: Option<i64>,
+    pub institution_name: String,
+    pub account_number: Option<String>,
+    pub account_type: String,
+    pub owner_id: Option<i64>,
+    pub owner_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstrumentMasterRow {
+    pub instrument_id: i64,
+    pub symbol: String,
+    pub name: String,
+    pub instrument_type: String,
+    pub asset_class: String,
+    pub region_type: String,
+    pub trading_currency_code: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AccountCreateInput {
     pub institution_id: i64,
     pub display_name: String,
@@ -44,6 +67,17 @@ pub struct InstrumentCreateInput {
     pub trading_currency_code: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstrumentUpdateInput {
+    pub instrument_id: i64,
+    pub symbol: String,
+    pub name: String,
+    pub instrument_type: String,
+    pub asset_class: String,
+    pub region_type: String,
+    pub trading_currency_code: String,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
     load_institution_options_native().map_err(|error| error.to_string())
@@ -54,6 +88,30 @@ pub fn load_person_options() -> Result<Vec<PersonOption>, String> {
     load_person_options_native().map_err(|error| error.to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_account_master_rows() -> Result<Vec<AccountMasterRow>, String> {
+    load_account_master_rows_native().map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_instrument_master_rows() -> Result<Vec<InstrumentMasterRow>, String> {
+    load_instrument_master_rows_native().map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_currency_codes() -> Result<Vec<String>, String> {
+    let connection = crate::db::open_database().map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare("SELECT currency_code FROM currency ORDER BY currency_code ASC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
     Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
@@ -61,6 +119,21 @@ pub fn load_institution_options() -> Result<Vec<InstitutionOption>, String> {
 
 #[cfg(target_arch = "wasm32")]
 pub fn load_person_options() -> Result<Vec<PersonOption>, String> {
+    Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_account_master_rows() -> Result<Vec<AccountMasterRow>, String> {
+    Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_instrument_master_rows() -> Result<Vec<InstrumentMasterRow>, String> {
+    Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_currency_codes() -> Result<Vec<String>, String> {
     Err("SQLite 讀取目前只支援桌面版；Web 版需改由 server function 提供資料。".to_string())
 }
 
@@ -96,10 +169,49 @@ pub fn create_manual_instrument(input: InstrumentCreateInput) -> AppResult<i64> 
     create_manual_instrument_with_connection(&mut connection, input)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn update_manual_instrument(input: InstrumentUpdateInput) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    update_manual_instrument_with_connection(&mut connection, input)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn delete_manual_account(account_id: i64) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    delete_manual_account_with_connection(&mut connection, account_id)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn delete_manual_instrument(instrument_id: i64) -> AppResult<()> {
+    let mut connection = open_manual_write_database()?;
+    delete_manual_instrument_with_connection(&mut connection, instrument_id)
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn create_manual_instrument(_input: InstrumentCreateInput) -> AppResult<i64> {
     Err(AppError::Validation(
         "目前只支援桌面版 SQLite 商品新增".to_string(),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn update_manual_instrument(_input: InstrumentUpdateInput) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 商品更新".to_string(),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn delete_manual_account(_account_id: i64) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 帳戶刪除".to_string(),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn delete_manual_instrument(_instrument_id: i64) -> AppResult<()> {
+    Err(AppError::Validation(
+        "目前只支援桌面版 SQLite 商品刪除".to_string(),
     ))
 }
 
@@ -201,6 +313,31 @@ fn validate_instrument_create_input(
         asset_class,
         region_type,
         trading_currency_code,
+    })
+}
+
+fn validate_instrument_update_input(
+    input: &InstrumentUpdateInput,
+) -> AppResult<InstrumentUpdateInput> {
+    if input.instrument_id <= 0 {
+        return Err(AppError::Validation("找不到商品".to_string()));
+    }
+    let created = validate_instrument_create_input(&InstrumentCreateInput {
+        symbol: input.symbol.clone(),
+        name: input.name.clone(),
+        instrument_type: input.instrument_type.clone(),
+        asset_class: input.asset_class.clone(),
+        region_type: input.region_type.clone(),
+        trading_currency_code: input.trading_currency_code.clone(),
+    })?;
+    Ok(InstrumentUpdateInput {
+        instrument_id: input.instrument_id,
+        symbol: created.symbol,
+        name: created.name,
+        instrument_type: created.instrument_type,
+        asset_class: created.asset_class,
+        region_type: created.region_type,
+        trading_currency_code: created.trading_currency_code,
     })
 }
 
@@ -349,6 +486,103 @@ fn create_manual_instrument_with_connection(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn update_manual_instrument_with_connection(
+    connection: &mut Connection,
+    input: InstrumentUpdateInput,
+) -> AppResult<()> {
+    let validated = validate_instrument_update_input(&input)?;
+    let transaction = connection.transaction()?;
+    ensure_instrument_exists(&transaction, validated.instrument_id)?;
+    ensure_currency_exists(&transaction, &validated.trading_currency_code)?;
+    if !validated.symbol.is_empty() {
+        let existing: Option<(i64, String)> = transaction
+            .query_row(
+                "SELECT instrument_id, name FROM instrument WHERE UPPER(TRIM(symbol)) = ?1 AND instrument_id <> ?2 LIMIT 1",
+                params![validated.symbol, validated.instrument_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((instrument_id, name)) = existing {
+            return Err(AppError::Validation(format!(
+                "商品代號 {} 已由商品 #{instrument_id}（{name}）使用",
+                validated.symbol
+            )));
+        }
+    }
+    transaction.execute(
+        "UPDATE instrument SET symbol = ?1, name = ?2, instrument_type = ?3, asset_class = ?4, region_type = ?5, trading_currency_code = ?6 WHERE instrument_id = ?7",
+        params![validated.symbol, validated.name, validated.instrument_type, validated.asset_class, validated.region_type, validated.trading_currency_code, validated.instrument_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn delete_manual_account_with_connection(
+    connection: &mut Connection,
+    account_id: i64,
+) -> AppResult<()> {
+    if account_id <= 0 {
+        return Err(AppError::Validation("找不到帳戶".to_string()));
+    }
+    let transaction = connection.transaction()?;
+    ensure_account_exists(&transaction, account_id)?;
+    ensure_unreferenced(
+        &transaction,
+        "account_asset_snapshot",
+        "account_id",
+        account_id,
+        "帳戶",
+    )?;
+    ensure_unreferenced(
+        &transaction,
+        "holding_snapshot",
+        "account_id",
+        account_id,
+        "帳戶",
+    )?;
+    ensure_unreferenced(
+        &transaction,
+        "dividend_receipt",
+        "account_id",
+        account_id,
+        "帳戶",
+    )?;
+    transaction.execute("DELETE FROM account WHERE account_id = ?1", [account_id])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn delete_manual_instrument_with_connection(
+    connection: &mut Connection,
+    instrument_id: i64,
+) -> AppResult<()> {
+    if instrument_id <= 0 {
+        return Err(AppError::Validation("找不到商品".to_string()));
+    }
+    let transaction = connection.transaction()?;
+    ensure_instrument_exists(&transaction, instrument_id)?;
+    for table in [
+        "holding_snapshot",
+        "instrument_price",
+        "dividend_receipt",
+        "dividend_assumption",
+        "instrument_annual_dividend",
+        "dividend_legacy_monthly",
+        "dividend_legacy_summary",
+    ] {
+        ensure_unreferenced(&transaction, table, "instrument_id", instrument_id, "商品")?;
+    }
+    transaction.execute(
+        "DELETE FROM instrument WHERE instrument_id = ?1",
+        [instrument_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn load_institution_options_native() -> rusqlite::Result<Vec<InstitutionOption>> {
     let connection = crate::db::open_database()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -388,6 +622,49 @@ fn load_person_options_native() -> rusqlite::Result<Vec<PersonOption>> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn load_account_master_rows_native() -> rusqlite::Result<Vec<AccountMasterRow>> {
+    let connection = crate::db::open_database()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let mut statement = connection.prepare(
+        "SELECT a.account_id, a.display_name, a.institution_id, COALESCE(i.name, '未指定金融機構'), a.account_number, a.account_type, o.person_id, COALESCE(p.display_name, '未指定所有權人') FROM account a LEFT JOIN institution i ON i.institution_id = a.institution_id LEFT JOIN account_owner o ON o.account_id = a.account_id LEFT JOIN person p ON p.person_id = o.person_id ORDER BY a.display_name ASC, a.account_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(AccountMasterRow {
+            account_id: row.get(0)?,
+            display_name: row.get(1)?,
+            institution_id: row.get(2)?,
+            institution_name: row.get(3)?,
+            account_number: row.get(4)?,
+            account_type: row.get(5)?,
+            owner_id: row.get(6)?,
+            owner_name: row.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_instrument_master_rows_native() -> rusqlite::Result<Vec<InstrumentMasterRow>> {
+    let connection = crate::db::open_database()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let mut statement = connection.prepare(
+        "SELECT instrument_id, COALESCE(symbol, ''), name, instrument_type, asset_class, COALESCE(region_type, ''), trading_currency_code FROM instrument ORDER BY name ASC, instrument_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(InstrumentMasterRow {
+            instrument_id: row.get(0)?,
+            symbol: row.get(1)?,
+            name: row.get(2)?,
+            instrument_type: row.get(3)?,
+            asset_class: row.get(4)?,
+            region_type: row.get(5)?,
+            trading_currency_code: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_institution_exists(connection: &Connection, institution_id: i64) -> AppResult<()> {
     let exists: Option<i64> = connection
         .query_row(
@@ -420,6 +697,46 @@ fn ensure_account_exists(connection: &Connection, account_id: i64) -> AppResult<
         Ok(())
     } else {
         Err(AppError::Validation(format!("找不到帳戶：{account_id}")))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_instrument_exists(connection: &Connection, instrument_id: i64) -> AppResult<()> {
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT instrument_id FROM instrument WHERE instrument_id = ?1 LIMIT 1",
+            [instrument_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!("找不到商品：{instrument_id}")))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_unreferenced(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    id: i64,
+    label: &str,
+) -> AppResult<()> {
+    let exists: Option<i64> = connection
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE {column} = ?1 LIMIT 1"),
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_some() {
+        Err(AppError::Validation(format!(
+            "此{label}已有歷史資料，無法刪除"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -506,6 +823,15 @@ mod tests {
                 CREATE TABLE currency (
                     currency_code TEXT PRIMARY KEY
                 );
+
+                CREATE TABLE account_asset_snapshot (account_id INTEGER);
+                CREATE TABLE holding_snapshot (account_id INTEGER, instrument_id INTEGER);
+                CREATE TABLE dividend_receipt (account_id INTEGER, instrument_id INTEGER);
+                CREATE TABLE dividend_assumption (instrument_id INTEGER);
+                CREATE TABLE instrument_annual_dividend (instrument_id INTEGER);
+                CREATE TABLE instrument_price (instrument_id INTEGER);
+                CREATE TABLE dividend_legacy_monthly (instrument_id INTEGER);
+                CREATE TABLE dividend_legacy_summary (instrument_id INTEGER);
 
                 INSERT INTO institution (institution_id, name) VALUES (1, 'Demo Bank');
                 INSERT INTO institution (institution_id, name) VALUES (2, 'Other Bank');
@@ -675,6 +1001,98 @@ mod tests {
 
         assert_eq!(symbol, "ABC");
         assert_eq!(currency_code, "NTD");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn update_manual_instrument_replaces_master_data() {
+        let mut connection = Connection::open_in_memory().expect("open db");
+        seed_db(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO instrument (instrument_id, symbol, name, instrument_type, asset_class, region_type, trading_currency_code) VALUES (1, 'OLD', '舊商品', 'ETF', 'EQUITY', 'DOMESTIC', 'NTD')",
+                [],
+            )
+            .expect("insert instrument");
+
+        update_manual_instrument_with_connection(
+            &mut connection,
+            InstrumentUpdateInput {
+                instrument_id: 1,
+                symbol: "new".to_string(),
+                name: "新商品".to_string(),
+                instrument_type: "FUND".to_string(),
+                asset_class: "BOND".to_string(),
+                region_type: "FOREIGN".to_string(),
+                trading_currency_code: "NTD".to_string(),
+            },
+        )
+        .expect("update instrument");
+
+        let row: (String, String, String) = connection
+            .query_row(
+                "SELECT symbol, name, instrument_type FROM instrument WHERE instrument_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read instrument");
+        assert_eq!(
+            row,
+            ("NEW".to_string(), "新商品".to_string(), "FUND".to_string())
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn deletes_only_unreferenced_master_data() {
+        let mut connection = Connection::open_in_memory().expect("open db");
+        seed_db(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO account (account_id, display_name, institution_id, account_type, account_number) VALUES (1, '可刪除帳戶', 1, 'BANK', '1234')",
+                [],
+            )
+            .expect("insert account");
+        connection
+            .execute(
+                "INSERT INTO instrument (instrument_id, symbol, name, instrument_type, asset_class, region_type, trading_currency_code) VALUES (1, 'DEL', '可刪除商品', 'ETF', 'EQUITY', 'DOMESTIC', 'NTD')",
+                [],
+            )
+            .expect("insert instrument");
+
+        delete_manual_account_with_connection(&mut connection, 1).expect("delete account");
+        delete_manual_instrument_with_connection(&mut connection, 1).expect("delete instrument");
+
+        let account_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM account", [], |row| row.get(0))
+            .expect("count accounts");
+        let instrument_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM instrument", [], |row| row.get(0))
+            .expect("count instruments");
+        assert_eq!(account_count, 0);
+        assert_eq!(instrument_count, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn refuses_to_delete_referenced_master_data() {
+        let mut connection = Connection::open_in_memory().expect("open db");
+        seed_db(&mut connection);
+        connection
+            .execute(
+                "INSERT INTO account (account_id, display_name, institution_id, account_type, account_number) VALUES (1, '使用中帳戶', 1, 'BANK', '1234')",
+                [],
+            )
+            .expect("insert account");
+        connection
+            .execute(
+                "INSERT INTO account_asset_snapshot (account_id) VALUES (1)",
+                [],
+            )
+            .expect("insert asset");
+        let error = delete_manual_account_with_connection(&mut connection, 1)
+            .expect_err("referenced account must not delete");
+        assert!(error.to_string().contains("已有歷史資料"));
     }
 
     #[test]
